@@ -1,0 +1,163 @@
+import Foundation
+
+/// Auto mode → "Complete": recognises yes/no and multiple-choice prompts drawn by Claude Code / Codex
+/// at the bottom of the screen and decides which keys to send.
+///
+/// Rules (deliberately conservative — anything unrecognised is left for the user):
+///   • Numbered menu with a selection cursor (❯ / ›): pick the option marked "Recommended";
+///     otherwise the first option starting with "Yes". If neither exists, do nothing.
+///   • Multi-select (checkbox) menus are skipped.
+///   • Inline prompts ending in (y/n), [y/N], [Y/n], (yes/no): answer "y".
+enum AutoResponder {
+    struct Decision: Equatable {
+        /// Key presses to send, one write each (TUIs parse one key per read more reliably).
+        var keys: [String]
+        /// Human-readable answer, e.g. "Yes" or "dayjs (Recommended)".
+        var label: String
+        /// Identifies the prompt independent of where the cursor currently is.
+        var fingerprint: String
+    }
+
+    static let down = "\u{1b}[B"
+    static let up = "\u{1b}[A"
+    static let enter = "\r"
+
+    private static let cursorGlyphs: Set<Character> = ["❯", "›", "▸", "▶", "➤"]
+    private static let boxChars = CharacterSet(charactersIn: "│┃║|╭╮╰╯─━")
+
+    private struct Option {
+        let line: Int
+        let number: Int
+        let text: String
+        let hasCursor: Bool
+    }
+
+    private static func window(_ screen: [String]) -> [String]? {
+        // Work on the bottom part of the screen, ignoring trailing blank rows.
+        var lines = screen.map { $0.trimmingCharacters(in: boxChars.union(.whitespaces)) }
+        while let last = lines.last, last.isEmpty { lines.removeLast() }
+        guard !lines.isEmpty else { return nil }
+        return Array(lines.suffix(30))
+    }
+
+    static func decide(screen: [String]) -> Decision? {
+        guard let window = window(screen) else { return nil }
+        // The last line is where input goes, so an inline y/n prompt there wins over any menu still drawn above it.
+        if let d = inlineYesNoDecision(window) { return d }
+        if let d = menuDecision(window) { return d }
+        return nil
+    }
+
+    /// Whether the screen is waiting for the user to answer a prompt (whether or not Auto could answer it).
+    /// Returns the question text (best effort) or nil.
+    static func pendingPrompt(screen: [String]) -> String? {
+        guard let window = window(screen) else { return nil }
+        if inlineYesNoDecision(window) != nil { return window.last }
+        guard let menu = findMenu(window) else { return nil }
+        let first = menu.block.first!.line
+        // The closest non-empty line above the options that isn't decoration is usually the question.
+        let question = window[max(0, first - 4)..<first].reversed()
+            .first { !$0.isEmpty && $0.rangeOfCharacter(from: .letters) != nil }
+        return question ?? "Choose an option"
+    }
+
+    /// Plain-text heuristics for "the agent is busy" (Claude: "esc to interrupt", Codex: "Esc to interrupt").
+    static func isWorking(screen: [String]) -> Bool {
+        screen.suffix(12).contains { $0.range(of: "to interrupt", options: .caseInsensitive) != nil }
+    }
+
+    // MARK: Numbered menus
+
+    private static func parseOption(_ raw: String, line: Int) -> Option? {
+        var s = Substring(raw)
+        var hasCursor = false
+        if let f = s.first, cursorGlyphs.contains(f) || f == ">" {
+            hasCursor = true
+            s = s.dropFirst().drop { $0 == " " }
+        }
+        // number
+        let digits = s.prefix { $0.isNumber }
+        guard (1...2).contains(digits.count), let n = Int(digits) else { return nil }
+        s = s.dropFirst(digits.count)
+        guard let sep = s.first, sep == "." || sep == ")" else { return nil }
+        s = s.dropFirst()
+        guard s.first == " " else { return nil }
+        let text = s.trimmingCharacters(in: .whitespaces)
+        guard !text.isEmpty else { return nil }
+        return Option(line: line, number: n, text: text, hasCursor: hasCursor)
+    }
+
+    private struct Menu {
+        let block: [Option]
+        let current: Option
+    }
+
+    /// The latest interactive numbered menu near the bottom of the screen (exactly one highlighted option).
+    private static func findMenu(_ window: [String]) -> Menu? {
+        let options = window.enumerated().compactMap { parseOption($0.element, line: $0.offset) }
+        // The latest block that starts at "1." and counts up.
+        guard let startIdx = options.lastIndex(where: { $0.number == 1 }) else { return nil }
+        var block = [options[startIdx]]
+        for o in options[(startIdx + 1)...] {
+            if o.number == block.last!.number + 1 && o.line - block.last!.line <= 4 { block.append(o) } else { break }
+        }
+        guard block.count >= 2 else { return nil }
+        let cursors = block.filter(\.hasCursor)
+        guard cursors.count == 1, let current = cursors.first else { return nil }
+        guard window.count - 1 - block.last!.line <= 8 else { return nil }
+        return Menu(block: block, current: current)
+    }
+
+    private static func menuDecision(_ window: [String]) -> Decision? {
+        guard let menu = findMenu(window) else { return nil }
+        let block = menu.block
+        let current = menu.current
+
+        // Skip multi-select checkbox menus.
+        let checkboxMarks = ["[ ]", "[x]", "[X]", "[✓]", "[✔]", "☐", "☑", "☒", "◯", "◉"]
+        if block.contains(where: { o in checkboxMarks.contains { o.text.hasPrefix($0) } }) { return nil }
+
+        let target: Option
+        if let rec = block.first(where: { $0.text.range(of: "recommended", options: .caseInsensitive) != nil }) {
+            target = rec
+        } else if let yes = block.first(where: { isYes($0.text) }) {
+            target = yes
+        } else {
+            return nil
+        }
+
+        let delta = target.number - current.number
+        var keys = Array(repeating: delta > 0 ? down : up, count: abs(delta))
+        keys.append(enter)
+
+        // Fingerprint: up to 3 non-option lines above the block + all option texts.
+        let firstLine = block.first!.line
+        let context = window[max(0, firstLine - 3)..<firstLine].joined(separator: "\n")
+        let fp = context + "\n" + block.map { "\($0.number). \($0.text)" }.joined(separator: "\n")
+
+        return Decision(keys: keys, label: cleanLabel(target.text), fingerprint: fp)
+    }
+
+    private static func isYes(_ text: String) -> Bool {
+        let t = text.lowercased()
+        return t == "yes" || t.hasPrefix("yes ") || t.hasPrefix("yes,") || t.hasPrefix("yes.") || t.hasPrefix("yes!")
+            || t.hasPrefix("yes (") || t.hasPrefix("yes -") || t.hasPrefix("yes —")
+    }
+
+    private static func cleanLabel(_ s: String) -> String {
+        s.count > 60 ? String(s.prefix(57)) + "…" : s
+    }
+
+    // MARK: Inline y/n
+
+    private static let ynPatterns = ["(y/n)", "[y/n]", "(y/N)", "[y/N]", "(Y/n)", "[Y/n]", "(yes/no)", "[yes/no]", "(Y/N)", "[Y/N]"]
+
+    private static func inlineYesNoDecision(_ window: [String]) -> Decision? {
+        guard let last = window.last else { return nil }
+        var t = last.trimmingCharacters(in: .whitespaces)
+        // allow a trailing "?" or ":" after the pattern
+        while let c = t.last, c == ":" || c == "?" || c == " " { t.removeLast() }
+        guard ynPatterns.contains(where: { t.hasSuffix($0) }) else { return nil }
+        return Decision(keys: ["y", enter], label: "y", fingerprint: "yn:" + last)
+    }
+}
