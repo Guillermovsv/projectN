@@ -6,6 +6,8 @@ import SwiftUI
 /// - Claude: the same endpoint Claude Code's `/usage` uses, authenticated with the login Claude Code keeps in the
 ///   macOS Keychain ("Claude Code-credentials"). The token is only sent to api.anthropic.com.
 /// - Codex: read locally from the latest `rate_limits` record Codex writes into ~/.codex/sessions.
+/// - Cursor: the dashboard usage the Cursor app shows, authenticated with the login cursor-agent keeps in the
+///   Keychain ("cursor-access-token"). The token is only sent to api2.cursor.sh.
 @MainActor
 final class UsageModel: ObservableObject {
     struct Window: Identifiable, Hashable {
@@ -25,6 +27,7 @@ final class UsageModel: ObservableObject {
 
     @Published private(set) var claude = ToolUsage()
     @Published private(set) var codex = ToolUsage()
+    @Published private(set) var cursor = ToolUsage()
     @Published private(set) var refreshing = false
 
     private var timer: Timer?
@@ -47,6 +50,7 @@ final class UsageModel: ObservableObject {
         let settings = store?.settings ?? AppSettings()
         Task {
             async let c = Self.fetchClaude()
+            async let k = Self.fetchCursor()
             // Task inherits MainActor here. A synchronous log scan inside it still
             // blocks typing and animation, even though readCodex is nonisolated.
             let x = await Task.detached(priority: .utility) {
@@ -61,8 +65,88 @@ final class UsageModel: ObservableObject {
                 self.claude.error = e.message
                 if self.claude.updated == nil { self.claude.updated = nil }
             }
+            switch await k {
+            case .success(let u): self.cursor = u
+            case .failure(let e): self.cursor.error = e.message
+            }
             self.refreshing = false
         }
+    }
+
+    func usage(for tool: Tool) -> ToolUsage {
+        switch tool {
+        case .codex: return codex
+        case .cursor: return cursor
+        default: return claude
+        }
+    }
+
+    // MARK: Cursor
+
+    nonisolated private static func fetchCursor() async -> Result<ToolUsage, UsageError> {
+        guard let token = keychainPassword(service: "cursor-access-token") else {
+            return .failure(UsageError(message: "Not signed in to Cursor (cursor-agent login)"))
+        }
+        var req = URLRequest(url: URL(string: "https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage")!)
+        req.httpMethod = "POST"
+        req.timeoutInterval = 15
+        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.setValue("1", forHTTPHeaderField: "Connect-Protocol-Version")
+        req.setValue("ProjectN", forHTTPHeaderField: "User-Agent")
+        req.httpBody = Data("{}".utf8)
+        do {
+            let (data, resp) = try await URLSession.shared.data(for: req)
+            let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+            guard code == 200 else {
+                return .failure(UsageError(message: code == 401 ? "Login expired — run cursor-agent login" : "HTTP \(code)"))
+            }
+            guard let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                return .failure(UsageError(message: "Unexpected response"))
+            }
+            return .success(parseCursorUsage(obj))
+        } catch {
+            return .failure(UsageError(message: error.localizedDescription))
+        }
+    }
+
+    /// `planUsage.totalPercentUsed` for the included-usage period (weekly or monthly, from the cycle dates),
+    /// plus on-demand spend against its limit when one is set.
+    nonisolated static func parseCursorUsage(_ obj: [String: Any]) -> ToolUsage {
+        func num(_ v: Any?) -> Double? {
+            if let n = v as? NSNumber { return n.doubleValue }
+            if let s = v as? String { return Double(s) }
+            return nil
+        }
+        let start = num(obj["billingCycleStart"]).map { Date(timeIntervalSince1970: $0 / 1000) }
+        let end = num(obj["billingCycleEnd"]).map { Date(timeIntervalSince1970: $0 / 1000) }
+        var label = "Period"
+        if let start, let end { label = end.timeIntervalSince(start) <= 8 * 86400 ? "Week" : "Month" }
+        var windows: [Window] = []
+        let plan = obj["planUsage"] as? [String: Any]
+        if let p = num(plan?["totalPercentUsed"]) ?? num(plan?["autoPercentUsed"]) {
+            windows.append(Window(label: label, percent: p, resetsAt: end))
+        }
+        if let s = obj["spendLimitUsage"] as? [String: Any],
+           let limit = num(s["individualLimit"]), limit > 0, let remaining = num(s["individualRemaining"]) {
+            windows.append(Window(label: "On-demand", percent: max(0, min(100, (limit - remaining) / limit * 100)), resetsAt: end))
+        }
+        return ToolUsage(windows: windows, updated: Date(), error: windows.isEmpty ? "No usage data" : nil)
+    }
+
+    nonisolated private static func keychainPassword(service: String) -> String? {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+        p.arguments = ["find-generic-password", "-s", service, "-w"]
+        let out = Pipe()
+        p.standardOutput = out
+        p.standardError = Pipe()
+        do { try p.run() } catch { return nil }
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        guard p.terminationStatus == 0 else { return nil }
+        let s = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return s.isEmpty ? nil : s
     }
 
     // MARK: Claude
@@ -200,7 +284,7 @@ struct UsageMeters: View {
 
     var body: some View {
         Button { showDetails.toggle() } label: {
-            meter(tool, tool == .codex ? usage.codex : usage.claude)
+            meter(tool, usage.usage(for: tool))
                 .padding(.horizontal, 8)
                 .frame(height: 26)
                 .background(RoundedRectangle(cornerRadius: 7).fill(Color.primary.opacity(0.06)))
@@ -228,7 +312,7 @@ struct UsageMeters: View {
                 Text("\(Int(w.percent.rounded()))%")
                     .font(.caption.monospacedDigit().weight(.semibold))
                     .foregroundStyle(usageColor(w.percent))
-                Text(w.label == "Week" ? "wk" : w.label)
+                Text(["Week": "wk", "Month": "mo", "On-demand": "extra"][w.label] ?? w.label)
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             } else {
@@ -261,7 +345,7 @@ struct UsageDetails: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack {
-                Text("\(tool.label) plan usage").font(.headline)
+                Text("Plan usage").font(.headline)
                 Spacer()
                 Button { usage.refresh() } label: {
                     if usage.refreshing { ProgressView().controlSize(.small) } else { Image(systemName: "arrow.clockwise") }
@@ -269,7 +353,12 @@ struct UsageDetails: View {
                 .buttonStyle(.hover)
                 .help("Refresh now")
             }
-            section(tool, tool == .codex ? usage.codex : usage.claude)
+            section(tool, usage.usage(for: tool))
+            // The other agents you use, for comparison (only those with data).
+            ForEach(Tool.allCases.filter { $0.hasUsageMeter && $0 != tool && !usage.usage(for: $0).windows.isEmpty }) { other in
+                Divider()
+                section(other, usage.usage(for: other))
+            }
             Text("Refreshes every minute. White < 70%, orange ≥ 70%, red ≥ 90%.")
                 .font(.caption2).foregroundStyle(.tertiary)
         }
@@ -285,7 +374,7 @@ struct UsageDetails: View {
             ForEach(u.windows) { w in
                 VStack(alignment: .leading, spacing: 3) {
                     HStack {
-                        Text(w.label == "5h" ? "5-hour window" : (w.label == "Week" ? "Weekly" : w.label)).font(.callout)
+                        Text(["5h": "5-hour window", "Week": "Weekly", "Month": "Monthly", "On-demand": "On-demand spend"][w.label] ?? w.label).font(.callout)
                         Spacer()
                         Text("\(Int(w.percent.rounded()))%").font(.callout.monospacedDigit().weight(.semibold))
                             .foregroundStyle(usageColor(w.percent))

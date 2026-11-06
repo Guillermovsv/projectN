@@ -102,7 +102,7 @@ extension Store {
         }
         var jobs: [Job] = []
         for w in state.workspaces { for s in w.spaces { for p in s.panes where runtimes[p.id]?.isRunning == true {
-            guard let rt = runtimes[p.id], p.tool != .terminal,
+            guard let rt = runtimes[p.id], p.tool == .claude || p.tool == .codex,
                   let id = p.tool == .claude ? p.claudeSessionID : p.codexSessionID else { continue }
             jobs.append(Job(wid: w.id, pane: p.id, tool: p.tool, session: id, current: p.lastPrompt, startedAt: rt.startedAt))
         } } }

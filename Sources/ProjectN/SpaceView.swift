@@ -70,7 +70,7 @@ struct SpaceView: View {
     }
 
     private func shortcutLetter(_ t: Tool) -> String {
-        switch t { case .claude: return "T"; case .codex: return "Y"; case .terminal: return "U" }
+        switch t { case .claude: return "T"; case .codex: return "Y"; case .cursor: return "I"; case .terminal: return "U" }
     }
 
     // Clicking inside a terminal (which swallows mouse events) focuses that pane.
@@ -140,7 +140,7 @@ struct AddPaneMenu: View {
         .menuIndicator(.hidden)
         .fixedSize()
         .frame(width: 28, height: 24)
-        .help(space.isFull ? "Space is full" : "Add pane — ⌘T Claude · ⌘Y Codex · ⌘U Terminal")
+        .help(space.isFull ? "Space is full" : "Add pane — ⌘T Claude · ⌘Y Codex · ⌘I Cursor · ⌘U Terminal")
     }
 
     @ViewBuilder

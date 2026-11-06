@@ -378,6 +378,7 @@ func toolColor(_ t: Tool) -> Color {
     switch t {
     case .claude: return .orange
     case .codex: return .teal
+    case .cursor: return .purple
     case .terminal: return .secondary
     }
 }

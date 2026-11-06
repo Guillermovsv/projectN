@@ -556,6 +556,10 @@ struct ToolsSettingsView: View {
                 Toggle("Pass ProjectN MCP servers (-c mcp_servers.*)", isOn: $store.settings.codexUseAppMCP)
                 Toggle("Isolate CODEX_HOME in \(AppHome.codexHomeDir.path.abbreviatingWithTilde) (separate login)", isOn: $store.settings.isolateCodexHome)
             }
+            Section("Cursor") {
+                TextField("Command", text: $store.settings.cursorCommand)
+                TextField("Extra arguments", text: $store.settings.cursorExtraArgs, prompt: Text("e.g. --model gpt-5"))
+            }
             Section("Terminal") {
                 TextField("Shell", text: $store.settings.shell)
             }

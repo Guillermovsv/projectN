@@ -349,8 +349,10 @@ struct LaunchOptionMenus: View {
                     }
                 }
             }
-            menu(icon: "gauge.with.dots.needle.50percent", value: s.effort, help: "Effort") {
-                ForEach(efforts, id: \.self) { e in item(e, o.effort == e) { set { $0.effort = e } } }
+            if pane.tool != .cursor {
+                menu(icon: "gauge.with.dots.needle.50percent", value: s.effort, help: "Effort") {
+                    ForEach(efforts, id: \.self) { e in item(e, o.effort == e) { set { $0.effort = e } } }
+                }
             }
             menu(icon: dangerous ? "exclamationmark.shield" : "lock.shield", value: s.permission, help: "Permissions", tint: dangerous ? .red : nil) {
                 ForEach(permissions) { c in
@@ -363,8 +365,12 @@ struct LaunchOptionMenus: View {
     }
 
     private var models: [LaunchCatalog.Choice] {
-        var list = pane.tool == .claude ? LaunchCatalog.claudeModels
-            : LaunchCatalog.codexModels(settings: store.settings).map { LaunchCatalog.Choice(value: $0.slug, label: $0.slug) }
+        var list: [LaunchCatalog.Choice]
+        switch pane.tool {
+        case .claude: list = LaunchCatalog.claudeModels
+        case .cursor: list = LaunchCatalog.cursorModels(settings: store.settings)
+        default: list = LaunchCatalog.codexModels(settings: store.settings).map { LaunchCatalog.Choice(value: $0.slug, label: $0.slug) }
+        }
         if let m = o.model, !list.contains(where: { $0.value == m }) { list.insert(LaunchCatalog.Choice(value: m, label: m), at: 0) }
         return list
     }
@@ -382,7 +388,7 @@ struct LaunchOptionMenus: View {
     }
 
     private var permissions: [LaunchCatalog.Choice] {
-        pane.tool == .claude ? LaunchCatalog.claudePermissions : LaunchCatalog.codexPermissions
+        LaunchCatalog.permissions(for: pane.tool)
     }
 
     private var dangerous: Bool { permissions.first { $0.value == o.permission }?.dangerous ?? false }

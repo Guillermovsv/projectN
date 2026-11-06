@@ -1,13 +1,14 @@
 import Foundation
 
 enum Tool: String, Codable, CaseIterable, Identifiable {
-    case claude, codex, terminal
+    case claude, codex, cursor, terminal
     var id: String { rawValue }
 
     var label: String {
         switch self {
         case .claude: return "Claude"
         case .codex: return "Codex"
+        case .cursor: return "Cursor"
         case .terminal: return "Terminal"
         }
     }
@@ -16,9 +17,13 @@ enum Tool: String, Codable, CaseIterable, Identifiable {
         switch self {
         case .claude: return "sparkle"
         case .codex: return "chevron.left.forwardslash.chevron.right"
+        case .cursor: return "cursorarrow.rays"
         case .terminal: return "terminal"
         }
     }
+
+    /// Agents whose plan usage ProjectN shows in the top bar.
+    var hasUsageMeter: Bool { self != .terminal }
 }
 
 struct Project: Codable, Identifiable, Hashable {
@@ -44,6 +49,8 @@ struct Pane: Codable, Identifiable, Hashable {
     var claudeSessionID: String?
     /// Codex session discovered from ~/.codex/sessions after launch (`codex resume <id>` afterwards).
     var codexSessionID: String?
+    /// Cursor Agent chat created with `cursor-agent create-chat` (`--resume <id>` on every launch).
+    var cursorSessionID: String?
     /// Latest prompt sent from ProjectN (sticky header). Survives relaunch.
     var lastPrompt: String?
     var createdAt = Date()
@@ -176,6 +183,8 @@ struct AppSettings: Codable, Equatable {
     var claudeExtraArgs: String = ""
     var codexCommand: String = "codex"
     var codexExtraArgs: String = ""
+    var cursorCommand: String = "cursor-agent"
+    var cursorExtraArgs: String = ""
     /// Pass ~/.projectn/mcp.json to Claude via --mcp-config
     var claudeUseAppMCP: Bool = true
     /// Translate ~/.projectn/mcp.json into `-c mcp_servers.*` overrides for Codex
@@ -195,6 +204,7 @@ struct AppSettings: Codable, Equatable {
     /// Defaults applied to new panes.
     var claudeDefaults = LaunchOptions()
     var codexDefaults = LaunchOptions()
+    var cursorDefaults = LaunchOptions()
     /// Built-in NVoice dictation (hold fn anywhere to talk, text is pasted at the cursor).
     var voiceEnabled: Bool = true
     /// Show NVoice's waveform icon in the macOS menu bar (person, language, mic, correct last dictation).
@@ -211,6 +221,8 @@ struct AppSettings: Codable, Equatable {
         claudeExtraArgs = (try? c.decode(String.self, forKey: .claudeExtraArgs)) ?? d.claudeExtraArgs
         codexCommand = (try? c.decode(String.self, forKey: .codexCommand)) ?? d.codexCommand
         codexExtraArgs = (try? c.decode(String.self, forKey: .codexExtraArgs)) ?? d.codexExtraArgs
+        cursorCommand = (try? c.decode(String.self, forKey: .cursorCommand)) ?? d.cursorCommand
+        cursorExtraArgs = (try? c.decode(String.self, forKey: .cursorExtraArgs)) ?? d.cursorExtraArgs
         claudeUseAppMCP = (try? c.decode(Bool.self, forKey: .claudeUseAppMCP)) ?? d.claudeUseAppMCP
         codexUseAppMCP = (try? c.decode(Bool.self, forKey: .codexUseAppMCP)) ?? d.codexUseAppMCP
         isolateClaudeConfig = (try? c.decode(Bool.self, forKey: .isolateClaudeConfig)) ?? d.isolateClaudeConfig
@@ -222,6 +234,7 @@ struct AppSettings: Codable, Equatable {
         apiKeyNames = (try? c.decode([String].self, forKey: .apiKeyNames)) ?? d.apiKeyNames
         claudeDefaults = (try? c.decode(LaunchOptions.self, forKey: .claudeDefaults)) ?? d.claudeDefaults
         codexDefaults = (try? c.decode(LaunchOptions.self, forKey: .codexDefaults)) ?? d.codexDefaults
+        cursorDefaults = (try? c.decode(LaunchOptions.self, forKey: .cursorDefaults)) ?? d.cursorDefaults
         voiceEnabled = (try? c.decode(Bool.self, forKey: .voiceEnabled)) ?? d.voiceEnabled
         voiceMenuBarIcon = (try? c.decode(Bool.self, forKey: .voiceMenuBarIcon)) ?? d.voiceMenuBarIcon
     }

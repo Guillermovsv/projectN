@@ -216,6 +216,7 @@ struct AppCommands: Commands {
         switch tool {
         case .claude: return "t"
         case .codex: return "y"
+        case .cursor: return "i"
         case .terminal: return "u"
         }
     }

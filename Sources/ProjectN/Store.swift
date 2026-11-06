@@ -338,6 +338,7 @@ final class Store: ObservableObject {
         switch tool {
         case .claude: pane.launchOptions = LaunchCatalog.explicit(settings.claudeDefaults, tool: .claude, settings: settings)
         case .codex: pane.launchOptions = LaunchCatalog.explicit(settings.codexDefaults, tool: .codex, settings: settings)
+        case .cursor: pane.launchOptions = LaunchCatalog.explicit(settings.cursorDefaults, tool: .cursor, settings: settings)
         case .terminal: break
         }
         updateWorkspace(wid) { if !$0.projectIDs.contains(pid) { $0.projectIDs.append(pid) } }
@@ -382,6 +383,9 @@ final class Store: ObservableObject {
             } else if pane.codexSessionID != nil {
                 updatePane(pane.id, in: wid) { $0.codexSessionID = nil }
             }
+        case .cursor:
+            // Resume the pane's chat; a fresh pane gets a new chat id in the background (see below).
+            if resume, let id = pane.cursorSessionID { mode = .cursorResume(id: id) }
         case .terminal:
             break
         }
@@ -400,6 +404,11 @@ final class Store: ObservableObject {
                !SessionDiscovery.claudeTranscriptExists(id: id, settings: settings) {
                 mode = .claudeNew(id: id)
             }
+            var newCursorChat: String?
+            if pane.tool == .cursor, case .fresh = mode, let id = LaunchCatalog.createCursorChat(settings: settings) {
+                newCursorChat = id
+                mode = .cursorResume(id: id)
+            }
             let restored = pane.tool == .terminal && resume
                 ? try? String(contentsOf: scrollback, encoding: .utf8) : nil
             let plan = Launcher.plan(tool: pane.tool, mode: mode, options: options,
@@ -408,6 +417,7 @@ final class Store: ObservableObject {
                 guard let self, self.pendingLaunches[pane.id] == token,
                       let (_, current) = self.pane(pane.id, in: wid) else { return }
                 self.pendingLaunches.removeValue(forKey: pane.id)
+                if let newCursorChat { self.updatePane(pane.id, in: wid) { $0.cursorSessionID = newCursorChat } }
                 let rt = TerminalSession(id: pane.id, plan: plan, fontSize: self.settings.fontSize,
                                          restoredText: restored, waitFor: previous)
                 rt.onExit = { [weak self] _ in self?.objectWillChange.send() }
@@ -453,7 +463,7 @@ final class Store: ObservableObject {
 
     func focusPane(_ id: UUID, in wid: UUID) {
         guard let (s, p) = pane(id, in: wid) else { return }
-        if p.tool != .terminal { UserDefaults.standard.set(p.tool.rawValue, forKey: "lastAgentTool") }
+        if p.tool.hasUsageMeter { UserDefaults.standard.set(p.tool.rawValue, forKey: "lastAgentTool") }
         guard s.focusedPaneID != id else { return }
         updateSpace(s.id, in: wid) { $0.focusedPaneID = id }
     }
@@ -509,8 +519,10 @@ final class Store: ObservableObject {
     private func makeLaunchOptionsExplicit() {
         let c = LaunchCatalog.explicit(settings.claudeDefaults, tool: .claude, settings: settings)
         let x = LaunchCatalog.explicit(settings.codexDefaults, tool: .codex, settings: settings)
+        let k = LaunchCatalog.explicit(settings.cursorDefaults, tool: .cursor, settings: settings)
         if c != settings.claudeDefaults { settings.claudeDefaults = c }
         if x != settings.codexDefaults { settings.codexDefaults = x }
+        if k != settings.cursorDefaults { settings.cursorDefaults = k }
         var st = state
         var changed = false
         for wi in st.workspaces.indices {
@@ -551,6 +563,7 @@ final class Store: ObservableObject {
         switch tool {
         case .claude: settings.claudeDefaults = options
         case .codex: settings.codexDefaults = options
+        case .cursor: settings.cursorDefaults = options
         case .terminal: break
         }
     }
@@ -665,10 +678,10 @@ final class Store: ObservableObject {
 
     /// The agent type whose usage the top bar shows: the focused pane's, else the last agent you focused.
     var activeAgentTool: Tool {
-        if let s = selectedSpace, let p = s.panes.first(where: { $0.id == s.focusedPaneID }) ?? s.panes.first, p.tool != .terminal {
+        if let s = selectedSpace, let p = s.panes.first(where: { $0.id == s.focusedPaneID }) ?? s.panes.first, p.tool.hasUsageMeter {
             return p.tool
         }
-        if let s = selectedSpace, let p = s.panes.last(where: { $0.tool != .terminal }), s.focusedPaneID == nil { return p.tool }
+        if let s = selectedSpace, let p = s.panes.last(where: { $0.tool.hasUsageMeter }), s.focusedPaneID == nil { return p.tool }
         return Tool(rawValue: UserDefaults.standard.string(forKey: "lastAgentTool") ?? "") ?? .claude
     }
 
