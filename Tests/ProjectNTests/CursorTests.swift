@@ -34,3 +34,41 @@ struct CursorTests {
         #expect(plan.commandLine == "cursor-agent --resume abc --model gpt-5 --mode ask")
     }
 }
+
+struct CursorAutoTests {
+    private let approval = [
+        "$ cd /Users/me/Developer/App && wc -l src/a.ts",
+        "  src/b.ts in .",
+        "",
+        "Run this command?",
+        "Not in allowlist: wc",
+        " → Run (once) (y)",
+        "   Add Shell(wc) to allowlist? (tab)",
+        "   Run Everything (shift+tab)",
+        "   Skip & tell the agent what to do instead (esc or n)",
+        "",
+        "",
+    ]
+
+    @Test func approvesCommandOnce() {
+        let d = AutoResponder.decide(screen: approval)
+        #expect(d?.keys == ["y"])
+        #expect(d?.label == "Run (once)")
+    }
+
+    @Test func reportsPendingPrompt() {
+        #expect(AutoResponder.pendingPrompt(screen: approval) == "Not in allowlist: wc")
+    }
+
+    @Test func fingerprintIgnoresSelectionArrow() {
+        var moved = approval
+        moved[5] = "   Run (once) (y)"
+        moved[6] = " → Add Shell(wc) to allowlist? (tab)"
+        #expect(AutoResponder.decide(screen: moved)?.fingerprint == AutoResponder.decide(screen: approval)?.fingerprint)
+    }
+
+    @Test func ignoresStrayKeyHintsInOutput() {
+        #expect(AutoResponder.decide(screen: ["Press any key to continue (y)", ""]) == nil)
+        #expect(AutoResponder.decide(screen: Array(approval.prefix(9)) + Array(repeating: "output line", count: 12)) == nil)
+    }
+}

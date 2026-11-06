@@ -8,6 +8,7 @@ import Foundation
 ///     otherwise the first option starting with "Yes". If neither exists, do nothing.
 ///   • Multi-select (checkbox) menus are skipped.
 ///   • Inline prompts ending in (y/n), [y/N], [Y/n], (yes/no): answer "y".
+///   • Cursor Agent key-hint menus (`→ Run (once) (y)` … `Skip … (esc or n)`): press "y".
 enum AutoResponder {
     struct Decision: Equatable {
         /// Key presses to send, one write each (TUIs parse one key per read more reliably).
@@ -45,6 +46,7 @@ enum AutoResponder {
         // The last line is where input goes, so an inline y/n prompt there wins over any menu still drawn above it.
         if let d = inlineYesNoDecision(window) { return d }
         if let d = menuDecision(window) { return d }
+        if let d = keyHintDecision(window) { return d }
         return nil
     }
 
@@ -53,6 +55,10 @@ enum AutoResponder {
     static func pendingPrompt(screen: [String]) -> String? {
         guard let window = window(screen) else { return nil }
         if inlineYesNoDecision(window) != nil { return window.last }
+        if let hint = findKeyHintMenu(window) {
+            return window[max(0, hint.first - 4)..<hint.first].reversed()
+                .first { !$0.isEmpty && $0.rangeOfCharacter(from: .letters) != nil } ?? "Choose an option"
+        }
         guard let menu = findMenu(window) else { return nil }
         let first = menu.block.first!.line
         // The closest non-empty line above the options that isn't decoration is usually the question.
@@ -159,5 +165,66 @@ enum AutoResponder {
         while let c = t.last, c == ":" || c == "?" || c == " " { t.removeLast() }
         guard ynPatterns.contains(where: { t.hasSuffix($0) }) else { return nil }
         return Decision(keys: ["y", enter], label: "y", fingerprint: "yn:" + last)
+    }
+
+    // MARK: Key-hint menus (Cursor Agent)
+
+    /// Cursor Agent draws approvals as an unnumbered list whose options end in the key that picks them:
+    ///
+    ///     Run this command?
+    ///     Not in allowlist: wc
+    ///     → Run (once) (y)
+    ///       Add Shell(wc) to allowlist? (tab)
+    ///       Run Everything (shift+tab)
+    ///       Skip & tell the agent what to do instead (esc or n)
+    ///
+    /// Auto presses "y" (approve this once — it never widens the allowlist or switches to Run Everything).
+    private struct KeyHintMenu {
+        let first: Int      // first option line
+        let yes: Int        // the "(y)" option line
+        let last: Int       // last option line
+    }
+
+    /// The keys in a trailing "(…)" hint, e.g. "Skip … (esc or n)" → ["esc", "n"].
+    private static func hintKeys(_ line: String) -> [String]? {
+        guard let r = line.range(of: "\\(([^()]+)\\)\\s*$", options: .regularExpression) else { return nil }
+        let inner = line[r].trimmingCharacters(in: .whitespaces).dropFirst().dropLast()
+        let keys = inner.lowercased().components(separatedBy: CharacterSet(charactersIn: ",/"))
+            .flatMap { $0.components(separatedBy: " or ") }
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        guard !keys.isEmpty, keys.allSatisfy({ $0.count <= 12 && !$0.contains(" ") }) else { return nil }
+        return keys
+    }
+
+    private static func stripCursor(_ line: String) -> String {
+        var s = Substring(line)
+        if let f = s.first, cursorGlyphs.contains(f) || f == ">" || f == "→" { s = s.dropFirst() }
+        return s.trimmingCharacters(in: .whitespaces)
+    }
+
+    private static func findKeyHintMenu(_ window: [String]) -> KeyHintMenu? {
+        // The latest option answered by "y", close to the bottom of the screen.
+        guard let yes = window.lastIndex(where: { hintKeys($0) == ["y"] }),
+              window.count - 1 - yes <= 8 else { return nil }
+        // Contiguous run of key-hinted lines around it.
+        var first = yes, last = yes
+        while first > 0, hintKeys(window[first - 1]) != nil { first -= 1 }
+        while last + 1 < window.count, hintKeys(window[last + 1]) != nil { last += 1 }
+        // Only a real menu: it must also offer a way to decline ("n" / "esc").
+        let hasNo = (first...last).contains { i in
+            hintKeys(window[i]).map { $0.contains("n") || $0.contains("esc") } ?? false
+        }
+        guard hasNo, last > first else { return nil }
+        return KeyHintMenu(first: first, yes: yes, last: last)
+    }
+
+    private static func keyHintDecision(_ window: [String]) -> Decision? {
+        guard let menu = findKeyHintMenu(window) else { return nil }
+        // Fingerprint ignores where the selection arrow is.
+        let fp = window[max(0, menu.first - 3)...menu.last].map(stripCursor).joined(separator: "\n")
+        let label = stripCursor(window[menu.yes])
+            .replacingOccurrences(of: "\\s*\\(y\\)\\s*$", with: "", options: .regularExpression)
+        return Decision(keys: ["y"], label: cleanLabel(label.isEmpty ? "Yes" : label), fingerprint: "keys:" + fp)
     }
 }
