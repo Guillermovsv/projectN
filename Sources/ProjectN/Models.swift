@@ -22,8 +22,8 @@ enum Tool: String, Codable, CaseIterable, Identifiable {
         }
     }
 
-    /// Claude and Codex report plan usage that ProjectN can read; Cursor doesn't.
-    var hasUsageMeter: Bool { self == .claude || self == .codex }
+    /// Agents whose plan usage ProjectN shows in the top bar.
+    var hasUsageMeter: Bool { self != .terminal }
 }
 
 struct Project: Codable, Identifiable, Hashable {
