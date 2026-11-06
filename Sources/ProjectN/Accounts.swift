@@ -84,6 +84,21 @@ struct AccountProvider: Identifiable {
                 return .unknown(t)
             }),
         AccountProvider(
+            id: "cursor", name: "Cursor", symbol: "cursorarrow.rays", color: .purple, binary: "cursor-agent",
+            statusCommand: "cursor-agent status", loginCommand: "cursor-agent login", logoutCommand: "cursor-agent logout",
+            installHint: "curl https://cursor.com/install -fsS | bash",
+            parse: { out, _ in
+                let t = out.replacingOccurrences(of: "\u{1B}\\[[0-9;?]*[A-Za-z]", with: "", options: .regularExpression)
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                let lower = t.lowercased()
+                if lower.contains("not logged in") || lower.contains("not authenticated") { return .signedOut }
+                if lower.contains("logged in") {
+                    let email = t.range(of: "[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]+", options: .regularExpression).map { String(t[$0]) }
+                    return .signedIn(account: email, detail: "Cursor account")
+                }
+                return .unknown(t)
+            }),
+        AccountProvider(
             id: "github", name: "GitHub", symbol: "arrow.triangle.branch", color: .purple, binary: "gh",
             statusCommand: "gh auth status", loginCommand: "gh auth login", logoutCommand: "gh auth logout",
             installHint: "brew install gh",

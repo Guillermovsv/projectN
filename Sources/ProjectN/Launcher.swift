@@ -16,6 +16,7 @@ enum Launcher {
         case claudeNew(id: String)        // claude --session-id <id>
         case claudeResume(id: String)     // claude --resume <id>
         case codexResume(id: String)      // codex resume <id>
+        case cursorResume(id: String)     // cursor-agent --resume <id>
     }
 
     static func plan(tool: Tool, mode: SessionMode, options: LaunchOptions = LaunchOptions(), project: Project, workspaceName: String, settings: AppSettings) -> Plan {
@@ -44,6 +45,11 @@ enum Launcher {
             parts += LaunchCatalog.codexArgs(options)
             parts += Shell.split(settings.codexExtraArgs)
             if let resumeID { parts.append(resumeID) }
+        case .cursor:
+            parts = Shell.split(settings.cursorCommand)
+            if case .cursorResume(let id) = mode { parts += ["--resume", id] }
+            parts += LaunchCatalog.cursorArgs(options)
+            parts += Shell.split(settings.cursorExtraArgs)
         case .terminal:
             break
         }

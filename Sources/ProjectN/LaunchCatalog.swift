@@ -131,6 +131,124 @@ enum LaunchCatalog {
         return a
     }
 
+    // MARK: Cursor
+
+    /// Models from `cursor-agent models` (needs a signed-in account), cached; "auto" until it has been read.
+    nonisolated(unsafe) private static var cursorCache: [Choice]?
+    nonisolated(unsafe) private static var cursorLoading = false
+    private static let cursorFallback = [Choice(value: "auto", label: "Auto", detail: "Cursor picks the model")]
+
+    static func cursorModels(settings: AppSettings) -> [Choice] {
+        if let c = cursorCache, !c.isEmpty { return c }
+        refreshCursorModels(settings: settings)
+        return cursorFallback
+    }
+
+    /// Reads the account's model list in the background (the CLI talks to Cursor's servers).
+    static func refreshCursorModels(settings: AppSettings) {
+        guard !cursorLoading else { return }
+        cursorLoading = true
+        DispatchQueue.global(qos: .utility).async {
+            let out = runCursor(["models"], settings: settings, timeout: 20) ?? ""
+            let models = parseCursorModels(out)
+            DispatchQueue.main.async {
+                if !models.isEmpty { cursorCache = models }
+                cursorLoading = false
+            }
+        }
+    }
+
+    /// Lines look like `gpt-5 - GPT-5` or `sonnet-4.5 - Claude 4.5 Sonnet (current)`.
+    static func parseCursorModels(_ out: String) -> [Choice] {
+        var seen = Set<String>()
+        var list: [Choice] = []
+        for raw in out.components(separatedBy: .newlines) {
+            let line = raw.replacingOccurrences(of: "\u{1B}\\[[0-9;]*m", with: "", options: .regularExpression)
+                .trimmingCharacters(in: .whitespaces)
+            guard let r = line.range(of: " - ") else { continue }
+            let slug = String(line[..<r.lowerBound]).trimmingCharacters(in: .whitespaces)
+            guard !slug.isEmpty, !slug.contains(" "), seen.insert(slug).inserted else { continue }
+            let name = String(line[r.upperBound...])
+                .replacingOccurrences(of: "\\s*\\((current|default)\\)", with: "", options: [.regularExpression, .caseInsensitive])
+                .trimmingCharacters(in: .whitespaces)
+            list.append(Choice(value: slug, label: name.isEmpty ? slug : name))
+        }
+        return list
+    }
+
+    /// Runs the Cursor CLI through the login shell (so ~/.local/bin is on PATH) and returns its output.
+    /// `firstLineOnly` stops as soon as a line arrives — `create-chat` prints the id and then keeps running.
+    nonisolated static func runCursor(_ args: [String], settings: AppSettings, timeout: TimeInterval, firstLineOnly: Bool = false) -> String? {
+        let shell = settings.shell.isEmpty ? "/bin/zsh" : settings.shell
+        let command = (Shell.split(settings.cursorCommand) + args).map(Shell.quote).joined(separator: " ")
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: shell)
+        p.arguments = ["-l", "-c", command]
+        p.currentDirectoryURL = FileManager.default.homeDirectoryForCurrentUser
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = FileHandle.nullDevice
+        p.standardInput = FileHandle.nullDevice
+        let buffer = OutputBuffer()
+        let done = DispatchSemaphore(value: 0)
+        pipe.fileHandleForReading.readabilityHandler = { h in
+            let chunk = h.availableData
+            if chunk.isEmpty { h.readabilityHandler = nil; done.signal(); return }
+            if buffer.append(chunk), firstLineOnly { h.readabilityHandler = nil; done.signal() }
+        }
+        do { try p.run() } catch { return nil }
+        _ = done.wait(timeout: .now() + timeout)
+        if p.isRunning { p.terminate() }
+        return String(data: buffer.data, encoding: .utf8)
+    }
+
+    /// Thread-safe output collector; `append` returns true once a full line has arrived.
+    private final class OutputBuffer: @unchecked Sendable {
+        private let lock = NSLock()
+        private var bytes = Data()
+        var data: Data { lock.lock(); defer { lock.unlock() }; return bytes }
+        func append(_ chunk: Data) -> Bool {
+            lock.lock(); defer { lock.unlock() }
+            bytes.append(chunk)
+            return bytes.contains(UInt8(ascii: "\n"))
+        }
+    }
+
+    /// A new, empty Cursor chat bound to a pane (so it can be resumed after a restart).
+    nonisolated static func createCursorChat(settings: AppSettings) -> String? {
+        guard let out = runCursor(["create-chat"], settings: settings, timeout: 15, firstLineOnly: true) else { return nil }
+        let pattern = "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+        return out.range(of: pattern, options: .regularExpression).map { String(out[$0]).lowercased() }
+    }
+
+    static let cursorPermissions: [Choice] = [
+        Choice(value: "manual", label: "Ask", detail: "Ask before commands not on your allowlist"),
+        Choice(value: "plan", label: "Plan", detail: "Read-only planning, no edits"),
+        Choice(value: "ask", label: "Q&A", detail: "Read-only questions and explanations"),
+        Choice(value: "force", label: "Run everything", detail: "Allow every command unless denied", dangerous: true),
+    ]
+
+    static func cursorArgs(_ o: LaunchOptions) -> [String] {
+        var a: [String] = []
+        if let m = o.model, m != "auto" { a += ["--model", m] }
+        switch o.permission {
+        case "plan": a += ["--mode", "plan"]
+        case "ask": a += ["--mode", "ask"]
+        case "force": a.append("--force")
+        default: break
+        }
+        return a
+    }
+
+    /// Model from ~/.cursor/cli-config.json if the user chose one in the CLI, else "auto".
+    static func cursorConfiguredModel() -> String {
+        let file = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".cursor/cli-config.json")
+        let cfg = (try? Data(contentsOf: file)).flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] } ?? [:]
+        if let m = cfg["model"] as? [String: Any], let id = (m["modelId"] ?? m["id"]) as? String, !id.isEmpty { return id }
+        if let m = cfg["model"] as? String, !m.isEmpty { return m }
+        return "auto"
+    }
+
     // MARK: Explicit values (no "Default")
 
     /// What each CLI would use on its own, resolved to concrete values from its config files.
@@ -166,6 +284,9 @@ enum LaunchCatalog {
             default: permission = "workspace"
             }
             return LaunchOptions(model: model, effort: effort, permission: permission)
+        case .cursor:
+            // Cursor Agent has no reasoning-effort setting.
+            return LaunchOptions(model: cursorConfiguredModel(), effort: "", permission: "manual")
         case .terminal:
             return LaunchOptions()
         }
@@ -181,7 +302,11 @@ enum LaunchCatalog {
     }
 
     static func modelLabel(_ value: String, tool: Tool) -> String {
-        tool == .claude ? (claudeModels.first { $0.value == value }?.label ?? value) : value
+        switch tool {
+        case .claude: return claudeModels.first { $0.value == value }?.label ?? value
+        case .cursor: return value == "auto" ? "Auto" : value
+        default: return value
+        }
     }
 
     // MARK: Labels
@@ -189,8 +314,17 @@ enum LaunchCatalog {
     static func summary(_ o: LaunchOptions, tool: Tool, settings: AppSettings) -> (model: String, effort: String, permission: String) {
         guard tool != .terminal else { return ("", "", "") }
         let x = explicit(o, tool: tool, settings: settings)
-        let perms = tool == .claude ? claudePermissions : codexPermissions
+        let perms = permissions(for: tool)
         let p = x.permission.map { v in perms.first { $0.value == v }?.label ?? v } ?? ""
         return (modelLabel(x.model ?? "", tool: tool), x.effort ?? "", p)
+    }
+
+    static func permissions(for tool: Tool) -> [Choice] {
+        switch tool {
+        case .claude: return claudePermissions
+        case .codex: return codexPermissions
+        case .cursor: return cursorPermissions
+        case .terminal: return []
+        }
     }
 }
