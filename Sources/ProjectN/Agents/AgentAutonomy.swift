@@ -108,7 +108,8 @@ extension AgentHarness {
         let tool = payload["tool_name"] as? String ?? ""
         let input = payload["tool_input"] as? [String: Any] ?? [:]
         let ctx = ApprovalPolicy.Context(permission: profile.permission, projectPath: project.path,
-                                         cliTools: profile.cliTools, cwd: payload["cwd"] as? String, autonomy: profile.autonomy)
+                                         cliTools: profile.cliTools, cwd: payload["cwd"] as? String, autonomy: profile.autonomy,
+                                         autoMode: profile.autoMode)
         let tier = ApprovalPolicy.decide(tool: tool, input: input, ctx)
         let summary = Self.describe(tool: tool, input: input)
         switch tier {
@@ -282,6 +283,12 @@ extension AgentHarness {
             // agent ends its turn, and the answer is typed into the same session when it comes.
             let q = (a["question"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
             guard !q.isEmpty else { reply("Missing `question`.", true); return }
+            if profile.autoMode {
+                AuditLog.record("question.skipped", ["task": t.id.uuidString, "agent": t.agentName, "question": q])
+                reply("Auto mode is on: nobody will answer questions. Decide yourself — use the project's files and notes, "
+                      + "pick the most reasonable option, state your assumption in one line in your final answer, and continue now.", false)
+                return
+            }
             if let open = t.awaitingAnswer, requests.contains(where: { $0.id == open && $0.isPending }) {
                 reply("You already have a question waiting for an answer. End your turn now; the answer will arrive as your next message.", false)
                 return
@@ -317,7 +324,7 @@ extension AgentHarness {
             let list = availableAgents().filter { $0.id != profile.id }.map { p -> [String: Any] in
                 let servers = Set(p.mcpServers + (p.useClaudeMCP && p.runtime == .claudeCode ? inherited : []))
                 return ["name": p.name, "role": p.role, "runtime": p.runtime.label, "model": p.model, "access": p.permission.label,
-                        "autonomy": p.autonomy.label,
+                        "autonomy": p.autoMode ? "Auto mode" : p.autonomy.label,
                         "projects": p.allProjects ? "all" : (store?.state.projects.filter { p.mayAccess($0.id) }.map(\.name).joined(separator: ", ") ?? ""),
                         "mcp_servers_in_this_project": servers.sorted(), "cli_tools": p.cliTools, "can_delegate": p.canDelegate,
                         "busy": tasks.contains { $0.agentID == p.id && $0.status.isActive }]
@@ -424,7 +431,7 @@ extension AgentHarness {
             guard !FileManager.default.fileExists(atPath: path) else { reply(ProjectCreationError.exists(path).description, true); return }
             let about = a["description"] as? String
             // Cautious agents ask first; others create it (it's an empty folder + README, nothing is lost).
-            if profile.autonomy != .cautious {
+            if profile.autonomy != .cautious || profile.autoMode {
                 switch createProject(name: rawName, description: about, by: t.agentName) {
                 case .success(let p):
                     reply(Self.json(["project": p.name, "path": p.path, "next": "Delegate work with delegate_task(project: \"\(p.name)\")."]), false)
@@ -528,7 +535,7 @@ enum AgentTools {
         var tools = [tool("save_project_note", "Save one durable fact about this project for every agent that works on it: where tasks / docs live (Notion page or database links and IDs), site URLs, MCP server names, conventions, decisions. No secrets.",
                           ["note": str("The fact, self-contained, with links / IDs.")], ["note"]),
                      tool("ask", "Ask whoever gave you this task (the coordinating agent or the user) a question you can't resolve yourself. Returns immediately: then end your turn with one short line. The answer arrives as your next message in this session.",
-                          ["question": str("The question, self-contained, with options if any.")], ["question"])]
+                          ["question": str("Self-contained. One line of context, then the question(s) as a numbered list (1., 2.…); put choices under each as `- a) …`, `- b) …`.")], ["question"])]
         guard canDelegate else { return tools }
         tools += [
             tool("list_agents", "List the agents you can delegate to: role, runtime, access, projects, MCP servers and CLI tools.", [:], []),

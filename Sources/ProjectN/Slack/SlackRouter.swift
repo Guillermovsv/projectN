@@ -168,27 +168,169 @@ enum SlackRouter {
 
     // MARK: Formatting
 
-    /// Markdown (as agents write it) → Slack mrkdwn.
+    /// Markdown (as agents write it) → Slack mrkdwn: headings, bold / italic / strike, links and images,
+    /// bullet / numbered / task lists (nested ones indented), tables (as lists) and separators.
     static func toSlack(_ md: String) -> String {
         var out: [String] = []
         var inCode = false
+        var table: [[String]] = []
+
+        func flushTable() {
+            guard !table.isEmpty else { return }
+            out += tableLines(table)
+            table = []
+        }
+
         for raw in md.components(separatedBy: "\n") {
             var line = raw
-            if line.trimmingCharacters(in: .whitespaces).hasPrefix("```") { inCode.toggle(); out.append("```"); continue }
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.hasPrefix("```") { flushTable(); inCode.toggle(); out.append("```"); continue }
             if inCode { out.append(line); continue }
-            if let r = line.range(of: #"^#{1,6}\s+"#, options: .regularExpression) {
-                line = "*" + line[r.upperBound...].replacingOccurrences(of: "**", with: "") + "*"
-            } else {
-                line = line.replacingOccurrences(of: #"\*\*(.+?)\*\*"#, with: "*$1*", options: .regularExpression)
-                line = line.replacingOccurrences(of: #"__(.+?)__"#, with: "*$1*", options: .regularExpression)
+            if trimmed.hasPrefix("|") && trimmed.count > 1 {
+                let cells = trimmed.trimmingCharacters(in: CharacterSet(charactersIn: "|"))
+                    .components(separatedBy: "|").map { $0.trimmingCharacters(in: .whitespaces) }
+                // The |---|:---:| row under the header.
+                if !cells.allSatisfy({ $0.range(of: #"^:?-{2,}:?$"#, options: .regularExpression) != nil }) {
+                    table.append(cells.map(inline))
+                }
+                continue
             }
-            line = line.replacingOccurrences(of: #"\[([^\]]+)\]\((https?://[^)\s]+)\)"#, with: "<$2|$1>", options: .regularExpression)
-            line = line.replacingOccurrences(of: #"^(\s*)[-*] \[ \]"#, with: "$1☐", options: .regularExpression)
-            line = line.replacingOccurrences(of: #"^(\s*)[-*] \[x\]"#, with: "$1☑", options: [.regularExpression, .caseInsensitive])
-            line = line.replacingOccurrences(of: #"^(\s*)[-*] "#, with: "$1• ", options: .regularExpression)
+            flushTable()
+            if trimmed.range(of: #"^([-*_])(\s*\1){2,}$"#, options: .regularExpression) != nil {
+                out.append("──────────")
+                continue
+            }
+            if let r = line.range(of: #"^#{1,6}\s+"#, options: .regularExpression) {
+                let title = String(line[r.upperBound...]).replacingOccurrences(of: "**", with: "")
+                if let last = out.last, !last.isEmpty { out.append("") }
+                out.append("*" + inline(title).trimmingCharacters(in: .whitespaces) + "*")
+                continue
+            }
+            line = inline(line)
+            // Lists: task items, bullets (nested ones get ◦), numbered items.
+            line = line.replacingOccurrences(of: #"^(\s*)[-*+] \[ \]"#, with: "$1☐", options: .regularExpression)
+            line = line.replacingOccurrences(of: #"^(\s*)[-*+] \[x\]"#, with: "$1☑", options: [.regularExpression, .caseInsensitive])
+            if let m = line.range(of: #"^(\s*)[-*+] "#, options: .regularExpression) {
+                let indent = line[m].prefix { $0 == " " || $0 == "\t" }.count
+                line = (indent >= 2 ? "      ◦ " : "• ") + line[m.upperBound...]
+            } else if let m = line.range(of: #"^\s{2,}\d+[.)] "#, options: .regularExpression) {
+                line = "      " + line[m].trimmingCharacters(in: .whitespaces) + line[m.upperBound...]
+            }
             out.append(line)
         }
-        return out.joined(separator: "\n")
+        flushTable()
+        // At most one blank line in a row, none at the ends.
+        var compact: [String] = []
+        for l in out where !(l.trimmingCharacters(in: .whitespaces).isEmpty && (compact.last?.trimmingCharacters(in: .whitespaces).isEmpty ?? true)) {
+            compact.append(l)
+        }
+        while compact.last?.trimmingCharacters(in: .whitespaces).isEmpty == true { compact.removeLast() }
+        return compact.joined(separator: "\n")
+    }
+
+    /// Inline Markdown → mrkdwn (outside code spans).
+    static func inline(_ s: String) -> String {
+        // Split on `code` spans so their contents stay as written.
+        let parts = s.components(separatedBy: "`")
+        return parts.enumerated().map { i, part in
+            guard i % 2 == 0 else { return part }
+            var l = part
+            l = l.replacingOccurrences(of: #"!\[([^\]]*)\]\((https?://[^)\s]+)\)"#, with: "<$2|$1>", options: .regularExpression)
+            l = l.replacingOccurrences(of: #"\[([^\]]+)\]\((https?://[^)\s]+)\)"#, with: "<$2|$1>", options: .regularExpression)
+            l = l.replacingOccurrences(of: #"(?<![*\w])\*(?![\s*])(.+?)(?<![\s*])\*(?![*\w])"#, with: "_$1_", options: .regularExpression)
+            l = l.replacingOccurrences(of: #"\*\*(.+?)\*\*"#, with: "*$1*", options: .regularExpression)
+            l = l.replacingOccurrences(of: #"__(.+?)__"#, with: "*$1*", options: .regularExpression)
+            l = l.replacingOccurrences(of: #"~~(.+?)~~"#, with: "~$1~", options: .regularExpression)
+            return l
+        }.joined(separator: "`")
+    }
+
+    /// A Markdown table as a list (Slack can't show tables): one bullet per row, labelled by the header.
+    static func tableLines(_ rows: [[String]]) -> [String] {
+        guard rows.count > 1 else { return rows.map { "• " + $0.filter { !$0.isEmpty }.joined(separator: " · ") } }
+        let header = rows[0]
+        return rows.dropFirst().map { row in
+            let first = row.first ?? ""
+            let rest = row.dropFirst().enumerated().compactMap { i, cell -> String? in
+                guard !cell.isEmpty else { return nil }
+                let h = i + 1 < header.count ? header[i + 1] : ""
+                return header.count == 2 || h.isEmpty ? cell : "\(h): \(cell)"
+            }
+            let head = first.isEmpty ? "" : "*\(first.replacingOccurrences(of: "*", with: ""))*"
+            return "• " + ([head].filter { !$0.isEmpty } + [rest.joined(separator: " · ")].filter { !$0.isEmpty })
+                .joined(separator: header.count == 2 ? ": " : " — ")
+        }
+    }
+
+    // MARK: Questions in an answer
+
+    private static let questionHeading = #"^\s*(#{1,6}\s*)?(\*\*)?\s*(preguntas?|dudas?|questions?|open questions|necesito (de ti|saber)|pendiente de ti|para decidir|decisiones( pendientes)?|antes de seguir)\b[^\n]*$"#
+
+    /// Separates the questions an agent ends its answer with — a "Preguntas" / "Questions" section, or the
+    /// trailing lines that end in "?" — from the rest, so they can be shown as a numbered list.
+    static func splitQuestions(_ md: String) -> (body: String, questions: [String]) {
+        var lines = md.components(separatedBy: "\n")
+        while lines.last?.trimmingCharacters(in: .whitespaces).isEmpty == true { lines.removeLast() }
+        guard !lines.isEmpty, !md.contains("```") || !lines.last!.hasPrefix("```") else { return (md, []) }
+
+        func strip(_ l: String) -> String {
+            l.replacingOccurrences(of: #"^\s*([-*+•]|\d+[.)])\s+"#, with: "", options: .regularExpression)
+                .trimmingCharacters(in: .whitespaces)
+        }
+        // 1. A questions section at the end (no heading after it).
+        if let h = lines.lastIndex(where: { $0.range(of: questionHeading, options: [.regularExpression, .caseInsensitive]) != nil
+                                            && ($0.hasPrefix("#") || $0.hasPrefix("**") || $0.trimmingCharacters(in: .whitespaces).hasSuffix(":")) }),
+           !lines[(h + 1)...].contains(where: { $0.hasPrefix("#") }) {
+            var qs: [String] = []
+            for l in lines[(h + 1)...] where !l.trimmingCharacters(in: .whitespaces).isEmpty {
+                let isItem = l.range(of: #"^([-*+•]|\d+[.)])\s+"#, options: .regularExpression) != nil
+                if !isItem, l.first == " " || l.first == "\t", !qs.isEmpty {
+                    qs[qs.count - 1] += "\n" + l   // sub-options of the previous question
+                } else if l.range(of: #"^\s+([-*+•]|\d+[.)]|[a-z][.)])\s+"#, options: .regularExpression) != nil, !qs.isEmpty {
+                    qs[qs.count - 1] += "\n" + l
+                } else {
+                    qs.append(strip(l))
+                }
+            }
+            if !qs.isEmpty {
+                let body = lines[..<h].joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+                return (body, qs)
+            }
+        }
+        // 2. Trailing lines ending in "?".
+        var i = lines.count
+        var qs: [String] = []
+        while i > 0 {
+            let l = lines[i - 1]
+            let t = strip(l)
+            if t.isEmpty { i -= 1; continue }
+            guard t.hasSuffix("?") || t.hasSuffix("?*") || t.hasSuffix("?**") else { break }
+            qs.insert(t, at: 0)
+            i -= 1
+        }
+        guard !qs.isEmpty, i > 0 else { return (md, []) }   // a reply that is only questions stays as written
+        return (lines[..<i].joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines), qs)
+    }
+
+    /// Questions as a numbered mrkdwn list (sub-options indented under each one).
+    static func numberedQuestions(_ qs: [String]) -> String {
+        qs.enumerated().map { i, q in
+            let parts = q.components(separatedBy: "\n")
+            let head = "*\(i + 1).* " + inline(parts[0])
+            let subs = parts.dropFirst().map { l -> String in
+                let t = l.trimmingCharacters(in: .whitespaces)
+                    .replacingOccurrences(of: #"^([-*+•])\s+"#, with: "", options: .regularExpression)
+                return "      ◦ " + inline(t)
+            }
+            return ([head] + subs).joined(separator: "\n")
+        }.joined(separator: "\n")
+    }
+
+    /// mrkdwn split into section blocks (Slack caps a section's text at 3000 characters).
+    static func sections(_ mrkdwn: String) -> [[String: Any]] {
+        chunks(mrkdwn, limit: 2900).filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }.map {
+            ["type": "section", "text": ["type": "mrkdwn", "text": $0]]
+        }
     }
 
     /// Splits long text into Slack-sized messages at line boundaries.

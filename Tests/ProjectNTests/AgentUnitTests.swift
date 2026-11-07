@@ -77,6 +77,26 @@ struct AgentUnitTests {
         #expect(SlackSettings.parseIDs("<@u123|ana>, U456\nC789") == ["U123", "U456", "C789"])
     }
 
+    @Test func slackRichFormatting() {
+        let md = "Hecho.\n\n\n| Página | Estado |\n|---|---|\n| Home | *ok* |\n| Blog | ~~roto~~ |\n---\n1. Uno\n   - sub\nUsa `a*b*c` y ![logo](https://x.dev/l.png)"
+        #expect(SlackRouter.toSlack(md) == "Hecho.\n\n• *Home*: _ok_\n• *Blog*: ~roto~\n──────────\n1. Uno\n      ◦ sub\nUsa `a*b*c` y <https://x.dev/l.png|logo>")
+        let three = SlackRouter.toSlack("| URL | Score | Nota |\n|--|--|--|\n| /a | 90 | bien |")
+        #expect(three == "• */a* — Score: 90 · Nota: bien")
+    }
+
+    @Test func questionsAreSplitOutOfAnswers() {
+        let withSection = "Revisé el sitio.\n- 3 páginas lentas\n\n## Preguntas\n1. ¿Las optimizo ya?\n2. ¿Qué plantilla?\n   - a) Clara\n   - b) Oscura"
+        let (body, qs) = SlackRouter.splitQuestions(withSection)
+        #expect(body == "Revisé el sitio.\n- 3 páginas lentas")
+        #expect(qs.count == 2)
+        #expect(SlackRouter.numberedQuestions(qs) == "*1.* ¿Las optimizo ya?\n*2.* ¿Qué plantilla?\n      ◦ a) Clara\n      ◦ b) Oscura")
+        let trailing = SlackRouter.splitQuestions("Listo el informe.\n\n¿Lo publico?\n¿Aviso al cliente?")
+        #expect(trailing.body == "Listo el informe." && trailing.questions == ["¿Lo publico?", "¿Aviso al cliente?"])
+        // No questions, or nothing but a question: left as written.
+        #expect(SlackRouter.splitQuestions("Todo listo.").questions.isEmpty)
+        #expect(SlackRouter.splitQuestions("¿Seguro?").questions.isEmpty)
+    }
+
     // MARK: Security
 
     @Test func workingDirectoryGuard() throws {

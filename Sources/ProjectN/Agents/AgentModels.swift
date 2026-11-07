@@ -109,6 +109,7 @@ enum AgentAutonomy: String, Codable, CaseIterable, Identifiable {
         case .high: return "Also publishes, sends and works outside the project on its own. Only deleting, admin/system changes and secret files ask."
         }
     }
+    static let autoModeDetail = "Auto mode: does everything on its own and never stops to ask questions. Only deleting, admin/system changes and secret files ask."
 }
 
 enum SessionPolicy: String, Codable, CaseIterable, Identifiable {
@@ -180,6 +181,9 @@ struct AgentProfile: Codable, Identifiable, Hashable {
     var sessionPolicy: SessionPolicy = .alwaysNew
     /// How much it does without asking (see AgentAutonomy).
     var autonomy: AgentAutonomy = .balanced
+    /// Auto mode: approves everything except deleting, admin/system changes and secrets, and the agent never
+    /// stops to ask questions (it decides with the most reasonable assumption). Overrides `autonomy`.
+    var autoMode: Bool = false
     /// Also load the MCP servers configured in Claude Code (~/.claude.json: yours + the project's).
     var useClaudeMCP = true
     /// Simultaneous tasks of this profile (across all projects).
@@ -281,6 +285,7 @@ struct AgentProfile: Codable, Identifiable, Hashable {
         contextSources = (try? c.decode([String].self, forKey: .contextSources)) ?? d.contextSources
         sessionPolicy = (try? c.decode(SessionPolicy.self, forKey: .sessionPolicy)) ?? d.sessionPolicy
         autonomy = (try? c.decode(AgentAutonomy.self, forKey: .autonomy)) ?? d.autonomy
+        autoMode = (try? c.decode(Bool.self, forKey: .autoMode)) ?? false
         useClaudeMCP = (try? c.decode(Bool.self, forKey: .useClaudeMCP)) ?? d.useClaudeMCP
         concurrencyLimit = max(1, (try? c.decode(Int.self, forKey: .concurrencyLimit)) ?? d.concurrencyLimit)
         timeoutMinutes = max(1, (try? c.decode(Int.self, forKey: .timeoutMinutes)) ?? d.timeoutMinutes)

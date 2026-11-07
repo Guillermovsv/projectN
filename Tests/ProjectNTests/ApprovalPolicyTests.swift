@@ -104,6 +104,24 @@ struct ApprovalPolicyTests {
         #expect(ApprovalPolicy.segments("echo 'a; b' && ls 2>&1 | wc -l") == ["echo 'a; b'", "ls 2>&1", "wc -l"])
     }
 
+    @Test func autoModeOnlyAsksForDeletesAdminAndSecrets() {
+        var c = ctx(.askBeforeChanges, autonomy: .cautious)
+        c.autoMode = true
+        let bash = { (cmd: String) in ApprovalPolicy.decide(tool: "Bash", input: ["command": cmd], c) }
+        for cmd in ["git push", "curl -X POST https://x.dev/api", "ssh host ls", "some-unknown-tool --x", "ls ../other-client"] {
+            #expect(bash(cmd) == .allow, "\(cmd)")
+        }
+        #expect(ApprovalPolicy.decide(tool: "Edit", input: ["file_path": project + "/a.swift"], c) == .allow)
+        #expect(ApprovalPolicy.decide(tool: "mcp__zernio__posts_publish_now", input: [:], c) == .allow)
+        for cmd in ["rm -rf build", "git push -f", "sudo ls", "chmod -R 777 .", "cat ~/.ssh/id_rsa", "cp a.txt /etc/hosts"] {
+            #expect(isUser(bash(cmd)), "\(cmd) → \(bash(cmd))")
+        }
+        #expect(isUser(ApprovalPolicy.decide(tool: "mcp__zernio__posts_delete", input: [:], c)))
+        // Auto mode never widens access.
+        var ro = ctx(.readOnly); ro.autoMode = true
+        #expect(isDeny(ApprovalPolicy.decide(tool: "Bash", input: ["command": "npm install"], ro)))
+    }
+
     @Test func autonomyLevelsDecideHowMuchAsks() {
         // Gray area: on its own unless cautious.
         #expect(decide("curl https://example.com", .balanced) == .allow)

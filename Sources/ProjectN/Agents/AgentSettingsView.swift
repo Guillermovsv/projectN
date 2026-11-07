@@ -328,11 +328,20 @@ struct AgentEditor: View {
             Text("Modes that skip approvals are never used for agents.").font(.caption).foregroundStyle(.secondary)
         }
         Section {
+            Toggle(isOn: $draft.autoMode) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Auto mode").fontWeight(.medium)
+                    Text("Works without asking questions or permission: approves its own actions and decides ambiguities itself.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            .toggleStyle(.switch)
             Picker("Autonomy", selection: $draft.autonomy) {
                 ForEach(AgentAutonomy.allCases) { Text($0.label).tag($0) }
             }
             .pickerStyle(.segmented)
-            Text(draft.autonomy.detail).font(.caption).foregroundStyle(.secondary)
+            .disabled(draft.autoMode)
+            Text(draft.autoMode ? AgentAutonomy.autoModeDetail : draft.autonomy.detail).font(.caption).foregroundStyle(.secondary)
         } header: {
             Text("How much it asks")
         } footer: {

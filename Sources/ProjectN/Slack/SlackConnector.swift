@@ -507,8 +507,17 @@ final class SlackConnector: ObservableObject {
                     }
                 }
             case .question:
-                text = "❓ *\(t.agentName)* pregunta:\n> \(r.summary.replacingOccurrences(of: "\n", with: "\n> "))\nResponde \(replyHere)."
-                Task { if let ts = await send(channel, thread, text, bot: bot, as: t.agentID) { requestMessages[r.id] = (channel, ts, bot) } }
+                let (intro, qs) = SlackRouter.splitQuestions(r.summary)
+                let body = qs.count > 1
+                    ? [SlackRouter.toSlack(intro), SlackRouter.numberedQuestions(qs)].filter { !$0.isEmpty }.joined(separator: "\n\n")
+                    : SlackRouter.toSlack(r.summary)
+                let hint = qs.count > 1 ? "Responde \(replyHere) — puedes contestar por número (p. ej. “1: sí, 2: la opción B”)."
+                                        : "Responde \(replyHere)."
+                text = "❓ *\(t.agentName)* tiene una pregunta\n\n\(body)\n\n_\(hint)_"
+                let blocks: [[String: Any]] = [["type": "section", "text": ["type": "mrkdwn", "text": "❓ *\(t.agentName)* tiene una pregunta"]]]
+                    + SlackRouter.sections(body)
+                    + [["type": "context", "elements": [["type": "mrkdwn", "text": hint]]]]
+                Task { if let ts = await send(channel, thread, text, blocks: blocks, bot: bot, as: t.agentID) { requestMessages[r.id] = (channel, ts, bot) } }
             }
             log("Waiting on you: \(t.agentName) — \(r.summary)")
         case .orchestrator:
@@ -568,8 +577,28 @@ final class SlackConnector: ObservableObject {
         let notes = t.notes.isEmpty ? "" : "\n" + t.notes.map { "ℹ️ \($0)" }.joined(separator: "\n")
         switch t.status {
         case .completed:
-            let body = (t.result ?? "").isEmpty ? "_(sin texto en la respuesta)_" : SlackRouter.toSlack(t.result ?? "")
-            postLong(channel, thread, body + notes + "\n\n_\(t.agentName) · \(t.projectName)\(footer.isEmpty ? "" : " · " + footer.joined(separator: " · "))_", bot: bot, as: t.agentID)
+            let (rawBody, questions) = SlackRouter.splitQuestions(t.result ?? "")
+            let body = rawBody.isEmpty && questions.isEmpty ? "_(sin texto en la respuesta)_" : SlackRouter.toSlack(rawBody)
+            let signature = "\(t.agentName) · \(t.projectName)\(footer.isEmpty ? "" : " · " + footer.joined(separator: " · "))"
+            let questionText = questions.isEmpty ? "" : "❓ *Preguntas para ti*\n" + SlackRouter.numberedQuestions(questions)
+            let hint = "Responde \(replyHere)" + (questions.count > 1 ? " — puedes contestar por número." : ".")
+            var blocks = SlackRouter.sections(body)
+            if !t.notes.isEmpty {
+                blocks.append(["type": "context", "elements": [["type": "mrkdwn", "text": t.notes.map { "ℹ️ \($0)" }.joined(separator: "\n")]]])
+            }
+            if !questions.isEmpty {
+                blocks.append(["type": "divider"])
+                blocks += SlackRouter.sections(questionText)
+                blocks.append(["type": "context", "elements": [["type": "mrkdwn", "text": hint]]])
+            }
+            blocks.append(["type": "context", "elements": [["type": "mrkdwn", "text": signature]]])
+            let text = [body + notes, questionText.isEmpty ? "" : questionText + "\n_\(hint)_", "_\(signature)_"]
+                .filter { !$0.isEmpty }.joined(separator: "\n\n")
+            if blocks.count <= 45 {
+                Task { await send(channel, thread, text, blocks: blocks, bot: bot, as: t.agentID) }
+            } else {
+                postLong(channel, thread, text, bot: bot, as: t.agentID)   // too long for one message
+            }
         case .cancelled, .failed, .timedOut, .interrupted:
             guard settings.notifyErrors else { break }
             let icon = t.status == .interrupted ? "⚠️" : "❌"

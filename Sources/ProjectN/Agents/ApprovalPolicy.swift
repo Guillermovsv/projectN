@@ -35,6 +35,8 @@ enum ApprovalPolicy {
         var cwd: String?
         /// How much runs without asking (see AgentAutonomy).
         var autonomy: AgentAutonomy = .balanced
+        /// Auto mode: everything runs except deleting, admin/system changes and secrets (see AgentProfile.autoMode).
+        var autoMode: Bool = false
     }
 
     /// Applies the agent's autonomy to a verdict for a top-level decision (nobody coordinating it):
@@ -42,6 +44,13 @@ enum ApprovalPolicy {
     /// remote work and writes in your home folder through. Deleting, admin/system changes and secrets always ask.
     static func decide(tool: String, input: [String: Any], _ ctx: Context) -> ApprovalTier {
         let tier = classify(tool: tool, input: input, ctx)
+        if ctx.autoMode {
+            switch tier {
+            case .orchestrator: return .allow
+            case .user(let why) where autoModeMayDecide(why): return .allow
+            default: return tier
+            }
+        }
         switch (tier, ctx.autonomy) {
         case (.orchestrator, .balanced), (.orchestrator, .high):
             return .allow
@@ -50,6 +59,13 @@ enum ApprovalPolicy {
         default:
             return tier
         }
+    }
+
+    /// Auto mode decides everything except deleting, administrator rights, system state and protected paths
+    /// (secrets, system folders).
+    static func autoModeMayDecide(_ why: String) -> Bool {
+        let stillAsk = ["Deletes", "Needs administrator rights", "Changes system state"]
+        return !stillAsk.contains { why.hasPrefix($0) } && !why.contains(" [protected]")
     }
 
     /// Reasons `high` autonomy decides by itself. Everything else (deleting, admin rights, system state,
