@@ -366,6 +366,11 @@ private struct AgentPage: View {
                         .buttonStyle(.plain)
                         .foregroundStyle(selected ? .primary : .secondary)
                         .help("\(t.projectName) · \(t.status.label)\n\(t.instruction)")
+                        .contextMenu {
+                            if t.paneID != nil {
+                                Button(t.status.isFinished ? "Close Session" : "Stop and Close Session") { agents.closeSession(t.id) }
+                            }
+                        }
                     }
                 }
             }
@@ -384,7 +389,7 @@ private struct AgentPage: View {
         if agents.requests.contains(where: { $0.taskID == t.id && $0.isPending }) { return .yellow }
         switch t.status {
         case .running, .starting: return .green
-        case .needsApproval: return .yellow
+        case .needsApproval, .waitingForUser: return .yellow
         case .queued: return .blue
         case .completed: return .secondary
         default: return .red
@@ -395,7 +400,9 @@ private struct AgentPage: View {
         VStack(spacing: 10) {
             AgentAvatar(profile: profile, size: 56)
             Text("New task for \(profile.name)").font(.title3.weight(.semibold))
-            Text("Each task starts a new session in the project you pick below.\nIt runs as a pane in the Agents workspace; its terminal shows up here.")
+            Text(profile.sessionPolicy == .perProject
+                 ? "Messages about a project continue \(profile.name)'s session there (one terminal per project).\nWhat you send while it works reaches it right away."
+                 : "Each task starts a new session in the project you pick below.\nIt runs as a pane in the Agents workspace; its terminal shows up here.")
                 .multilineTextAlignment(.center).font(.callout).foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -560,10 +567,13 @@ private struct AgentMessageBox: View {
         let msg = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !msg.isEmpty else { return }
         error = nil
-        if let rt = liveRuntime, let t = task {
-            rt.submit(msg)
-            if let p = t.paneID, let w = t.workspaceID { store.updatePane(p, in: w) { $0.lastPrompt = msg } }
-            AuditLog.record("task.message", ["task": t.id.uuidString, "agent": t.agentName])
+        if liveRuntime != nil, let t = task {
+            // Same path as Slack: answers its open question, or is typed in as soon as the session can take it.
+            if let q = t.awaitingAnswer, agents.requests.contains(where: { $0.id == q && $0.isPending }) {
+                agents.resolveRequest(q, answer: msg, by: "you (ProjectN)")
+            } else {
+                agents.deliverMessage(msg, to: t.id)
+            }
             text = ""
             return
         }

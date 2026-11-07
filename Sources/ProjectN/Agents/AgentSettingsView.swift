@@ -275,8 +275,13 @@ struct AgentEditor: View {
         }
         Section("Sessions & limits") {
             Picker("Session policy", selection: $draft.sessionPolicy) {
-                ForEach(SessionPolicy.allCases) { Text($0.label).tag($0) }
+                ForEach(SessionPolicy.selectable) { Text($0.label).tag($0) }
+                if !SessionPolicy.selectable.contains(draft.sessionPolicy) { Text(draft.sessionPolicy.label).tag(draft.sessionPolicy) }
             }
+            Text(draft.sessionPolicy == .perProject
+                 ? "Messages about the same project continue one conversation; what you send while it works reaches it right away. Say “sesión nueva” to start over."
+                 : "Every message starts a new conversation with no memory of earlier ones.")
+                .font(.caption).foregroundStyle(.secondary)
             Stepper("Tasks at the same time: \(draft.concurrencyLimit)", value: $draft.concurrencyLimit, in: 1...8)
             Stepper("Stop a task after \(draft.timeoutMinutes) min", value: $draft.timeoutMinutes, in: 1...240, step: draft.timeoutMinutes < 10 ? 1 : 5)
         }
@@ -321,6 +326,18 @@ struct AgentEditor: View {
             Text("What it may do")
         } footer: {
             Text("Modes that skip approvals are never used for agents.").font(.caption).foregroundStyle(.secondary)
+        }
+        Section {
+            Picker("Autonomy", selection: $draft.autonomy) {
+                ForEach(AgentAutonomy.allCases) { Text($0.label).tag($0) }
+            }
+            .pickerStyle(.segmented)
+            Text(draft.autonomy.detail).font(.caption).foregroundStyle(.secondary)
+        } header: {
+            Text("How much it asks")
+        } footer: {
+            Text("Deleting anything, administrator / system changes and secret files (keys, tokens, ~/.ssh…) always ask you, at every level.")
+                .font(.caption).foregroundStyle(.secondary)
         }
         if draft.runtime == .claudeCode {
             toolsSection
@@ -378,6 +395,14 @@ struct AgentEditor: View {
     // MARK: Integrations
 
     @ViewBuilder private var integrationsTab: some View {
+        if draft.runtime == .claudeCode {
+            Section {
+                Toggle("Also use Claude Code's MCP servers", isOn: $draft.useClaudeMCP)
+            } footer: {
+                Text("The servers you set up in Claude Code (yours and each project's, from ~/.claude.json and .mcp.json) — e.g. WordPress / Elementor — are available to this agent too.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+        }
         Section {
             let library = MCPConfig.load()
             if library.isEmpty {
@@ -394,7 +419,7 @@ struct AgentEditor: View {
             }
             Button { importingMCP = true } label: { Label("Add from JSON…", systemImage: "curlybraces") }
         } header: { Text("MCP servers") } footer: {
-            Text("Only the checked servers (plus ProjectN's own) are loaded for this agent. Tools that read run freely; tools that delete or publish ask you.")
+            Text("The checked servers (plus ProjectN's own\(draft.useClaudeMCP && draft.runtime == .claudeCode ? " and Claude Code's" : "")) are loaded for this agent. Tools that read run freely; tools that delete or publish ask you.")
                 .font(.caption).foregroundStyle(.secondary)
         }
         Section {
@@ -705,7 +730,7 @@ struct AgentTasksView: View {
         switch s {
         case .completed: return .green
         case .running, .starting: return .blue
-        case .needsApproval: return .yellow
+        case .needsApproval, .waitingForUser: return .yellow
         case .queued: return .secondary
         case .failed, .timedOut: return .red
         case .cancelled, .interrupted: return .orange
@@ -877,6 +902,10 @@ struct AutonomySettingsView: View {
                 Stepper("Max delegated tasks per request: \(agents.policy.maxTasksPerRequest)", value: binding.maxTasksPerRequest, in: 1...50)
                 Stepper("Approvals & questions expire after \(agents.policy.requestTimeoutMinutes) min", value: binding.requestTimeoutMinutes, in: 5...480, step: 5)
                 Stepper("Project sessions start fresh after \(agents.policy.sessionIdleHours) h unused", value: binding.sessionIdleHours, in: 1...168)
+                Stepper("Stop an idle session's process after \(agents.policy.idleCloseMinutes) min", value: binding.idleCloseMinutes, in: 5...240, step: 5)
+                Stepper("Idle sessions kept running per agent: \(agents.policy.maxIdleSessionsPerAgent)", value: binding.maxIdleSessionsPerAgent, in: 1...8)
+                Text("A stopped session keeps its terminal and conversation: the next message resumes it.")
+                    .font(.caption).foregroundStyle(.secondary)
                 Text("Unanswered approvals count as “no”; unanswered questions tell the agent to continue with the safest assumption.")
                     .font(.caption).foregroundStyle(.secondary)
             }

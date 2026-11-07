@@ -56,7 +56,10 @@ enum SlackRouter {
     static let fillerWords: Set<String> = ["de", "del", "el", "la", "en", "the", "a", "an", "of", "in", "que", "y", "and",
                                             "para", "for", "con", "with", "llamado", "named", "called", "manager"]
 
-    static func resolveProject(_ text: String, allowed: [Project], selectedProjectID: UUID?) -> ProjectResolution {
+    /// `conversationProjectID`: the project this conversation has been about. "project X" where X isn't a project
+    /// ("add it to the project npm install …") then keeps that project instead of asking.
+    static func resolveProject(_ text: String, allowed: [Project], selectedProjectID: UUID?,
+                               conversationProjectID: UUID? = nil) -> ProjectResolution {
         let folded = text.folded
         // 1. Project names (or folder names) written in the message.
         var hits: [Project] = []
@@ -70,14 +73,17 @@ enum SlackRouter {
         if hits.count > 1 { return .ambiguous(hits) }
 
         // 2. "proyecto X" / "project X" where X isn't a project.
+        let conversation = conversationProjectID.flatMap { id in allowed.first { $0.id == id } }
         if let word = wordAfterProjectKeyword(text) {
             let w = word.folded
             if !selectedWords.contains(w) && !fillerWords.contains(w) {
+                if let conversation { return .project(conversation) }
                 return .notFound(name: word, candidates: allowed)
             }
         }
 
-        // 3. The project selected in ProjectN, or the only allowed one.
+        // 3. The conversation's project, the project selected in ProjectN, or the only allowed one.
+        if let conversation { return .project(conversation) }
         if let sel = selectedProjectID, let p = allowed.first(where: { $0.id == sel }) { return .project(p) }
         if allowed.count == 1 { return .project(allowed[0]) }
         return .unspecified(candidates: allowed)

@@ -82,6 +82,35 @@ enum AgentPermission: String, Codable, CaseIterable, Identifiable {
     }
 }
 
+/// How much an agent does without asking, on top of its access level. Deleting and admin/system changes always
+/// ask you, at every level.
+enum AgentAutonomy: String, Codable, CaseIterable, Identifiable {
+    /// Asks about anything unusual: gray-area commands, reads outside the project, network downloads.
+    case cautious
+    /// Default. Routine and gray-area work runs on its own (reads anywhere except secrets, downloads, other
+    /// commands). Asks before deleting, publishing / sending, remote systems and writing outside the project.
+    case balanced
+    /// Also publishes, sends data, works on remote systems and writes in your home folder on its own. Only deleting,
+    /// administrator / system changes and secret files ask you.
+    case high
+
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .cautious: return "Cautious"
+        case .balanced: return "Balanced"
+        case .high: return "High"
+        }
+    }
+    var detail: String {
+        switch self {
+        case .cautious: return "Asks about anything outside routine project work."
+        case .balanced: return "Works on its own. Asks before deleting, publishing or sending, remote systems and writing outside the project."
+        case .high: return "Also publishes, sends and works outside the project on its own. Only deleting, admin/system changes and secret files ask."
+        }
+    }
+}
+
 enum SessionPolicy: String, Codable, CaseIterable, Identifiable {
     /// One session per project: later messages about the same project continue it (no new terminal, no
     /// re-read context). "sesión nueva" / "desde cero" or a long idle time starts a new one.
@@ -91,6 +120,8 @@ enum SessionPolicy: String, Codable, CaseIterable, Identifiable {
     /// New session by default; a previous session of the same thread is resumed only when the user asks explicitly.
     case resumeOnExplicitRequest
     var id: String { rawValue }
+    /// Offered in the editor. `resumeOnExplicitRequest` is only read from old files (migrated to per-project).
+    static let selectable: [SessionPolicy] = [.perProject, .alwaysNew]
     var label: String {
         switch self {
         case .perProject: return "One session per project (continues)"
@@ -147,6 +178,10 @@ struct AgentProfile: Codable, Identifiable, Hashable {
     /// Files read into every new session, relative to the project root (must stay inside it).
     var contextSources: [String] = ["README.md"]
     var sessionPolicy: SessionPolicy = .alwaysNew
+    /// How much it does without asking (see AgentAutonomy).
+    var autonomy: AgentAutonomy = .balanced
+    /// Also load the MCP servers configured in Claude Code (~/.claude.json: yours + the project's).
+    var useClaudeMCP = true
     /// Simultaneous tasks of this profile (across all projects).
     var concurrencyLimit: Int = 2
     /// A task is stopped after this many minutes.
@@ -197,6 +232,36 @@ struct AgentProfile: Codable, Identifiable, Hashable {
 
     func mayAccess(_ projectID: UUID) -> Bool { allProjects || projectIDs.contains(projectID) }
 
+    /// The Project Manager's instructions on installs before autonomous agents (replaced once if unchanged).
+    static let legacyProjectManagerInstructions = """
+    Eres el Project Manager de una agencia de marketing digital.
+
+    Tu responsabilidad es recibir solicitudes, identificar proyectos, consultar su documentación, organizar tareas y comunicar resultados.
+
+    Antes de actuar, verifica que tienes suficiente contexto.
+
+    Utiliza el README y los archivos autorizados del proyecto.
+
+    No inventes información sobre archivos o tareas.
+
+    No modifiques archivos, publiques cambios ni ejecutes otros agentes sin autorización.
+
+    Presenta resultados claros y solicita aprobación cuando corresponda.
+    """
+
+    static let projectManagerInstructions = """
+    Eres el Project Manager de una agencia de marketing digital.
+
+    Tu responsabilidad es recibir solicitudes, identificar el proyecto, organizar el trabajo, repartirlo entre los agentes y comunicar resultados.
+
+    Cómo trabajar:
+    - Actúa. Ya tienes acceso a los proyectos y a tus herramientas; no pidas permiso para lo que tu configuración permite. ProjectN pide aprobación al usuario automáticamente cuando hace falta.
+    - Usa el contexto: la conversación anterior, el README, la memoria del proyecto y los archivos. Si algo es ambiguo, elige la interpretación más razonable, dila en una línea y avanza. Pregunta solo si equivocarte sería costoso.
+    - Delega: cuando el trabajo corresponde a otro agente (desarrollo, SEO, contenido…) o el usuario dice “pídele / dile / que lo haga el developer…”, usa delegate_task con una instrucción completa. No le devuelvas al usuario lo que otro agente puede resolver.
+    - No inventes información sobre archivos o tareas.
+    - Responde breve y claro: qué se hizo, qué está en curso (y con quién) y qué necesita al usuario, si algo.
+    """
+
     // Tolerant decoding so new fields don't break saved profiles.
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -215,6 +280,8 @@ struct AgentProfile: Codable, Identifiable, Hashable {
         projectIDs = (try? c.decode([UUID].self, forKey: .projectIDs)) ?? []
         contextSources = (try? c.decode([String].self, forKey: .contextSources)) ?? d.contextSources
         sessionPolicy = (try? c.decode(SessionPolicy.self, forKey: .sessionPolicy)) ?? d.sessionPolicy
+        autonomy = (try? c.decode(AgentAutonomy.self, forKey: .autonomy)) ?? d.autonomy
+        useClaudeMCP = (try? c.decode(Bool.self, forKey: .useClaudeMCP)) ?? d.useClaudeMCP
         concurrencyLimit = max(1, (try? c.decode(Int.self, forKey: .concurrencyLimit)) ?? d.concurrencyLimit)
         timeoutMinutes = max(1, (try? c.decode(Int.self, forKey: .timeoutMinutes)) ?? d.timeoutMinutes)
         enabled = (try? c.decode(Bool.self, forKey: .enabled)) ?? true
@@ -235,21 +302,7 @@ struct AgentProfile: Codable, Identifiable, Hashable {
             name: "Project Manager", role: "Project Manager",
             provider: .anthropic, runtime: .claudeCode,
             model: "claude-opus-5-5", effort: "high",
-            instructions: """
-            Eres el Project Manager de una agencia de marketing digital.
-
-            Tu responsabilidad es recibir solicitudes, identificar proyectos, consultar su documentación, organizar tareas y comunicar resultados.
-
-            Antes de actuar, verifica que tienes suficiente contexto.
-
-            Utiliza el README y los archivos autorizados del proyecto.
-
-            No inventes información sobre archivos o tareas.
-
-            No modifiques archivos, publiques cambios ni ejecutes otros agentes sin autorización.
-
-            Presenta resultados claros y solicita aprobación cuando corresponda.
-            """)
+            instructions: AgentProfile.projectManagerInstructions)
         p.permission = .readOnly
         p.canDelegate = true
         p.sessionPolicy = .perProject
@@ -278,8 +331,18 @@ struct TaskOrigin: Codable, Hashable {
     /// For scheduled tasks: which schedule.
     var scheduleID: UUID?
     var scheduleName: String?
+    /// Created by ProjectN itself (e.g. results of delegated tasks handed back to the coordinator): no "started" notice.
+    var automatic: Bool?
 
     static let local = TaskOrigin(kind: .local)
+    /// How the request's author is named to the agent (no raw Slack member ids).
+    var promptLabel: String {
+        switch kind {
+        case .slack: return "the user, via Slack"
+        case .local: return "the user, in ProjectN"
+        default: return label
+        }
+    }
     var label: String {
         switch kind {
         case .slack: return "Slack" + (slackUser.map { " · \($0)" } ?? "")
@@ -291,15 +354,16 @@ struct TaskOrigin: Codable, Hashable {
 }
 
 enum AgentTaskStatus: String, Codable {
-    case queued, starting, running, needsApproval, completed, failed, cancelled, timedOut, interrupted
+    case queued, starting, running, needsApproval, waitingForUser, completed, failed, cancelled, timedOut, interrupted
     var isFinished: Bool { [.completed, .failed, .cancelled, .timedOut, .interrupted].contains(self) }
-    var isActive: Bool { [.starting, .running, .needsApproval].contains(self) }
+    var isActive: Bool { [.starting, .running, .needsApproval, .waitingForUser].contains(self) }
     var label: String {
         switch self {
         case .queued: return "Queued"
         case .starting: return "Starting"
         case .running: return "Running"
         case .needsApproval: return "Needs approval"
+        case .waitingForUser: return "Waiting for your answer"
         case .completed: return "Completed"
         case .failed: return "Failed"
         case .cancelled: return "Cancelled"
@@ -360,6 +424,16 @@ struct AgentTask: Codable, Identifiable, Hashable {
     var lastApprovalNotice: String?
     /// The final outcome was delivered to the origin (Slack). Undelivered outcomes are sent on reconnect.
     var delivered = false
+    /// Messages for this session not typed into it yet (sent while it was busy or waiting on a prompt).
+    var inbox: [String]?
+    /// Messages added to this task after it started (follow-ups, answers, results of delegated tasks).
+    var followUps: [String]?
+    /// The question (request id) this task asked and is waiting on, with its turn ended.
+    var awaitingAnswer: UUID?
+    /// Don't recap earlier conversation in a new session ("sesión nueva").
+    var skipRecap: Bool?
+    /// Digest of the project notes this session has seen (sent again when they change).
+    var notesDigest: String?
     var duration: TimeInterval? { startedAt.map { (finishedAt ?? Date()).timeIntervalSince($0) } }
 }
 
@@ -449,6 +523,12 @@ struct AgentPolicy: Codable, Equatable {
     var sessionIdleHours = 12
     /// Profiles were moved to per-project sessions once (older installs defaulted to a new session per message).
     var perProjectSessionsMigrated = false
+    /// Second migration: "resume only when asked" → per project, orchestrators off Haiku, PM instructions.
+    var autonomyMigrated = false
+    /// An idle session's process is stopped after this many minutes (it resumes on the next message).
+    var idleCloseMinutes = 30
+    /// At most this many idle session processes per agent stay running.
+    var maxIdleSessionsPerAgent = 2
     /// Agents (with your approval) and your own Slack requests may create new projects.
     var allowProjectCreation = true
     /// Where new project folders are created. Empty = the folder most of your projects live in (else ~/Documents).
@@ -464,6 +544,9 @@ struct AgentPolicy: Codable, Equatable {
         requestTimeoutMinutes = (try? c.decode(Int.self, forKey: .requestTimeoutMinutes)) ?? d.requestTimeoutMinutes
         sessionIdleHours = (try? c.decode(Int.self, forKey: .sessionIdleHours)) ?? d.sessionIdleHours
         perProjectSessionsMigrated = (try? c.decode(Bool.self, forKey: .perProjectSessionsMigrated)) ?? false
+        autonomyMigrated = (try? c.decode(Bool.self, forKey: .autonomyMigrated)) ?? false
+        idleCloseMinutes = max(5, (try? c.decode(Int.self, forKey: .idleCloseMinutes)) ?? d.idleCloseMinutes)
+        maxIdleSessionsPerAgent = max(1, (try? c.decode(Int.self, forKey: .maxIdleSessionsPerAgent)) ?? d.maxIdleSessionsPerAgent)
         allowProjectCreation = (try? c.decode(Bool.self, forKey: .allowProjectCreation)) ?? d.allowProjectCreation
         newProjectsFolder = (try? c.decode(String.self, forKey: .newProjectsFolder)) ?? d.newProjectsFolder
     }
@@ -493,6 +576,8 @@ struct AgentRequest: Codable, Identifiable, Hashable {
     var decidedBy: String?
     var createdAt = Date()
     var decidedAt: Date?
+    /// The CLI's own prompt in the terminal (answered by sending keys), not a hook or `ask` request.
+    var terminalPrompt: Bool?
 
     var isPending: Bool { status == .pending }
 }

@@ -234,6 +234,23 @@ final class TerminalSession: NSObject, ObservableObject, LocalProcessTerminalVie
         return d.label
     }
 
+    /// Answers the prompt on screen for the user (approved / denied from Slack or ProjectN): "Yes" when the
+    /// prompt's default choice is a yes, Escape to refuse. Returns false if there's no prompt to answer.
+    @discardableResult
+    func answerPendingPrompt(approve: Bool) -> Bool {
+        guard isRunning, !terminated, let screen = screenTail(), AutoResponder.pendingPrompt(screen: screen) != nil else { return false }
+        if approve {
+            guard let d = AutoResponder.decide(screen: screen), d.label.lowercased().hasPrefix("y") else { return false }
+            answeredFingerprint = d.fingerprint
+            lastAutoAnswer = (d.label, Date())
+            sendKeys(d.keys)
+        } else {
+            lastAutoAnswer = ("No", Date())
+            sendKeys(["\u{1b}"])
+        }
+        return true
+    }
+
     /// Sends key presses one at a time with a short gap; TUIs (Ink, ratatui) handle that more reliably than one burst.
     private func sendKeys(_ keys: [String]) {
         for (i, k) in keys.enumerated() {

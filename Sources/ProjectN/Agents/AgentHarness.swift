@@ -34,6 +34,14 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
     var orchestratorWaiters: [UUID: [() -> Void]] = [:]
     /// Tool calls ProjectN allowed recently, per task (to confirm the CLI's own redundant prompt for them).
     var recentlyApproved: [UUID: [(text: String, at: Date)]] = [:]
+    /// A terminal prompt seen on screen, per task, and since when (reported only if it stays up).
+    var promptSeen: [UUID: (text: String, at: Date)] = [:]
+    /// When a message was last typed into each task's session.
+    var lastTyped: [UUID: Date] = [:]
+    /// Prompts seen in each task's transcript at the last read, and how many must appear before a finished turn
+    /// counts (a message was typed in but the CLI hasn't written it yet).
+    var promptsSeen: [UUID: Int] = [:]
+    var promptsExpected: [UUID: (count: Int, at: Date)] = [:]
 
     private(set) weak var store: Store?
     let catalog: ModelCatalog
@@ -48,23 +56,42 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
     init(catalog: ModelCatalog? = nil) {
         AgentStore.bootstrap()
         self.catalog = catalog ?? .shared
-        let policy = AgentStore.loadPolicy()
-        self.policy = policy
+        var policy = AgentStore.loadPolicy()
         if var saved = AgentStore.loadProfiles() {
+            var changed = false
             // Older installs started a new session per message; move them to per-project sessions once.
             if !policy.perProjectSessionsMigrated {
                 for i in saved.indices where saved[i].sessionPolicy == .alwaysNew { saved[i].sessionPolicy = .perProject }
-                var migrated = policy
-                migrated.perProjectSessionsMigrated = true
-                self.policy = migrated
-                AgentStore.saveProfiles(saved, policy: migrated)
+                policy.perProjectSessionsMigrated = true
+                changed = true
             }
+            // Autonomous agents: "resume only when asked" opened a new session (and terminal) for every message;
+            // coordinators need a model that delegates well; the old Project Manager text told it to ask first.
+            if !policy.autonomyMigrated {
+                for i in saved.indices {
+                    if saved[i].sessionPolicy == .resumeOnExplicitRequest { saved[i].sessionPolicy = .perProject }
+                    if saved[i].canDelegate, saved[i].runtime == .claudeCode, saved[i].model.contains("haiku") {
+                        saved[i].model = "claude-sonnet-5-5"
+                    }
+                    let trim = { (x: String) in x.trimmingCharacters(in: .whitespacesAndNewlines) }
+                    if trim(saved[i].instructions) == trim(AgentProfile.legacyProjectManagerInstructions) {
+                        saved[i].instructions = AgentProfile.projectManagerInstructions
+                    }
+                }
+                policy.autonomyMigrated = true
+                changed = true
+                AuditLog.record("agents.migrated", ["to": "per-project sessions, autonomy"])
+            }
+            if changed { AgentStore.saveProfiles(saved, policy: policy) }
             profiles = saved
         } else {
+            policy.perProjectSessionsMigrated = true
+            policy.autonomyMigrated = true
             let seeded = [AgentProfile.projectManager()]
             profiles = seeded
             AgentStore.saveProfiles(seeded, policy: policy)
         }
+        self.policy = policy
         // Anything that was running when the app quit can't be followed any more: report it as interrupted.
         var loaded = AgentStore.loadTasks()
         var changed = false
@@ -200,7 +227,6 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
 
         var resumeFrom: AgentTask?
         if let rid = request.resumeTaskID {
-            guard profile.sessionPolicy == .resumeOnExplicitRequest else { return record(.resumeNotAllowed, request, profile: profile, project: project) }
             guard let prev = task(rid), prev.sessionID != nil, prev.agentID == profile.id, prev.projectID == project.id else {
                 return record(.nothingToResume, request, profile: profile, project: project)
             }
@@ -211,6 +237,14 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
         switch catalog.resolve(profile, settings: store.settings) {
         case .success(let r): resolution = r
         case .failure(let e): return record(e, request, profile: profile, project: project)
+        }
+
+        // The session is already working on this conversation: the message goes straight into it
+        // (typed into its terminal as soon as it can take input), instead of a new task or a new session.
+        if request.resumeTaskID == nil, !request.freshSession, profile.sessionPolicy == .perProject,
+           let live = liveTask(agent: profile.id, project: project.id, origin: request.origin) {
+            deliverMessage(request.instruction, to: live.id)
+            return .success(task(live.id) ?? live)
         }
 
         // Per-project sessions: continue this agent's session for the project instead of opening a new one.
@@ -226,6 +260,7 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
                           model: resolution.model, effort: resolution.effort, permission: profile.permission)
         t.notes = resolution.notes
         t.dependsOn = request.dependsOn
+        if request.freshSession { t.skipRecap = true }
         if let parentID = request.origin.parentTaskID, let parent = task(parentID) {
             t.depth = parent.depth + 1
             t.rootTaskID = parent.rootTaskID ?? parent.id
@@ -286,8 +321,43 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
 
     private func activeCount(agent: UUID) -> Int { tasks.filter { $0.agentID == agent && $0.status.isActive }.count }
 
-    private func projectHasWriter(_ project: UUID) -> Bool {
-        tasks.contains { $0.projectID == project && $0.status.isActive && $0.permission.canWrite }
+    /// Another agent that edits on its own is active in the project. Only "Read & write" agents lock each other
+    /// out (those that ask first have every edit approved), and never inside one delegation chain: a coordinator
+    /// waiting on its delegate must not block it (that deadlocked until the coordinator gave up).
+    private func projectHasWriter(_ project: UUID, for t: AgentTask) -> Bool {
+        let mine = lineage(t)
+        return tasks.contains { o in
+            o.id != t.id && o.projectID == project && o.status.isActive && o.permission == .editProject
+                && !mine.contains(o.id) && !lineage(o).contains(t.id)
+        }
+    }
+
+    /// Why a queued task hasn't started (for coordinators following it).
+    func queueReason(_ t: AgentTask) -> String {
+        if let dep = t.dependsOn.compactMap(task).first(where: { !$0.status.isFinished }) {
+            return "waits for task \(dep.id.uuidString) (\(dep.agentName)) it depends on"
+        }
+        if let prev = t.resumedFromTaskID.flatMap(task), !prev.status.isFinished {
+            return "\(t.agentName) is still busy with an earlier message in the same session; it continues right after"
+        }
+        if let p = profile(t.agentID), activeCount(agent: t.agentID) >= max(1, p.concurrencyLimit) {
+            return "\(t.agentName) is at its limit of \(p.concurrencyLimit) tasks at a time"
+        }
+        if t.permission == .editProject, projectHasWriter(t.projectID, for: t) {
+            return "another agent is editing \(t.projectName); it starts when that one finishes"
+        }
+        return "starting"
+    }
+
+    /// The task and the tasks that delegated it, up the chain.
+    func lineage(_ t: AgentTask) -> Set<UUID> {
+        var out: Set<UUID> = [t.id]
+        var cur = t.origin.parentTaskID
+        while let c = cur, !out.contains(c) {
+            out.insert(c)
+            cur = task(c)?.origin.parentTaskID
+        }
+        return out
     }
 
     /// Starts queued tasks whose agent has a free slot, whose dependencies completed, and — for agents that may
@@ -309,7 +379,7 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
             // A message for a busy session waits for it, then continues in it.
             if let prev = t.resumedFromTaskID.flatMap(task), !prev.status.isFinished { continue }
             guard activeCount(agent: t.agentID) < max(1, profile.concurrencyLimit) else { continue }
-            if t.permission.canWrite, projectHasWriter(t.projectID) { continue }
+            if t.permission == .editProject, projectHasWriter(t.projectID, for: t) { continue }
             launch(t.id, profile: profile)
         }
     }
@@ -326,13 +396,20 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
         let resumeFrom = t.resumedFromTaskID.flatMap(task)
         if let prev = resumeFrom, continueInPlace(&t, after: prev) { return }
         let prompt: String
-        if resumeFrom != nil {
-            prompt = PromptComposer.resumeMessage(task: t)
+        let notes = AgentStore.projectNotes(project.id)
+        let digest = AgentStore.notesDigest(notes)
+        if let prev = resumeFrom {
+            prompt = PromptComposer.resumeMessage(task: t, updatedNotes: prev.notesDigest == digest ? nil : notes)
+            t.notesDigest = digest
         } else {
+            t.notesDigest = digest
             let ctx = ContextLoader.load(projectPath: project.path, sources: profile.contextSources)
             t.notes += ctx.notes
             prompt = PromptComposer.firstMessage(task: t, profile: profile, project: project, context: ctx,
-                                                 includeInstructions: profile.runtime != .claudeCode)
+                                                 includeInstructions: profile.runtime != .claudeCode,
+                                                 recap: t.skipRecap == true || profile.sessionPolicy != .perProject ? [] : recentConversation(for: t))
+            // One terminal per agent + project: earlier sessions of this pair whose work is done are closed.
+            closeFinishedPanes(agent: profile.id, project: project.id)
         }
         // The bridge must be listening before a session that relies on it starts.
         guard bridge.port != nil || AgentBridge.helperPath == nil else { return }
@@ -391,9 +468,12 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
     /// The session to continue for (agent, project): its latest task that had a session, if it ran on the same
     /// runtime and model, didn't crash, and was used within the idle window.
     func projectSession(agent p: AgentProfile, project: UUID, model: String) -> AgentTask? {
-        guard let prev = tasks.last(where: { $0.agentID == p.id && $0.projectID == project && $0.sessionID != nil && $0.paneID != nil })
+        // A queued task that will continue the session counts too: the next one waits for it and then continues
+        // in its terminal, instead of resuming the same conversation in a second terminal.
+        guard let prev = tasks.last(where: { $0.agentID == p.id && $0.projectID == project && $0.sessionID != nil
+                                             && ($0.paneID != nil || $0.status == .queued) })
         else { return nil }
-        guard prev.runtime == p.runtime, prev.model == model, prev.status != .failed else { return nil }
+        guard prev.runtime == p.runtime, prev.status != .failed else { return nil }
         let lastUsed = prev.finishedAt ?? Date()
         guard Date().timeIntervalSince(lastUsed) < Double(max(1, policy.sessionIdleHours) * 3600) else { return nil }
         return prev
@@ -403,7 +483,8 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
     /// Returns false when it isn't, so the caller resumes the conversation in a new process instead.
     private func continueInPlace(_ t: inout AgentTask, after prev: AgentTask) -> Bool {
         guard let store, let paneID = prev.paneID, let wid = prev.workspaceID, let rt = store.runtimes[paneID], rt.isRunning,
-              let (_, pane) = store.pane(paneID, in: wid), pane.agentTaskID == prev.id, let sid = prev.sessionID else { return false }
+              let (_, pane) = store.pane(paneID, in: wid), pane.agentTaskID == prev.id, let sid = prev.sessionID,
+              prev.model == t.model, !rt.needsInput else { return false }
         let url = t.runtime == .claudeCode
             ? TranscriptReader.claudeTranscript(sessionID: sid, settings: store.settings)
             : TranscriptReader.codexTranscript(sessionID: sid, settings: store.settings)
@@ -422,8 +503,15 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
             $0.agentTaskID = t.id
             $0.lastPrompt = t.instruction
         }
+        let notes = AgentStore.projectNotes(t.projectID)
+        let digest = AgentStore.notesDigest(notes)
+        let message = PromptComposer.resumeMessage(task: t, updatedNotes: prev.notesDigest == digest ? nil : notes)
+        t.notesDigest = digest
         replace(t)
-        rt.submit(PromptComposer.resumeMessage(task: t))
+        lastTyped[t.id] = Date()
+        promptsSeen[t.id] = 0   // the transcript is read from here on (new offset)
+        expectPrompt(t.id)
+        rt.submit(message)
         AuditLog.record("task.started", ["task": t.id.uuidString, "agent": t.agentName, "project": t.projectName,
                                          "session": sid, "pane": paneID.uuidString, "mode": "continued in place"])
         emit(t, .started)
@@ -438,13 +526,14 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
         if Date().timeIntervalSince(lastScheduleCheck) >= 30 {
             lastScheduleCheck = Date()
             runDueSchedules()
+            closeIdleSessions()
         }
         for t in tasks where t.status.isActive {
             guard let paneID = t.paneID, let wid = t.workspaceID else { continue }
             let profile = profile(t.agentID)
-            // Timeout.
+            // Timeout (not while it's waiting for your answer: that's your time, not its).
             let limit = timeoutOverride ?? Double((profile?.timeoutMinutes ?? 30) * 60)
-            if let started = t.startedAt, Date().timeIntervalSince(started) > limit {
+            if t.status != .waitingForUser, let started = t.startedAt, Date().timeIntervalSince(started) > limit {
                 store.killRuntime(paneID)
                 finish(t.id, status: .timedOut, error: "Stopped after \(profile?.timeoutMinutes ?? 30) minutes without finishing.")
                 continue
@@ -468,29 +557,64 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
                 case .needsInput(let q):
                     let approved = (recentlyApproved[t.id] ?? []).filter { Date().timeIntervalSince($0.at) < 180 }.map(\.text)
                     if !approved.isEmpty, let answer = rt.confirmApprovedPrompt(approved) {
+                        promptSeen.removeValue(forKey: t.id)
                         AuditLog.record("prompt.confirmed", ["task": t.id.uuidString, "agent": t.agentName, "answer": answer,
                                                              "prompt": ApprovalPolicy.clip(q)])
+                    } else if let last = rt.lastAutoAnswer, Date().timeIntervalSince(last.at) < 8 {
+                        // Just answered: the screen still shows the prompt until the CLI redraws. Not a new one.
+                    } else if let seen = promptSeen[t.id], seen.text == q {
+                        // Only a prompt that stays up is reported (half-drawn frames and instant redraws aren't).
+                        if Date().timeIntervalSince(seen.at) >= 3 { noteApproval(t.id, question: q) }
                     } else {
-                        noteApproval(t.id, question: q)
+                        promptSeen[t.id] = (q, Date())
                     }
-                case .working where t.status != .running && !requests.contains(where: { $0.taskID == t.id && $0.isPending }):
+                case .working where t.status != .running && t.status != .waitingForUser && !requests.contains(where: { $0.taskID == t.id && $0.isPending }):
+                    promptGone(t.id)
                     update(t.id) { $0.status = .running }
                 default:
+                    promptGone(t.id)
                     if t.status == .starting, rt.isRunning { update(t.id) { $0.status = .running } }
                 }
+                flushInbox(t.id)
             }
             readTranscript(task(t.id) ?? t)
         }
     }
 
+    /// The CLI shows its own prompt and nothing answered it: ask the user (Slack buttons / ProjectN), then
+    /// answer it in the terminal for them.
     private func noteApproval(_ id: UUID, question: String) {
-        guard let t = task(id) else { return }
+        guard let t = task(id), let paneID = t.paneID else { return }
         let q = question.trimmingCharacters(in: .whitespacesAndNewlines)
         update(id) { $0.status = .needsApproval }
-        guard t.lastApprovalNotice != q else { return }
+        guard t.lastApprovalNotice != q, !requests.contains(where: { $0.taskID == id && $0.isPending && $0.terminalPrompt == true }) else { return }
         update(id) { $0.lastApprovalNotice = q }
         AuditLog.record("task.approval_needed", ["task": id.uuidString, "agent": t.agentName, "prompt": q])
+        let screen = store?.runtimes[paneID]?.scrollbackText(maxLines: 14) ?? ""
+        let detail = screen.split(separator: "\n").map { $0.trimmingCharacters(in: CharacterSet(charactersIn: " │┃║╭╮╰╯─━")) }
+            .filter { !$0.isEmpty }.suffix(10).joined(separator: "\n")
+        createRequest(kind: .approval, task: t, summary: Redactor.redact(detail.isEmpty ? q : detail),
+                      reason: "\(t.runtime.label) asks in its terminal: \(q)", route: .user, terminalPrompt: true) { [weak self] r in
+            guard let self, let rt = self.store?.runtimes[paneID] else { return }
+            switch r.status {
+            case .approved: if !rt.answerPendingPrompt(approve: true) { AuditLog.record("prompt.answer_failed", ["task": id.uuidString]) }
+            case .denied: rt.answerPendingPrompt(approve: false)
+            default: break
+            }
+        }
         if let t = task(id) { emit(t, .approvalNeeded(q)) }
+    }
+
+    /// The terminal prompt went away (answered there, or by ProjectN): forget it, so the next one is reported.
+    private func promptGone(_ id: UUID) {
+        promptSeen.removeValue(forKey: id)
+        if task(id)?.lastApprovalNotice != nil, task(id)?.lastApprovalNotice?.hasPrefix("plan:") == false {
+            update(id) { $0.lastApprovalNotice = nil }
+        }
+        for r in requests where r.taskID == id && r.isPending && r.terminalPrompt == true
+            && Date().timeIntervalSince(r.createdAt) > 3 {
+            closeRequest(r.id, status: .expired, by: "ProjectN (answered in the terminal)")
+        }
     }
 
     private func readTranscript(_ t: AgentTask) {
@@ -519,10 +643,29 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
         }
     }
 
+    /// A message was just typed in: a finished turn doesn't count until the transcript shows it.
+    func expectPrompt(_ id: UUID) {
+        let base = max(promptsSeen[id] ?? 0, promptsExpected[id]?.count ?? 0)
+        promptsExpected[id] = (base + 1, Date())
+    }
+
     private func apply(snapshot: TranscriptReader.Snapshot?, exitCode: String?, to id: UUID) {
         guard let t = task(id), t.status.isActive else { return }
         if let u = snapshot?.usage { update(id) { $0.usage = u } }
+        if let s = snapshot { promptsSeen[id] = s.prompts }
+        if let s = snapshot, s.finished, let e = promptsExpected[id] {
+            // The typed message hasn't reached the transcript yet: the "finished" turn is the previous one.
+            if s.prompts < e.count && Date().timeIntervalSince(e.at) < 90 { return }
+            promptsExpected.removeValue(forKey: id)
+        }
         if let s = snapshot, s.finished {
+            // More messages for it: the session continues instead of finishing.
+            if !(t.inbox ?? []).isEmpty { flushInbox(id); return }
+            // It asked a question and ended its turn: it waits for the answer (no timeout meanwhile).
+            if let q = t.awaitingAnswer, requests.contains(where: { $0.id == q && $0.isPending }) {
+                if t.status != .waitingForUser { update(id) { $0.status = .waitingForUser; $0.result = s.result } }
+                return
+            }
             update(id) { $0.result = s.result ?? "" }
             finish(id, status: .completed, error: s.error)
             return
@@ -551,18 +694,151 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
         if status != .completed { revokeToken(for: id) }
         recentlyApproved.removeValue(forKey: id)
         expireRequests()
+        promptSeen.removeValue(forKey: id)
+        promptsExpected.removeValue(forKey: id)
+        promptsSeen.removeValue(forKey: id)
+        lastTyped.removeValue(forKey: id)
+        // Requests addressed to this task as a coordinator go to the user now that it stopped listening.
+        for r in requests where r.isPending && r.route == .orchestrator(id) { escalateRequest(r.id, note: "the coordinator finished its turn") }
         guard let done = task(id) else { return }
         AuditLog.record("task.\(status.rawValue)", ["task": id.uuidString, "agent": done.agentName, "project": done.projectName,
                                                      "duration_s": String(Int(done.duration ?? 0)),
                                                      "tokens": done.usage.map { String($0.total) } ?? "n/a",
                                                      "error": done.error ?? ""])
         emit(done, .finished)
+        // Messages that arrived too late for this turn continue the session as a follow-up.
+        if let left = done.inbox, !left.isEmpty, status != .cancelled {
+            update(id) { $0.inbox = [] }
+            var origin = done.origin
+            origin.automatic = true
+            submit(AgentTaskRequest(agentID: done.agentID, projectID: done.projectID,
+                                    instruction: left.joined(separator: "\n\n"), origin: origin))
+        }
+        handBackToCoordinator(done)
         pump()
+    }
+
+    // MARK: Live sessions
+
+    /// The active task of this agent + project for the same conversation (Slack channel, or ProjectN itself).
+    func liveTask(agent: UUID, project: UUID, origin: TaskOrigin) -> AgentTask? {
+        guard origin.kind == .slack || origin.kind == .local else { return nil }
+        return tasks.last { t in
+            t.agentID == agent && t.projectID == project && t.status.isActive && t.origin.kind == origin.kind
+                && (origin.kind != .slack || t.origin.slackChannel == origin.slackChannel)
+        }
+    }
+
+    /// Hands a new message to a running session: it waits in the inbox until the terminal can take it (typed in
+    /// right away when possible). An open question stays open (replies to it are routed as answers by Slack).
+    func deliverMessage(_ text: String, to id: UUID) {
+        guard let t = task(id) else { return }
+        queueForSession(id, PromptComposer.newMessage(text))
+        AuditLog.record("task.message_queued", ["task": id.uuidString, "agent": t.agentName, "text": ApprovalPolicy.clip(text)])
+    }
+
+    func queueForSession(_ id: UUID, _ message: String) {
+        update(id) { $0.inbox = ($0.inbox ?? []) + [message] }
+        flushInbox(id)
+    }
+
+    /// Types the next waiting message into the session when it can take input: running (Claude Code queues
+    /// what's typed while it works), not showing a prompt, not waiting on an approval hook.
+    func flushInbox(_ id: UUID) {
+        guard let store, let t = task(id), t.status.isActive, t.status != .starting, var inbox = t.inbox, !inbox.isEmpty,
+              let paneID = t.paneID, let rt = store.runtimes[paneID], rt.isRunning, !rt.needsInput,
+              !requests.contains(where: { $0.taskID == id && $0.isPending && $0.kind == .approval }) else { return }
+        if let last = lastTyped[id], Date().timeIntervalSince(last) < 2 { return }   // one message at a time
+        let next = inbox.removeFirst()
+        lastTyped[id] = Date()
+        expectPrompt(id)
+        update(id) {
+            $0.inbox = inbox
+            $0.followUps = ($0.followUps ?? []) + [next]
+            if $0.status == .waitingForUser || $0.status == .needsApproval {
+                $0.status = .running
+                $0.startedAt = Date()   // the timeout counts from here
+            }
+        }
+        store.updatePane(paneID, in: t.workspaceID ?? UUID()) { $0.lastPrompt = next }
+        rt.submit(next)
+        AuditLog.record("task.message_delivered", ["task": id.uuidString, "agent": t.agentName])
+    }
+
+    /// A delegated task ended: its coordinator gets the result in its session — now if it's still working (and
+    /// not inside wait_for_tasks, which reports it anyway), else as a follow-up that answers the user.
+    private func handBackToCoordinator(_ done: AgentTask) {
+        guard let pid = done.origin.parentTaskID, let parent = task(pid) else { return }
+        let message = PromptComposer.delegatedResult(done)
+        if parent.status.isActive {
+            if orchestratorWaiters[pid]?.isEmpty == false { return }
+            queueForSession(pid, message)
+        } else if parent.status == .completed, profile(parent.agentID)?.enabled == true {
+            var origin = parent.origin
+            origin.automatic = true
+            submit(AgentTaskRequest(agentID: parent.agentID, projectID: parent.projectID, instruction: message, origin: origin))
+        }
+    }
+
+    /// Earlier exchanges of this conversation, for a session that starts fresh.
+    func recentConversation(for t: AgentTask, limit: Int = 6) -> [AgentTask] {
+        guard t.origin.kind == .slack || t.origin.kind == .local else { return [] }
+        let recent = tasks.filter { o in
+            o.id != t.id && o.agentID == t.agentID && o.projectID == t.projectID && o.status.isFinished
+                && o.origin.kind == t.origin.kind && o.origin.automatic != true
+                && (t.origin.kind != .slack || o.origin.slackChannel == t.origin.slackChannel)
+                && Date().timeIntervalSince(o.createdAt) < 48 * 3600
+        }
+        return Array(recent.suffix(limit))
+    }
+
+    /// Closes this agent + project's panes whose tasks have finished (a new session is starting for the pair).
+    private func closeFinishedPanes(agent: UUID, project: UUID) {
+        guard let store else { return }
+        for o in tasks where o.agentID == agent && o.projectID == project && o.status.isFinished {
+            guard let pid = o.paneID, let wid = o.workspaceID, let (_, pane) = store.pane(pid, in: wid), pane.agentTaskID == o.id else { continue }
+            store.closePane(pid, in: wid)
+            AuditLog.record("session.closed", ["agent": o.agentName, "project": o.projectName, "session": o.sessionID ?? "", "why": "replaced"])
+        }
+    }
+
+    /// Closes a task's session terminal (pane); a running task is cancelled first. The conversation stays in the
+    /// CLI's history: the next message about that project resumes it in a new terminal.
+    func closeSession(_ id: UUID) {
+        guard let t = task(id) else { return }
+        if !t.status.isFinished { cancel(id) }
+        guard let store, let pid = t.paneID, let wid = t.workspaceID, store.pane(pid, in: wid) != nil else { return }
+        store.closePane(pid, in: wid)
+        AuditLog.record("session.closed", ["agent": t.agentName, "project": t.projectName, "session": t.sessionID ?? "", "why": "closed by you"])
+    }
+
+    /// Idle sessions don't keep a process running forever: stopped after the idle time, and only the most recent
+    /// few per agent stay up. The pane and conversation remain; the next message resumes it.
+    func closeIdleSessions(now: Date = Date()) {
+        guard let store, let w = store.agentWorkspace else { return }
+        var idle: [(pane: UUID, task: AgentTask)] = []
+        for p in w.spaces.flatMap(\.panes) {
+            guard let tid = p.agentTaskID, let t = task(tid), t.status.isFinished, store.runtimes[p.id]?.isRunning == true else { continue }
+            idle.append((p.id, t))
+        }
+        let limit = Double(policy.idleCloseMinutes * 60)
+        var keep: [UUID: Int] = [:]
+        for item in idle.sorted(by: { ($0.task.finishedAt ?? .distantPast) > ($1.task.finishedAt ?? .distantPast) }) {
+            let age = now.timeIntervalSince(item.task.finishedAt ?? now)
+            let n = keep[item.task.agentID, default: 0]
+            if age > limit || n >= policy.maxIdleSessionsPerAgent {
+                store.killRuntime(item.pane)
+                AuditLog.record("session.stopped", ["agent": item.task.agentName, "project": item.task.projectName,
+                                                    "session": item.task.sessionID ?? "", "why": age > limit ? "idle" : "too many idle sessions"])
+            } else {
+                keep[item.task.agentID] = n + 1
+            }
+        }
     }
 
     // MARK: Helpers
 
-    private func update(_ id: UUID, _ mutate: (inout AgentTask) -> Void) {
+    func update(_ id: UUID, _ mutate: (inout AgentTask) -> Void) {
         guard let i = tasks.firstIndex(where: { $0.id == id }) else { return }
         var t = tasks[i]
         mutate(&t)

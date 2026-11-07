@@ -22,8 +22,10 @@ struct AgentHarnessTests {
     mkdir -p "$PROJECTN_HOME/fake"
     : > "$PROJECTN_HOME/fake/args-$SID-$MODE"
     for a in "$@"; do printf '%s\\n<<ARG>>\\n' "$a" >> "$PROJECTN_HOME/fake/args-$SID-$MODE"; done
-    case "$PROMPT" in *CRASH*) echo "fake crash"; exit 3;; esac
-    case "$PROMPT" in *SLOW*) sleep 30;; esac
+    # Only the request itself decides (not context copied from another agent's request).
+    HEAD=$(printf '%s\n' "$PROMPT" | sed -n '/^## Request/,/^## [^R]/p'); [ -n "$HEAD" ] || HEAD="$PROMPT"
+    case "$HEAD" in *CRASH*) echo "fake crash"; exit 3;; esac
+    case "$HEAD" in *SLOW*) sleep 30;; esac
     D="$CLAUDE_CONFIG_DIR/projects/fake"; mkdir -p "$D"; F="$D/$SID.jsonl"
     printf '{"type":"user","message":{"role":"user","content":"x"}}\\n' >> "$F"
     printf '{"type":"assistant","message":{"id":"m-%s-%s","role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"RESULT-%s: 1. Arreglar login"}],"usage":{"input_tokens":10,"output_tokens":5}}}\\n' "$MODE" "$$" "$MODE" >> "$F"
@@ -38,6 +40,8 @@ struct AgentHarnessTests {
     done
     sleep 60
     """
+
+    nonisolated(unsafe) static var didClearSeen = false
 
     struct Env {
         let store: Store
@@ -65,9 +69,12 @@ struct AgentHarnessTests {
         _ = NSApplication.shared
         AppHome.bootstrap()
         let fm = FileManager.default
-        for f in [AgentStore.profilesFile, AgentStore.tasksFile, AgentStore.slackSeenFile, AgentStore.integrationsFile] {
+        for f in [AgentStore.profilesFile, AgentStore.tasksFile, AgentStore.integrationsFile] {
             try? fm.removeItem(at: f)
         }
+        // Suites run in parallel and share this file: clear it once per run, not under another test's feet
+        // (tests use distinct message timestamps, so earlier entries never collide).
+        if !didClearSeen { didClearSeen = true; try? fm.removeItem(at: AgentStore.slackSeenFile) }
         let script = home.appendingPathComponent("fake-claude.sh")
         try Self.fakeClaude.write(to: script, atomically: true, encoding: .utf8)
         try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
@@ -95,11 +102,14 @@ struct AgentHarnessTests {
         let noReadme = try makeProject("SinDocs", readme: nil)
         store.openProject(project)   // "the selected project"
 
-        ModelCatalog.shared.setClaudeListing(listing ?? .init(
+        // Each env has its own catalog: suites run in parallel and one of them limits the model list.
+        let catalog = ModelCatalog()
+        catalog.setClaudeListing(listing ?? .init(
             models: [.init(id: "claude-opus-5-5", label: "Opus 5.5", efforts: ["low", "medium", "high", "xhigh", "max"]),
+                     .init(id: "claude-sonnet-5-5", label: "Sonnet 5.5", efforts: ["low", "medium", "high"]),
                      .init(id: "claude-haiku-5-5", label: "Haiku 5.5", efforts: [])],
             source: .live))
-        let harness = AgentHarness()
+        let harness = AgentHarness(catalog: catalog)
         harness.attach(store, refreshModels: false)
         // Most tests here count sessions per task; per-project sessions are tested in AutonomyTests.
         if var pm = harness.profiles.first { pm.sessionPolicy = .alwaysNew; harness.saveProfile(pm) }
@@ -257,7 +267,7 @@ struct AgentHarnessTests {
         again.settings = env.slack.settings
         again.handle(event: ["type": "app_mention", "text": "<@UBOT> Project Manager, revisa Demo", "user": "U1", "channel": "C1", "ts": "500.1"], eventID: "EvA")
         try await Task.sleep(for: .milliseconds(200))
-        #expect(env.harness.tasks.count == 1)
+        #expect(env.harness.tasks.count == 1, "\(env.harness.tasks.map { "\($0.instruction) | \($0.origin.label) | \($0.projectName) | \($0.status)" })")
     }
 
     // MARK: Concurrency
@@ -363,13 +373,7 @@ struct AgentHarnessTests {
         try await waitUntil { env.harness.tasks.count == 2 && env.harness.tasks[1].status == .completed }
         #expect(env.harness.tasks[1].sessionID != first.sessionID)
 
-        // Explicit resume while the policy forbids it.
-        mention("Project Manager, reanuda la sesión y resume en 3 puntos", ts: "900.3", thread: "900.1", env: env)
-        try await waitUntil { env.posts.texts(thread: "900.1").contains { $0.contains("doesn't allow resuming") } }
-
-        var pm = try #require(env.harness.profiles.first)
-        pm.sessionPolicy = .resumeOnExplicitRequest
-        env.harness.saveProfile(pm)
+        // Asking explicitly resumes the thread's session, whatever the session policy.
         // Its terminal is gone (e.g. ProjectN restarted), so resuming starts the CLI again with --resume.
         // (With the terminal still open, the message would simply be typed into it.)
         let last = try #require(env.harness.tasks.last { $0.sessionID != nil })

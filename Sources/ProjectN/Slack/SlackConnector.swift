@@ -339,7 +339,8 @@ final class SlackConnector: ObservableObject {
         let allowed = store.state.projects.filter { agent.mayAccess($0.id) }
         // Not naming a project = keep working on the one this conversation was about with this agent.
         let lastHere = harness.tasks.last { $0.origin.slackChannel == channel && $0.agentID == agent.id }?.projectID
-        switch SlackRouter.resolveProject(instruction, allowed: allowed, selectedProjectID: lastHere ?? store.focusedProjectID) {
+        switch SlackRouter.resolveProject(instruction, allowed: allowed, selectedProjectID: store.focusedProjectID,
+                                          conversationProjectID: lastHere) {
         case .project(let p):
             submit(agentID: agent.id, project: p, instruction: instruction, user: user, channel: channel,
                    threadTS: threadTS, messageTS: messageTS, resume: wantsResume, bot: botKey)
@@ -384,7 +385,12 @@ final class SlackConnector: ObservableObject {
         origin.slackBot = bot
         var req = AgentTaskRequest(agentID: agentID, projectID: project.id, instruction: instruction, origin: origin, resumeTaskID: resumeTaskID)
         req.freshSession = SlackRouter.wantsNewSession(instruction)
+        let existing = Set(harness.tasks.map(\.id))
         switch harness.submit(req) {
+        case .success(let t) where existing.contains(t.id):
+            // Went into the session that's already working on this conversation.
+            log("Message for \(t.agentName)'s running session")
+            post(channel, threadTS, "📨 *\(t.agentName)* ya está trabajando en *\(project.name)*: le pasé tu mensaje y lo tendrá en cuenta.", bot: bot, as: t.agentID)
         case .success(let t):
             log("Queued \(t.agentName) → \(project.name)")
             if t.status == .queued, settings.notifyOnStart {
@@ -424,7 +430,7 @@ final class SlackConnector: ObservableObject {
         let delegated = t.origin.kind == .agent
         switch event {
         case .started:
-            guard settings.notifyOnStart else { return }
+            guard settings.notifyOnStart, t.origin.automatic != true else { return }
             if delegated {
                 post(channel, thread, "↳ *\(t.origin.delegatedBy ?? "Un agente")* delegó a *\(t.agentName)* (\(t.projectName)): \(Self.firstLine(t.instruction))", bot: bot, as: t.agentID)
                 return
@@ -436,10 +442,9 @@ final class SlackConnector: ObservableObject {
             }
             let session = t.resumedFromTaskID == nil ? "sesión nueva" : "sesión reanudada"
             post(channel, thread, "▶️ *\(t.agentName)* trabajando en *\(t.projectName)* — \(session) · \(label)\(t.effort.map { " · effort \($0)" } ?? "") · \(t.permission.label)", bot: bot, as: t.agentID)
-        case .approvalNeeded(let q):
-            guard settings.notifyApprovals else { return }
-            let quoted = q.split(separator: "\n").prefix(12).map { "> \($0)" }.joined(separator: "\n")
-            post(channel, thread, "⏸ *\(t.agentName)* espera una respuesta en su terminal de ProjectN:\n\(quoted)\nÁbrelo en ProjectN → vista *Agents*.", bot: bot, as: t.agentID)
+        case .approvalNeeded:
+            // Posted as a request with Aprobar / Rechazar buttons (requestCreated); ProjectN answers the terminal.
+            return
         case .planProposed(let plan):
             guard settings.notifyApprovals else { return }
             postLong(channel, thread, "📝 *\(t.agentName)* propone este plan (espera tu aprobación en ProjectN):\n\n" + SlackRouter.toSlack(plan), bot: bot, as: t.agentID)
@@ -824,6 +829,10 @@ struct SeenEvents {
 
     mutating func insert(_ key: String) {
         guard !key.isEmpty, !set.contains(key) else { return }
+        // Merge what another connector (an earlier instance, a restart) saved meanwhile instead of overwriting it.
+        if let saved = AppHome.load([String].self, from: AgentStore.slackSeenFile) {
+            for k in saved where !set.contains(k) { order.append(k); set.insert(k) }
+        }
         order.append(key)
         set.insert(key)
         if order.count > limit {

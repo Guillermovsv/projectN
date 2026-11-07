@@ -5,8 +5,11 @@ import Testing
 struct ApprovalPolicyTests {
     let project = "/Users/test/Documents/client-site"
 
-    private func ctx(_ p: AgentPermission = .editProject, cli: [String] = []) -> ApprovalPolicy.Context {
-        .init(permission: p, projectPath: project, cliTools: cli, cwd: project)
+    private func ctx(_ p: AgentPermission = .editProject, cli: [String] = [], autonomy: AgentAutonomy = .balanced) -> ApprovalPolicy.Context {
+        .init(permission: p, projectPath: project, cliTools: cli, cwd: project, autonomy: autonomy)
+    }
+    private func decide(_ c: String, _ a: AgentAutonomy, _ p: AgentPermission = .editProject) -> ApprovalTier {
+        ApprovalPolicy.decide(tool: "Bash", input: ["command": c], ctx(p, autonomy: a))
     }
     private func bash(_ c: String, _ p: AgentPermission = .editProject, cli: [String] = []) -> ApprovalTier {
         ApprovalPolicy.classify(tool: "Bash", input: ["command": c], ctx(p, cli: cli))
@@ -43,10 +46,14 @@ struct ApprovalPolicyTests {
         for c in ["git push", "git push origin main", "npm publish", "vercel --prod", "firebase deploy", "gh pr merge 3",
                   "gh release create v1", "docker push img", "ssh host ls", "scp a host:/b", "curl -X POST https://x.dev/api",
                   "curl -d a=1 https://x", "sudo ls", "chmod -R 777 .", "cat ~/.ssh/id_rsa", "cp a.txt /etc/hosts",
-                  "ls ../other-client", "echo hi > ~/notes.txt"] {
+                  "echo hi > ~/notes.txt", "cat ~/.claude.json", "grep token ~/.aws/config"] {
             #expect(isUser(bash(c)), "\(c) → \(bash(c))")
         }
         #expect(isUser(ApprovalPolicy.classify(tool: "Read", input: ["file_path": "/Users/test/.aws/credentials"], ctx())))
+        // Reading another folder: fine unless the agent is cautious.
+        #expect(bash("ls ../other-client") == .allow)
+        #expect(isUser(ApprovalPolicy.classify(tool: "Bash", input: ["command": "ls ../other-client"], ctx(autonomy: .cautious))))
+        #expect(ApprovalPolicy.classify(tool: "Read", input: ["file_path": "/Users/test/Documents/other/README.md"], ctx()) == .allow)
         #expect(isUser(ApprovalPolicy.classify(tool: "Edit", input: ["file_path": "/Users/test/other/x.swift"], ctx())))
         #expect(isUser(ApprovalPolicy.classify(tool: "mcp__zernio__posts_publish_now", input: [:], ctx())))
         #expect(isUser(ApprovalPolicy.classify(tool: "mcp__zernio__posts_create", input: [:], ctx())))
@@ -68,9 +75,14 @@ struct ApprovalPolicyTests {
     }
 
     @Test func grayAreaAndReadOnlyAgents() {
-        for c in ["curl https://example.com", "some-unknown-tool --x", "echo $(whoami)"] {
+        for c in ["curl https://example.com", "some-unknown-tool --x", "echo $(some-unknown-tool)"] {
             #expect(isGray(bash(c)), "\(c) → \(bash(c))")
         }
+        // What runs inside $(…) / `…` is judged like the rest of the command.
+        #expect(bash("echo $(whoami)") == .allow)
+        #expect(bash("ls \"$(npm prefix -g)/bin\"") == .allow)
+        #expect(isUser(bash("echo $(rm -rf build)")))
+        #expect(isUser(bash("x=`git push`")))
         #expect(isGray(ApprovalPolicy.classify(tool: "WebFetch", input: ["url": "https://x.dev"], ctx())))
         #expect(isGray(ApprovalPolicy.classify(tool: "mcp__airedinamica-elementor__elementor-manage-elements", input: [:], ctx())))
         // Read-only agents: reading is fine, changing is refused outright (not even asked).
@@ -90,5 +102,45 @@ struct ApprovalPolicyTests {
 
     @Test func segmentsRespectQuotesAndRedirections() {
         #expect(ApprovalPolicy.segments("echo 'a; b' && ls 2>&1 | wc -l") == ["echo 'a; b'", "ls 2>&1", "wc -l"])
+    }
+
+    @Test func autonomyLevelsDecideHowMuchAsks() {
+        // Gray area: on its own unless cautious.
+        #expect(decide("curl https://example.com", .balanced) == .allow)
+        #expect(decide("some-unknown-tool --x", .high) == .allow)
+        #expect(isGray(decide("some-unknown-tool --x", .cautious)))
+        // Publishing / sending: asks at balanced, runs at high.
+        for c in ["git push", "curl -X POST https://x.dev/api", "ssh host ls", "vercel --prod"] {
+            #expect(isUser(decide(c, .balanced)), "\(c)")
+            #expect(decide(c, .high) == .allow, "\(c)")
+        }
+        // Always asks: deleting, admin, system state, secrets — even at high.
+        for c in ["rm -rf build", "git push -f", "sudo ls", "chmod -R 777 .", "cat ~/.ssh/id_rsa", "cp a.txt /etc/hosts"] {
+            #expect(isUser(decide(c, .high)), "\(c) → \(decide(c, .high))")
+        }
+        // Read-only agents stay read-only whatever the autonomy.
+        #expect(isDeny(decide("npm install", .high, .readOnly)))
+        // MCP tools: publishing asks at balanced, gray ones don't.
+        let mcp = { (t: String, a: AgentAutonomy) in ApprovalPolicy.decide(tool: t, input: [:], self.ctx(autonomy: a)) }
+        #expect(mcp("mcp__airedinamica-elementor__elementor-manage-elements", .balanced) == .allow)
+        #expect(isUser(mcp("mcp__zernio__posts_publish_now", .balanced)))
+        #expect(mcp("mcp__zernio__posts_publish_now", .high) == .allow)
+        #expect(isUser(mcp("mcp__zernio__posts_delete", .high)))
+    }
+
+    @Test func secretsAreRedacted() {
+        let cmd = #"curl -H "Authorization: Basic Z3VpbGwuYWxleC5zYW5jaGV6QGdtYWlsLmNvbTpUcGsxY2RY" https://x.dev"#
+        #expect(!Redactor.redact(cmd).contains("Z3VpbGwu"))
+        let b64 = #"python3 -c "import base64;print(base64.b64decode('Z3VpbGwuYWxleC5zYW5jaGV6QGdtYWlsLmNvbTpUcGsxY2RYYXEzQW9EVXhBcXhiTEVCVk0='))""#
+        #expect(!Redactor.redact(b64).contains("Z3VpbGwu"))
+        #expect(!Redactor.redact("export API_KEY=abc123secret").contains("abc123secret"))
+        #expect(!Redactor.redact("https://user:hunter2@example.com/x").contains("hunter2"))
+        #expect(!ApprovalPolicy.clip("token=ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ123456").contains("ghp_ABCDEF"))
+        // Ordinary text, paths, UUIDs and model names survive.
+        for keep in ["/private/tmp/claude-501/-Users-memo-Documents-Florina/091f94a5-7193-4d75-98f4-958182b8ab48/scratchpad",
+                     "npm view @seo-core-app-ai/mcp version", "claude-sonnet-5-5", "antiquewhite-newt-221898.hostingersite.com",
+                     "git log --oneline -5"] {
+            #expect(Redactor.redact(keep) == keep, "\(keep)")
+        }
     }
 }

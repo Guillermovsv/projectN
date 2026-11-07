@@ -67,7 +67,7 @@ PLIST
 # built-in NVoice dictation) across rebuilds. Ad-hoc signing ("-") changes the signature every build,
 # so macOS silently ignores the old grant.
 if [ -z "${SIGN_IDENTITY:-}" ]; then
-  for id in "ProjectN Local Signing"; do
+  for id in "ProjectN Local Signing" "NVoice Local Signing"; do
     if security find-identity -p codesigning 2>/dev/null | grep -q "\"$id\""; then SIGN_IDENTITY="$id"; break; fi
   done
 fi

@@ -109,7 +109,12 @@ enum Launcher {
         env["COLORTERM"] = "truecolor"
         env["TERM_PROGRAM"] = "ProjectN"
         if env["LANG"] == nil { env["LANG"] = "en_US.UTF-8" }
-        let extraPath = [AppHome.binDir.path, AppHome.mcpDir.appendingPathComponent("node_modules/.bin").path]
+        // Apps opened from Finder get a bare PATH, and a non-interactive `zsh -l -c` doesn't read ~/.zshrc,
+        // so add the usual places CLIs like `claude` / `codex` / `cursor-agent` are installed.
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let userBins = ["\(home)/.local/bin", "\(home)/.claude/local", "\(home)/.bun/bin", "\(home)/.npm-global/bin",
+                        "/opt/homebrew/bin", "/usr/local/bin"]
+        let extraPath = [AppHome.binDir.path, AppHome.mcpDir.appendingPathComponent("node_modules/.bin").path] + userBins
         env["PATH"] = (extraPath + [env["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin"]).joined(separator: ":")
         env["PROJECTN_HOME"] = AppHome.root.path
         env["PROJECTN_MCP_CONFIG"] = AppHome.mcpFile.path

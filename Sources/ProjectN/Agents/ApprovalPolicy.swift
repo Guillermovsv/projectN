@@ -33,6 +33,32 @@ enum ApprovalPolicy {
         /// Commands this agent may run without asking (its CLI tools), e.g. ["gh", "wp", "vercel"].
         var cliTools: [String] = []
         var cwd: String?
+        /// How much runs without asking (see AgentAutonomy).
+        var autonomy: AgentAutonomy = .balanced
+    }
+
+    /// Applies the agent's autonomy to a verdict for a top-level decision (nobody coordinating it):
+    /// gray-area work runs on its own unless the agent is cautious; `high` also lets publishing / sending /
+    /// remote work and writes in your home folder through. Deleting, admin/system changes and secrets always ask.
+    static func decide(tool: String, input: [String: Any], _ ctx: Context) -> ApprovalTier {
+        let tier = classify(tool: tool, input: input, ctx)
+        switch (tier, ctx.autonomy) {
+        case (.orchestrator, .balanced), (.orchestrator, .high):
+            return .allow
+        case (.user(let why), .high) where highMayDecide(why):
+            return .allow
+        default:
+            return tier
+        }
+    }
+
+    /// Reasons `high` autonomy decides by itself. Everything else (deleting, admin rights, system state,
+    /// secrets, system folders) still asks.
+    private static func highMayDecide(_ why: String) -> Bool {
+        let ok = ["Publishes", "Sends data", "Pushes to a remote", "Publishes a package", "Changes GitHub", "Deploys",
+                  "Publishes an image", "Acts on a remote system", "Copies to a remote system", "Writes outside the project",
+                  "Touches a path outside the project", "Reads outside the project", "Creates a new project"]
+        return ok.contains { why.hasPrefix($0) } && !why.contains(" [protected]")
     }
 
     static func classify(tool: String, input: [String: Any], _ ctx: Context) -> ApprovalTier {
@@ -41,7 +67,10 @@ enum ApprovalPolicy {
         let path = (input["file_path"] ?? input["path"] ?? input["notebook_path"]) as? String
         switch tool {
         case "Read", "Glob", "Grep", "LS", "NotebookRead":
-            if let path, !inside(path, ctx) { return .user("Reads outside the project: \(path)") }
+            if let path, !inside(path, ctx) {
+                if isProtected(path) { return .user("Reads outside the project: \(path) [protected]") }
+                return ctx.autonomy == .cautious ? .user("Reads outside the project: \(path)") : .allow
+            }
             return .allow
         case "TodoWrite", "WebSearch", "Task", "Agent", "TaskCreate", "TaskUpdate", "TaskGet", "TaskList", "ToolSearch", "Skill":
             return .allow
@@ -52,7 +81,7 @@ enum ApprovalPolicy {
             return .orchestrator("Wants to leave plan mode and start working")
         case "Edit", "Write", "MultiEdit", "NotebookEdit":
             guard ctx.permission.canWrite else { return .deny("\(roleLabel(ctx)) can't modify files. Give your findings as text instead.") }
-            if let path, !inside(path, ctx) { return .user("Writes outside the project: \(path)") }
+            if let path, !inside(path, ctx) { return .user("Writes outside the project: \(path)" + (isProtected(path) || !inHome(path) ? " [protected]" : "")) }
             if tool == "Write", let path, input["content"] as? String == "" { return .user("Deletes the contents of \(path)") }
             return ctx.permission == .askBeforeChanges ? .user("Edits \(path.map(relative(ctx)) ?? "a file")") : .allow
         case "Bash":
@@ -110,13 +139,51 @@ enum ApprovalPolicy {
             return .user("Deletes data: \(clip(trimmed))")
         }
         if trimmed.contains("$(") || trimmed.contains("`") || trimmed.contains("<(") {
-            verdict = max(verdict, .orchestrator("Runs a command with substitutions: \(clip(trimmed))"))
+            // The commands inside $(…), `…` and <(…) are judged like the rest.
+            let inner = substitutions(trimmed)
+            for c in inner where c != trimmed {
+                verdict = max(verdict, classifyCommand(c, ctx))
+                if case .deny = verdict { return verdict }
+            }
+            if inner.isEmpty { verdict = max(verdict, .orchestrator("Runs a command with substitutions: \(clip(trimmed))")) }
         }
         for segment in segments(trimmed) {
             verdict = max(verdict, classifySegment(segment, ctx))
             if case .deny = verdict { return verdict }
         }
         return verdict
+    }
+
+    /// Bodies of $(…), <(…) and `…` (outermost level; nested ones are found when the body is classified).
+    static func substitutions(_ s: String) -> [String] {
+        var out: [String] = []
+        let chars = Array(s)
+        var i = 0
+        var single = false
+        while i < chars.count {
+            let c = chars[i]
+            if c == "'" { single.toggle(); i += 1; continue }
+            if single { i += 1; continue }
+            if (c == "$" || c == "<"), i + 1 < chars.count, chars[i + 1] == "(" {
+                var depth = 1, j = i + 2
+                while j < chars.count, depth > 0 {
+                    if chars[j] == "(" { depth += 1 } else if chars[j] == ")" { depth -= 1 }
+                    j += 1
+                }
+                guard depth == 0 else { return [] }   // unbalanced: can't judge it
+                out.append(String(chars[(i + 2)..<(j - 1)]).trimmingCharacters(in: .whitespaces))
+                i = j
+                continue
+            }
+            if c == "`" {
+                guard let end = chars[(i + 1)...].firstIndex(of: "`") else { return [] }
+                out.append(String(chars[(i + 1)..<end]).trimmingCharacters(in: .whitespaces))
+                i = end + 1
+                continue
+            }
+            i += 1
+        }
+        return out.filter { !$0.isEmpty }
     }
 
     /// Splits on ; && || | & and newlines (outside quotes).
@@ -217,15 +284,20 @@ enum ApprovalPolicy {
         }
 
         // ── Paths outside the project ────────────────────────────────────────────────
+        // Reading elsewhere (ls, cat, grep… on another folder) is fine unless the agent is cautious or it's a secret.
+        let reads = readOnlyCommands.contains(cmd) || (cmd == "git" && gitReadOnly.contains(sub))
         for a in args where !a.hasPrefix("-") {
             let arg = a.split(separator: "=", maxSplits: 1).last.map(String.init) ?? a
             guard arg.hasPrefix("/") || arg.hasPrefix("~") || arg.contains("..") else { continue }
-            if !inside(arg, ctx) && !harmlessPath(arg) { return .user("Touches a path outside the project: \(arg)") }
+            guard !inside(arg, ctx) && !harmlessPath(arg) else { continue }
+            if isProtected(arg) { return .user("Touches a path outside the project: \(arg) [protected]") }
+            if reads && ctx.autonomy != .cautious { continue }
+            return .user("Touches a path outside the project: \(arg)" + (inHome(arg) ? "" : " [protected]"))
         }
         if segment.range(of: #"(^|[^<>&0-9])>{1,2}\s*([^\s&|;]+)"#, options: .regularExpression) != nil {
             let targets = matches(#">{1,2}\s*([^\s&|;]+)"#, in: segment)
             for t in targets where !t.hasPrefix("&") && !harmlessPath(t) {
-                if !inside(t, ctx) { return .user("Writes outside the project: \(t)") }
+                if !inside(t, ctx) { return .user("Writes outside the project: \(t)" + (isProtected(t) || !inHome(t) ? " [protected]" : "")) }
                 if !ctx.permission.canWrite { return .deny("\(roleLabel(ctx)) can't write files (redirect to \(t)).") }
             }
         }
@@ -253,6 +325,23 @@ enum ApprovalPolicy {
         return p == base || p.hasPrefix(base + "/")
     }
 
+    /// Secrets and credentials outside the project: reading or writing them always asks you.
+    static func isProtected(_ path: String) -> Bool {
+        let c = PathGuard.canonical((path as NSString).expandingTildeInPath)
+        let home = PathGuard.canonical(NSHomeDirectory())
+        let dirs = [".ssh", ".aws", ".gnupg", ".kube", ".docker", ".config/gcloud", ".config/gh", "Library/Keychains",
+                    "Library/Cookies", ".projectn", "Library/Application Support/Google/Chrome"]
+        if dirs.contains(where: { c == "\(home)/\($0)" || c.hasPrefix("\(home)/\($0)/") }) { return true }
+        if [".claude.json", ".netrc", ".npmrc", ".pypirc", ".git-credentials", ".zsh_history", ".bash_history"].contains(where: { c == "\(home)/\($0)" }) { return true }
+        return PathGuard.looksSecret(URL(fileURLWithPath: c))
+    }
+
+    static func inHome(_ path: String) -> Bool {
+        let c = PathGuard.canonical((path as NSString).expandingTildeInPath)
+        let home = PathGuard.canonical(NSHomeDirectory())
+        return c.hasPrefix(home + "/") && !c.hasPrefix(home + "/Library/")
+    }
+
     static func harmlessPath(_ p: String) -> Bool {
         let c = PathGuard.canonical((p as NSString).expandingTildeInPath)
         return ["/dev/null", "/dev/stdout", "/dev/stderr", "/dev/stdin"].contains(c)
@@ -265,11 +354,62 @@ enum ApprovalPolicy {
 
     private static func roleLabel(_ ctx: Context) -> String { ctx.permission == .readOnly ? "This agent is read-only and" : "This agent" }
 
-    static func clip(_ s: String) -> String { s.count > 160 ? String(s.prefix(160)) + "…" : s }
+    static func clip(_ s: String) -> String {
+        let r = Redactor.redact(s)
+        return r.count > 160 ? String(r.prefix(160)) + "…" : r
+    }
 
     private static func matches(_ pattern: String, in s: String) -> [String] {
         guard let re = try? NSRegularExpression(pattern: pattern) else { return [] }
         let ns = s as NSString
         return re.matches(in: s, range: NSRange(location: 0, length: ns.length)).map { ns.substring(with: $0.range(at: 1)) }
+    }
+}
+
+/// Hides secrets (tokens, passwords, Authorization headers, base64 credentials) in text shown in Slack, ProjectN
+/// and the audit log. Heuristic: better to over-redact a random-looking string than to leak a credential.
+enum Redactor {
+    private static let rules: [(NSRegularExpression, String)] = {
+        let specs: [(String, String)] = [
+            // Authorization: Bearer xxx / Basic xxx (headers, curl -H, JSON)
+            (#"(?i)(authorization["']?\s*[:=]\s*["']?\s*(?:bearer|basic|token)?\s*)[^\s"',;}]+"#, "$1•••"),
+            (#"(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]{8,}"#, "$1 •••"),
+            // key=value / "key": "value" for secret-looking names
+            (#"(?i)((?:api[_-]?key|apikey|access[_-]?token|refresh[_-]?token|auth[_-]?token|token|secret|client[_-]?secret|password|passwd|pwd|app[_-]?password)["']?\s*[:=]\s*["']?)[^\s"'&,;}]+"#, "$1•••"),
+            // Well-known token formats
+            (#"\b(?:sk|pk|rk)-[A-Za-z0-9_-]{16,}"#, "•••"),
+            (#"\bxox[abposr]-[A-Za-z0-9-]{10,}"#, "•••"),
+            (#"\bxapp-[A-Za-z0-9-]{10,}"#, "•••"),
+            (#"\bgh[pousr]_[A-Za-z0-9]{20,}"#, "•••"),
+            (#"\bAKIA[0-9A-Z]{16}\b"#, "•••"),
+            (#"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,}"#, "•••"),
+            // user:password@host in URLs
+            (#"(://[^/\s:@]+:)[^@\s/]+@"#, "$1•••@"),
+        ]
+        return specs.compactMap { p, t in (try? NSRegularExpression(pattern: p)).map { ($0, t) } }
+    }()
+
+    static func redact(_ s: String) -> String {
+        guard !s.isEmpty else { return s }
+        var out = s
+        for (re, template) in rules {
+            out = re.stringByReplacingMatches(in: out, range: NSRange(out.startIndex..., in: out), withTemplate: template)
+        }
+        return redactOpaqueTokens(out)
+    }
+
+    /// Long random-looking runs (upper + lower + digits, ≥ 24 chars, no path separators): base64 credentials, keys.
+    private static func redactOpaqueTokens(_ s: String) -> String {
+        guard let re = try? NSRegularExpression(pattern: #"[A-Za-z0-9+=_-]{24,}"#) else { return s }
+        var out = s
+        for m in re.matches(in: s, range: NSRange(s.startIndex..., in: s)).reversed() {
+            guard let r = Range(m.range, in: out) else { continue }
+            let w = out[r]
+            let hasUpper = w.contains { $0.isUppercase }, hasLower = w.contains { $0.isLowercase }, hasDigit = w.contains { $0.isNumber }
+            // UUIDs, paths written with dashes and plain words don't qualify.
+            let dashed = w.split(separator: "-").count > 3
+            if hasUpper && hasLower && hasDigit && !dashed { out.replaceSubrange(r, with: "•••") }
+        }
+        return out
     }
 }

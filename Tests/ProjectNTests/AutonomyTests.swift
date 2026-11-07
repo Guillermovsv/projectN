@@ -15,10 +15,10 @@ struct AutonomyTests {
         try await AgentHarnessTests.makeSharedEnv()
     }
 
-    private func waitUntil(_ seconds: Double = 15, _ condition: () -> Bool) async throws {
+    private func waitUntil(_ seconds: Double = 15, line: Int = #line, _ condition: () -> Bool) async throws {
         let deadline = Date().addingTimeInterval(seconds)
         while !condition(), Date() < deadline { try await Task.sleep(for: .milliseconds(50)) }
-        #expect(condition())
+        #expect(condition(), "waited at line \(line)")
     }
 
     /// Runs the helper like the CLI would; returns its stdout.
@@ -83,8 +83,9 @@ struct AutonomyTests {
         return t
     }
 
-    private func addDeveloper(_ env: Env) -> AgentProfile {
+    private func addDeveloper(_ env: Env, autonomy: AgentAutonomy = .cautious) -> AgentProfile {
         var dev = AgentProfile(name: "Developer", role: "Developer", model: "claude-opus-5-5", instructions: "Code.")
+        dev.autonomy = autonomy
         dev.permission = .editProject
         dev.allProjects = true
         dev.concurrencyLimit = 3
@@ -150,7 +151,7 @@ struct AutonomyTests {
         #expect(listed.first?.contains("\"Developer\"") == true)
 
         // Delegate a task that finishes, and wait for it.
-        let (_, r1) = await mcp([("delegate_task", ["agent": "Developer", "instruction": "Revisa el login"]),
+        let (_, r1) = await mcp([("delegate_task", ["agent": "Developer", "instruction": "Revisa el login", "context": "Las tareas están en Notion › Project Hub › Tasks (T1–T12), proyecto Demo."]),
                                  ("wait_for_tasks", ["timeout_seconds": 30])], task: pm.id, env: env)
         let child = try #require(env.harness.tasks.first { $0.origin.parentTaskID == pm.id })
         #expect(child.depth == 1 && child.rootTaskID == pm.id && child.origin.delegatedBy == "Project Manager")
@@ -163,7 +164,7 @@ struct AutonomyTests {
         #expect(devTools == ["ask"] || devTools.isEmpty)   // empty once the child finished (token revoked)
 
         // A running child: gray area goes to the PM, deletion goes to the user.
-        let (_, r2) = await mcp([("delegate_task", ["agent": "Developer", "instruction": "SLOW implementa el login"])], task: pm.id, env: env)
+        let (_, r2) = await mcp([("delegate_task", ["agent": "Developer", "instruction": "SLOW implementa el login", "context": "Las tareas están en Notion › Project Hub › Tasks (T1–T12), proyecto Demo."])], task: pm.id, env: env)
         #expect(r2.first?.contains("task_id") == true)
         let worker = try #require(env.harness.tasks.last { $0.origin.parentTaskID == pm.id })
         try await waitUntil { env.harness.tokenOfTask[worker.id] != nil && env.harness.task(worker.id)?.status.isActive == true }
@@ -190,13 +191,21 @@ struct AutonomyTests {
         env.harness.resolveRequest(userReq.id, approve: false, by: "you (ProjectN)")
         #expect(await del.decision == "deny")
 
-        // Questions go up to the PM too.
-        async let question = mcp([("ask", ["question": "¿Uso OAuth o email?"])], task: worker.id, env: env)
-        try await waitUntil { env.harness.requests.contains { $0.isPending && $0.kind == .question } }
+        // Questions go up to the PM too. `ask` doesn't block (Claude Code would move a long call to the background):
+        // it returns at once, and the answer is typed into the asking session.
+        let (_, asked) = await mcp([("ask", ["question": "¿Uso OAuth o email?"])], task: worker.id, env: env)
+        #expect(asked.first?.contains("Question sent to Project Manager") == true)
         let q = try #require(env.harness.requests.first { $0.isPending && $0.kind == .question })
         #expect(q.route == .orchestrator(pm.id))
+        #expect(env.harness.task(worker.id)?.awaitingAnswer == q.id)
+        // The PM, not inside wait_for_tasks, is told in its own session.
+        #expect(env.harness.task(pm.id).map { (($0.inbox ?? []) + ($0.followUps ?? [])).contains { $0.contains("Developer needs you") } } == true)
         _ = await mcp([("answer_request", ["request_id": q.id.uuidString, "decision": "answer", "text": "Email"])], task: pm.id, env: env)
-        #expect(await question.results.first?.contains("Answer from Project Manager:\nEmail") == true)
+        try await waitUntil {
+            let w = env.harness.task(worker.id)
+            return ((w?.inbox ?? []) + (w?.followUps ?? [])).contains { $0.contains("Answer to your question (from Project Manager)") && $0.contains("Email") }
+        }
+        #expect(env.harness.task(worker.id)?.awaitingAnswer == nil)
 
         // Escalation hands a gray request to you.
         async let escalated = hook("WebFetch", ["url": "https://example.com"], task: worker.id, env: env)
@@ -208,10 +217,12 @@ struct AutonomyTests {
                                      "actions": [["action_id": "pn_approve", "value": e.id.uuidString]]])
         #expect(await escalated.decision == "allow")
 
-        // Ending the PM cancels nothing by itself, but its pending requests can't hang: they expire.
+        // Ending the PM cancels nothing by itself, but its pending requests can't hang: they go to you.
         async let orphan = hook("Bash", ["command": "curl https://example.com"], task: worker.id, env: env)
         try await waitUntil { env.harness.requests.contains { $0.isPending && $0.route == .orchestrator(pm.id) } }
         env.harness.cancel(pm.id)
+        let handed = try #require(env.harness.pendingUserRequests().first { $0.summary.contains("curl") })
+        env.harness.resolveRequest(handed.id, approve: false, by: "you")
         #expect(await orphan.decision == "deny")
         env.harness.cancel(worker.id)
     }
@@ -225,9 +236,9 @@ struct AutonomyTests {
         policy.maxTasksPerRequest = 1
         env.harness.savePolicy(policy)
         let pm = try await startPM(env, ts: "3.1")
-        let (_, r) = await mcp([("delegate_task", ["agent": "Developer", "instruction": "SLOW uno"]),
-                                ("delegate_task", ["agent": "Developer", "instruction": "dos"]),
-                                ("delegate_task", ["agent": "Project Manager", "instruction": "yo"])], task: pm.id, env: env)
+        let (_, r) = await mcp([("delegate_task", ["agent": "Developer", "instruction": "SLOW uno", "context": "Las tareas están en Notion › Project Hub › Tasks (T1–T12), proyecto Demo."]),
+                                ("delegate_task", ["agent": "Developer", "instruction": "dos", "context": "Las tareas están en Notion › Project Hub › Tasks (T1–T12), proyecto Demo."]),
+                                ("delegate_task", ["agent": "Project Manager", "instruction": "yo", "context": "Las tareas están en Notion › Project Hub › Tasks (T1–T12), proyecto Demo."])], task: pm.id, env: env)
         #expect(r.count == 3 && r[1].contains("Limit reached") && r[2].contains("not to yourself"))
         let worker = try #require(env.harness.tasks.last { $0.origin.parentTaskID == pm.id })
         try await waitUntil { env.harness.tokenOfTask[worker.id] != nil && env.harness.task(worker.id)?.status.isActive == true }
@@ -236,7 +247,7 @@ struct AutonomyTests {
         env.harness.resolveRequest(env.harness.pendingUserRequests()[0].id, approve: true, by: "you")
         #expect(await gray.decision == "allow")
         // Non-delegators can't use delegation tools.
-        let (_, denied) = await mcp([("delegate_task", ["agent": "Project Manager", "instruction": "x"])], task: worker.id, env: env)
+        let (_, denied) = await mcp([("delegate_task", ["agent": "Project Manager", "instruction": "x", "context": "Las tareas están en Notion › Project Hub › Tasks (T1–T12), proyecto Demo."])], task: worker.id, env: env)
         #expect(denied.first?.contains("can't delegate") == true)
         env.harness.cancel(worker.id)
         env.harness.cancel(pm.id)
@@ -323,6 +334,9 @@ struct AutonomyTests {
         #expect(FileManager.default.fileExists(atPath: created.appendingPathComponent("README.md").path))
         let p = try #require(env.store.state.projects.first { $0.name == "Landing García" })
         try await waitUntil { env.harness.tasks.first { $0.projectID == p.id }?.status == .completed }
+        if env.harness.tasks.first(where: { $0.projectID == p.id })?.status != .completed {
+            Issue.record("\(env.harness.tasks.map { "\($0.instruction) | \($0.projectName) | \($0.status) | \($0.error ?? "") | inbox \($0.inbox ?? [])" }) runtimes=\(env.store.runtimes.count)")
+        }
         try await waitUntil { env.posts.texts(thread: "8.1").contains { $0.hasPrefix("📁 Proyecto *Landing García* creado") } }
         // Asking again doesn't recreate or overwrite it: it's an existing project now.
         let readme = try String(contentsOf: created.appendingPathComponent("README.md"), encoding: .utf8)
@@ -335,8 +349,13 @@ struct AutonomyTests {
                                  "text": "<@UBOT> Project Manager, crea el proyecto \"../../etc\" ya"], eventID: "Ev8.3")
         try await waitUntil { env.posts.texts(thread: "8.3").contains { $0.contains("No pude crear el proyecto") } }
 
-        // 2. An agent's create_project asks you; denied → nothing; approved → created.
+        // 2. An agent's create_project: created directly (balanced autonomy)…
         let pm = try await startPM(env, ts: "8.4")
+        let (_, direct) = await mcp([("create_project", ["name": "Directo PM"])], task: pm.id, env: env)
+        #expect(direct.first?.contains("\"project\" : \"Directo PM\"") == true)
+        #expect(FileManager.default.fileExists(atPath: base.appendingPathComponent("Directo PM/README.md").path))
+        // …or, for a cautious agent, it asks you; denied → nothing; approved → created.
+        if var cautious = env.harness.profile(pm.agentID) { cautious.autonomy = .cautious; env.harness.saveProfile(cautious) }
         async let denied = mcp([("create_project", ["name": "Idea del PM"])], task: pm.id, env: env)
         try await waitUntil { env.harness.pendingUserRequests().contains { $0.summary.contains("Idea del PM") } }
         try await waitUntil { env.posts.texts(thread: "8.4").contains { $0.contains("Create project “Idea del PM”") } }
@@ -426,19 +445,26 @@ struct AutonomyTests {
         // Task messages are signed by the agent; routing messages ("which project?") by the app itself.
         #expect(signers.contains("Project Manager"))
 
-        // A question from a running agent is answered by a plain message in the same channel…
+        // A question from a running agent is answered by a plain message in the same channel; the answer is
+        // typed into the agent's session.
+        if var p = env.harness.profiles.first { p.sessionPolicy = .perProject; env.harness.saveProfile(p) }
         let pm = try await startPM(env, ts: "9.3")
-        async let q = mcp([("ask", ["question": "¿Qué color?"])], task: pm.id, env: env)
+        let sent = { (id: UUID) in (env.harness.task(id)?.inbox ?? []) + (env.harness.task(id)?.followUps ?? []) }
+        let (_, q) = await mcp([("ask", ["question": "¿Qué color?"])], task: pm.id, env: env)
+        #expect(q.first?.contains("Question sent to the user") == true)
         try await waitUntil { env.posts.items.contains { $0.text.contains("pregunta") && $0.text.contains("Responde aquí") } }
         env.slack.handle(event: ["type": "message", "user": "U1", "channel": "C1", "ts": "9.4", "text": "Azul"], eventID: "Ev9.4")
-        #expect(await q.results.first?.contains("Azul") == true)
-        // …while a message that starts with an agent's name is a new request, not an answer.
-        async let q2 = mcp([("ask", ["question": "¿Y el tamaño?"])], task: pm.id, env: env)
+        try await waitUntil { sent(pm.id).contains { $0.contains("Answer to your question") && $0.contains("Azul") } }
+        // …while a message that starts with an agent's name is a new instruction, not an answer: it goes into the
+        // same running session (no new task, no new terminal) and the question stays open.
+        _ = await mcp([("ask", ["question": "¿Y el tamaño?"])], task: pm.id, env: env)
         try await waitUntil { env.harness.requests.contains { $0.isPending && $0.kind == .question } }
         let before = env.harness.tasks.count
         env.slack.handle(event: ["type": "message", "user": "U1", "channel": "C1", "ts": "9.5", "channel_type": "channel",
                                  "text": "Project Manager, revisa Demo"], eventID: "Ev9.5")
-        #expect(env.harness.tasks.count == before + 1)
+        #expect(env.harness.tasks.count == before)
+        #expect(sent(pm.id).contains { $0.contains("New message from the user") && $0.contains("revisa Demo") })
+        try await waitUntil { env.posts.items.contains { $0.text.hasPrefix("📨 *Project Manager* ya está trabajando") } }
         #expect(env.harness.requests.contains { $0.isPending && $0.kind == .question })
         // Approval by plain "aprobar".
         async let gate = hook("Bash", ["command": "git push"], task: pm.id, env: env)
@@ -446,7 +472,7 @@ struct AutonomyTests {
         env.slack.handle(event: ["type": "message", "user": "U1", "channel": "C1", "ts": "9.6", "text": "aprobar"], eventID: "Ev9.6")
         #expect(await gate.decision == "allow")
         env.slack.handle(event: ["type": "message", "user": "U1", "channel": "C1", "ts": "9.7", "text": "Grande"], eventID: "Ev9.7")
-        _ = await q2
+        try await waitUntil { sent(pm.id).contains { $0.contains("Grande") } }
         env.harness.cancel(pm.id)
     }
 
@@ -558,13 +584,17 @@ struct AutonomyTests {
         let token = try #require(env.harness.tokenOfTask[second.id])
         #expect(env.harness.tokens[token] == second.id)
 
-        // A busy session: the next message waits, then continues in it.
+        // A busy session: the next message goes straight into it (no new task, no new terminal).
         say("Project Manager, revisa Demo otra vez", "11.3")
+        let third = try #require(env.harness.tasks.last)
         say("Project Manager, y resume en una línea", "11.4")
-        let third = env.harness.tasks[env.harness.tasks.count - 2], fourth = env.harness.tasks.last!
-        #expect(fourth.resumedFromTaskID == third.id)
-        try await waitUntil { env.harness.task(fourth.id)?.status == .completed }
-        #expect(env.harness.task(fourth.id)?.paneID == first.paneID)
+        #expect(env.harness.tasks.last?.id == third.id)
+        try await waitUntil { env.posts.items.contains { $0.text.hasPrefix("📨 *Project Manager* ya está trabajando") } }
+        try await waitUntil { env.harness.task(third.id)?.status == .completed }
+        #expect(env.harness.task(third.id)?.followUps?.contains { $0.contains("y resume en una línea") } == true)
+        #expect(env.harness.task(third.id)?.paneID == first.paneID)
+        let typed = (try? String(contentsOf: TestHome.url.appendingPathComponent("fake/followups-\(first.sessionID ?? "")"), encoding: .utf8)) ?? ""
+        #expect(typed.contains("y resume en una línea"))   // it finished only after answering the typed message
 
         // "sesión nueva" and another project start a new session.
         say("Project Manager, sesión nueva: revisa Demo desde cero", "11.5")
@@ -584,5 +614,96 @@ struct AutonomyTests {
         #expect(resumed.projectID == env.other.id && resumed.sessionID == other.sessionID)
         try await waitUntil { env.harness.task(resumed.id)?.status == .completed }
         #expect(env.harness.task(resumed.id)?.result == "RESULT-resume: 1. Arreglar login")
+    }
+
+    @Test func delegatedResultsComeBackToTheCoordinatorsSession() async throws {
+        let env = try await makeEnv()
+        defer { env.store.terminateAll() }
+        _ = addDeveloper(env, autonomy: .balanced)
+        let pm = try await startPM(env, ts: "14.1")
+        // The PM delegates and doesn't wait: the result is typed into its session when the child finishes.
+        let (_, r) = await mcp([("delegate_task", ["agent": "Developer", "instruction": "Revisa el login", "context": "Las tareas están en Notion › Project Hub › Tasks (T1–T12), proyecto Demo."])], task: pm.id, env: env)
+        #expect(r.first?.contains("task_id") == true)
+        let child = try #require(env.harness.tasks.first { $0.origin.parentTaskID == pm.id })
+        try await waitUntil { env.harness.task(child.id)?.status == .completed }
+        try await waitUntil {
+            let p = env.harness.task(pm.id)
+            return ((p?.inbox ?? []) + (p?.followUps ?? [])).contains { $0.contains("Result of a task you delegated") && $0.contains("RESULT-new") }
+        }
+        // Balanced autonomy: gray-area work doesn't wait for anyone.
+        let worker = try env.harness.submit(.init(agentID: child.agentID, projectID: env.project.id, instruction: "SLOW x",
+                                                  origin: TaskOrigin(kind: .agent, parentTaskID: pm.id, delegatedBy: "Project Manager"))).get()
+        try await waitUntil { env.harness.tokenOfTask[worker.id] != nil && env.harness.task(worker.id)?.status.isActive == true }
+        #expect(await hook("Bash", ["command": "curl https://example.com/data.json"], task: worker.id, env: env).decision == "allow")
+        env.harness.cancel(worker.id)
+        env.harness.cancel(pm.id)
+    }
+
+    @Test func idleSessionsStopAndResumeOnTheNextMessage() async throws {
+        let env = try await makeEnv()
+        defer { env.store.terminateAll() }
+        env.slack.settings.replyInThreads = false
+        if var p = env.harness.profiles.first { p.sessionPolicy = .perProject; env.harness.saveProfile(p) }
+        func say(_ text: String, _ ts: String) {
+            env.slack.handle(event: ["type": "message", "channel_type": "im", "user": "U1", "channel": "D2", "ts": ts, "text": text], eventID: "Ev\(ts)")
+        }
+        say("Project Manager, revisa Demo", "15.1")
+        let first = try #require(env.harness.tasks.last)
+        try await waitUntil { env.harness.task(first.id)?.status == .completed }
+        #expect(env.store.runtimes[first.paneID!]?.isRunning == true)   // kept open for the next message
+        env.harness.closeIdleSessions(now: Date().addingTimeInterval(3 * 3600))
+        #expect(env.store.runtimes[first.paneID!] == nil)                // stopped after the idle time
+        say("Project Manager, sigue", "15.2")
+        let next = try #require(env.harness.tasks.last)
+        #expect(next.id != first.id && next.sessionID == first.sessionID && next.paneID == first.paneID)   // same conversation, same pane
+        try await waitUntil { env.harness.task(next.id)?.status == .completed }
+        #expect(env.harness.task(next.id)?.result == "RESULT-resume: 1. Arreglar login")
+    }
+
+    /// The coordinator (may edit, asks first) waiting on its delegate must not block it: that deadlocked until the
+    /// coordinator gave up ("Calling ProjectN" for minutes). Delegations carry context; notes are shared.
+    @Test func delegatesStartRightAwayWithContextAndProjectNotes() async throws {
+        let env = try await makeEnv()
+        defer { env.store.terminateAll() }
+        var dev = addDeveloper(env, autonomy: .balanced)
+        dev.sessionPolicy = .perProject
+        env.harness.saveProfile(dev)
+        if var p = env.harness.profiles.first(where: { $0.name == "Project Manager" }) {
+            p.permission = .askBeforeChanges; p.sessionPolicy = .perProject; env.harness.saveProfile(p)
+        }
+        let pm = try await startPM(env, ts: "16.1")
+
+        // Notes saved by one agent reach every later session in the project.
+        let (_, saved) = await mcp([("save_project_note", ["note": "Las tareas de Demo están en Notion › Project Hub › Tasks: https://app.notion.com/p/abc123"])], task: pm.id, env: env)
+        #expect(saved.first?.contains("Saved") == true)
+        #expect(AgentStore.projectNotes(env.project.id).contains("https://app.notion.com/p/abc123"))
+
+        // No context → refused with a reason.
+        let (_, bare) = await mcp([("delegate_task", ["agent": "Developer", "instruction": "Revisa las tareas"])], task: pm.id, env: env)
+        #expect(bare.first?.contains("Add `context`") == true)
+
+        // With context: starts right away (not queued behind its own coordinator) and gets the user's words.
+        let (_, r) = await mcp([("delegate_task", ["agent": "Developer", "instruction": "SLOW revisa las tareas T1–T12",
+                                                  "context": "Las tareas están en Notion › Project Hub › Tasks (T1–T12), enlazadas al proyecto."])],
+                               task: pm.id, env: env)
+        #expect(r.first?.contains("task_id") == true)
+        let child = try #require(env.harness.tasks.first { $0.origin.parentTaskID == pm.id })
+        #expect(env.harness.task(child.id)?.status != .queued)
+        #expect(child.instruction.contains("## Context from Project Manager") && child.instruction.contains("Notion › Project Hub › Tasks"))
+        #expect(child.instruction.contains("What the user asked Project Manager") && child.instruction.contains("coordina el trabajo en Demo"))
+        let argsFile = TestHome.url.appendingPathComponent("fake/args-\(env.harness.task(child.id)?.sessionID ?? "")-new")
+        try await waitUntil { ((try? String(contentsOf: argsFile, encoding: .utf8)) ?? "").contains("## Project notes") }
+
+        // A second delegation to the same agent waits for the first and continues its session (one terminal).
+        let (_, r2) = await mcp([("delegate_task", ["agent": "Developer", "instruction": "y luego resume",
+                                                   "context": "Sigue con las mismas tareas de Notion de la tarea anterior."])], task: pm.id, env: env)
+        #expect(r2.first?.contains("task_id") == true)
+        let second = try #require(env.harness.tasks.last { $0.origin.parentTaskID == pm.id })
+        #expect(second.resumedFromTaskID == child.id && second.status == .queued)
+        let (_, w) = await mcp([("wait_for_tasks", ["task_ids": [second.id.uuidString], "timeout_seconds": 5])], task: pm.id, env: env)
+        #expect(w.first?.contains("still busy with an earlier message") == true)
+        env.harness.cancel(second.id)
+        env.harness.cancel(child.id)
+        env.harness.cancel(pm.id)
     }
 }

@@ -18,6 +18,8 @@ enum TranscriptReader {
         var error: String?
         /// Bytes read (so later reads/resumes can start after them).
         var size: UInt64 = 0
+        /// User prompts (not tool results) seen: tells whether a message typed in has reached the transcript yet.
+        var prompts = 0
     }
 
     static func claudeTranscript(sessionID: String, settings: AppSettings) -> URL? {
@@ -98,6 +100,7 @@ enum TranscriptReader {
                 // A new prompt (not a tool result) starts a new turn: the previous end_turn no longer counts.
                 let isToolResult = ((m["content"] as? [[String: Any]]) ?? []).contains { $0["type"] as? String == "tool_result" }
                 if !isToolResult, o["isMeta"] as? Bool != true {
+                    snap.prompts += 1
                     endTurnText = nil
                     snap.finished = false
                     plan = nil
@@ -128,6 +131,7 @@ enum TranscriptReader {
             let type = o["type"] as? String
             let ptype = p["type"] as? String
             if type == "event_msg", ptype == "task_started" {
+                snap.prompts += 1
                 snap.finished = false
             } else if type == "event_msg", ptype == "task_complete" {
                 snap.finished = true
