@@ -8,11 +8,7 @@ import Testing
 @Suite(.serialized)
 @MainActor
 struct ResponsivenessTests {
-    private static let home: URL = {
-        let url = FileManager.default.temporaryDirectory.appendingPathComponent("projectn-tests-\(UUID())")
-        setenv("PROJECTN_HOME", url.path, 1)
-        return url
-    }()
+    private static let home: URL = TestHome.url
 
     private func makeStore() throws -> Store {
         let home = Self.home

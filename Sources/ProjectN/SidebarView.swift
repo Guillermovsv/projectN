@@ -48,6 +48,7 @@ struct SidebarView: View {
     private var topBar: some View {
         HStack(spacing: 4) {
             Spacer().frame(width: Chrome.trafficLightsWidth)
+            ViewModeSwitch()
             Spacer()
             Button(action: onHide) { Image(systemName: "sidebar.left") }
                 .buttonStyle(ChromeButtonStyle())
@@ -221,40 +222,7 @@ struct SidebarView: View {
         }
     }
 
-    private var footer: some View {
-        HStack(spacing: 6) {
-            Button { nav.openSettings(.appearance, panel: panel) } label: {
-                Label("Settings", systemImage: "gearshape")
-            }
-            .buttonStyle(.hover)
-            .help("Settings: appearance, accounts & connections, MCP servers, tools")
-            Spacer()
-            // Appearance, right beside Settings.
-            Menu {
-                Section("Appearance") {
-                    ForEach(AppTheme.all) { t in
-                        Button { store.settings.theme = t.id } label: {
-                            if t.id == store.settings.theme { Label(t.name, systemImage: "checkmark") } else { Text(t.name) }
-                        }
-                    }
-                }
-                Divider()
-                Button("Appearance Settings…") { nav.openSettings(.appearance, panel: panel) }
-            } label: {
-                Label(AppTheme.current.name, systemImage: "paintpalette")
-            }
-            .menuStyle(.borderlessButton)
-            .menuIndicator(.hidden)
-            .fixedSize()
-            .hoverHighlight()
-            .help("Appearance")
-        }
-        .font(.callout)
-        .foregroundStyle(.secondary)
-        .padding(.horizontal, 14)
-        .padding(.vertical, 10)
-        .overlay(alignment: .top) { Divider() }
-    }
+    private var footer: some View { SidebarFooter() }
 
     private func openNewWorkspace(_ preselect: Set<UUID>) {
         newWorkspacePreselect = preselect
@@ -383,3 +351,77 @@ func toolColor(_ t: Tool) -> Color {
     }
 }
 
+
+/// Bottom of both sidebars: Settings, theme, version.
+struct SidebarFooter: View {
+    @EnvironmentObject var store: Store
+    @EnvironmentObject var nav: NavigationModel
+    @EnvironmentObject var panel: RightPanelModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+        HStack(spacing: 6) {
+            Button { nav.openSettings(.appearance, panel: panel) } label: {
+                Label("Settings", systemImage: "gearshape")
+            }
+            .buttonStyle(.hover)
+            .help("Settings: appearance, accounts & connections, MCP servers, tools")
+            Spacer()
+            // Appearance, right beside Settings.
+            Menu {
+                Section("Appearance") {
+                    ForEach(AppTheme.all) { t in
+                        Button { store.settings.theme = t.id } label: {
+                            if t.id == store.settings.theme { Label(t.name, systemImage: "checkmark") } else { Text(t.name) }
+                        }
+                    }
+                }
+                Divider()
+                Button("Appearance Settings…") { nav.openSettings(.appearance, panel: panel) }
+            } label: {
+                Label(AppTheme.current.name, systemImage: "paintpalette")
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .hoverHighlight()
+            .help("Appearance")
+        }
+        VersionTag().padding(.leading, 2)
+        }
+        .font(.callout)
+        .foregroundStyle(.secondary)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .overlay(alignment: .top) { Divider() }
+    }
+}
+
+/// Workspaces | Agents switch at the top of the sidebar (⌃⌘1 / ⌃⌘2).
+struct ViewModeSwitch: View {
+    @EnvironmentObject var nav: NavigationModel
+    @EnvironmentObject var agents: AgentHarness
+
+    var body: some View {
+        HStack(spacing: 2) {
+            ForEach(NavigationModel.Mode.allCases) { m in
+                Button { nav.switchMode(m) } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: m.symbol)
+                        if m == .agents, !agents.pendingUserRequests().isEmpty {
+                            Circle().fill(Color.yellow).frame(width: 6, height: 6)
+                        }
+                    }
+                    .frame(width: 34, height: 22)
+                    .background(RoundedRectangle(cornerRadius: 6).fill(nav.mode == m ? Color.primary.opacity(0.12) : .clear))
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(nav.mode == m ? .primary : .secondary)
+                .help("\(m.label) view (⌃⌘\(m == .workspaces ? 1 : 2))")
+            }
+        }
+        .padding(2)
+        .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.05)))
+    }
+}

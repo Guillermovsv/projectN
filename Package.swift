@@ -24,6 +24,13 @@ let package = Package(
                 .linkedFramework("CoreAudio"),
             ]
         ),
+        // Helper the agent CLIs run: the PreToolUse approval hook and the ProjectN MCP server (delegation,
+        // questions). It only forwards to the running app over a token-protected loopback connection.
+        .executableTarget(
+            name: "pn-agent",
+            path: "Sources/pn-agent",
+            swiftSettings: [.swiftLanguageMode(.v5)]
+        ),
         .testTarget(
             name: "ProjectNTests",
             dependencies: ["ProjectN"],

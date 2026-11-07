@@ -216,6 +216,24 @@ final class TerminalSession: NSObject, ObservableObject, LocalProcessTerminalVie
         sendKeys(decision.keys)
     }
 
+    /// Agent panes: answers the CLI's own permission prompt with "Yes", but only when that prompt shows one of
+    /// `approved` (tool calls ProjectN's policy, an orchestrator or the user already approved). Claude Code still
+    /// asks for some commands (e.g. with `$(…)`) after a hook allowed them. Returns the answer given.
+    func confirmApprovedPrompt(_ approved: [String]) -> String? {
+        guard isRunning, !terminated, let screen = screenTail(requireCurrent: true),
+              AutoResponder.pendingPrompt(screen: screen) != nil,
+              let d = AutoResponder.decide(screen: screen), d.fingerprint != answeredFingerprint,
+              d.label.lowercased().hasPrefix("y") else { return nil }
+        let squash = { (s: String) in String(s.unicodeScalars.filter { !CharacterSet.whitespacesAndNewlines.contains($0) && !"│┃║╭╮╰╯─━".unicodeScalars.contains($0) }.map(Character.init)) }
+        let text = squash(screen.joined())
+        guard approved.contains(where: { a in let n = squash(a); return n.count >= 2 && text.contains(String(n.prefix(50))) }) else { return nil }
+        answeredFingerprint = d.fingerprint
+        autoAnswerCount += 1
+        lastAutoAnswer = (d.label, Date())
+        sendKeys(d.keys)
+        return d.label
+    }
+
     /// Sends key presses one at a time with a short gap; TUIs (Ink, ratatui) handle that more reliably than one burst.
     private func sendKeys(_ keys: [String]) {
         for (i, k) in keys.enumerated() {

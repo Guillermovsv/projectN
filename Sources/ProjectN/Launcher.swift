@@ -19,7 +19,12 @@ enum Launcher {
         case cursorResume(id: String)     // cursor-agent --resume <id>
     }
 
-    static func plan(tool: Tool, mode: SessionMode, options: LaunchOptions = LaunchOptions(), project: Project, workspaceName: String, settings: AppSettings) -> Plan {
+    /// `extraArgs` (agent profiles: system prompt, tool limits) go after the regular flags.
+    /// `prompt` starts the session with that first message; it is always placed after `--`
+    /// so variadic flags (`--tools`, `--add-dir`) can't swallow it, and never interpreted by a shell.
+    static func plan(tool: Tool, mode: SessionMode, options: LaunchOptions = LaunchOptions(), project: Project, workspaceName: String,
+                     settings: AppSettings, extraArgs: [String] = [], prompt: String? = nil,
+                     exitMarker: URL? = nil, extraEnv: [String: String] = [:]) -> Plan {
         let shell = settings.shell.isEmpty ? "/bin/zsh" : settings.shell
         let servers = MCPConfig.load()
         var parts: [String] = []
@@ -37,6 +42,8 @@ enum Launcher {
             }
             parts += LaunchCatalog.claudeArgs(options)
             parts += Shell.split(settings.claudeExtraArgs)
+            parts += extraArgs
+            if let prompt, !prompt.isEmpty { parts += ["--", prompt] }
         case .codex:
             parts = Shell.split(settings.codexCommand)
             var resumeID: String?
@@ -44,7 +51,9 @@ enum Launcher {
             if settings.codexUseAppMCP { parts += MCPConfig.codexOverrides(servers) }
             parts += LaunchCatalog.codexArgs(options)
             parts += Shell.split(settings.codexExtraArgs)
+            parts += extraArgs
             if let resumeID { parts.append(resumeID) }
+            if let prompt, !prompt.isEmpty { parts += ["--", prompt] }
         case .cursor:
             parts = Shell.split(settings.cursorCommand)
             if case .cursorResume(let id) = mode { parts += ["--resume", id] }
@@ -61,13 +70,20 @@ enum Launcher {
         } else {
             // Run through an interactive login shell so the user's PATH (nvm, ~/.local/bin, …) is set up,
             // then drop into a shell in the same folder when the tool exits.
-            let script = "\(commandLine); echo; echo \"[\(tool.label) exited — you're in a shell now]\"; exec \(Shell.quote(shell)) -l -i"
+            // Agent panes: record the tool's exit code so the harness can tell a crash from a finished turn.
+            let marker = exitMarker.map { "; __pn_rc=$?; echo $__pn_rc > \(Shell.quote($0.path))" } ?? ""
+            let script = "\(commandLine)\(marker); echo; echo \"[\(tool.label) exited — you're in a shell now]\"; exec \(Shell.quote(shell)) -l -i"
             args = ["-l", "-i", "-c", script]
         }
 
+        var env = environment(project: project, workspaceName: workspaceName, settings: settings)
+        if !extraEnv.isEmpty {
+            env.removeAll { kv in extraEnv.keys.contains { kv.hasPrefix($0 + "=") } }
+            env += extraEnv.map { "\($0.key)=\($0.value)" }
+        }
         return Plan(executable: shell,
                     args: args,
-                    environment: environment(project: project, workspaceName: workspaceName, settings: settings),
+                    environment: env,
                     directory: project.path,
                     commandLine: tool == .terminal ? shell : commandLine)
     }

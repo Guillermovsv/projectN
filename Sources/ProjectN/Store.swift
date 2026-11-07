@@ -31,6 +31,17 @@ final class Store: ObservableObject {
     private let launchQueue = DispatchQueue(label: "dev.projectn.launch", qos: .userInitiated)
     private var pendingLaunches: [UUID: UUID] = [:]
     private var pendingMessages: [UUID: [String]] = [:]
+    /// Pane ID → first message passed on the command line at its next launch (agent tasks).
+    var initialPrompts: [UUID: String] = [:]
+
+    /// What an agent pane gets instead of the app-wide defaults (set by the agent harness).
+    struct AgentLaunchContext {
+        /// Added to the environment (bridge port + task token, MCP tool timeout…).
+        var env: [String: String] = [:]
+        /// Only these Keychain API keys are exported (not every key like ordinary panes).
+        var apiKeyNames: [String] = []
+    }
+    var agentLaunchContext: ((Pane) -> AgentLaunchContext)?
     private let discoveryQueue = DispatchQueue(label: "dev.projectn.discovery", qos: .utility)
     private var discoveryInFlight = false
     /// Shared with PromptTracker's Store extension; a slow scan must not queue another.
@@ -119,14 +130,20 @@ final class Store: ObservableObject {
         updateSpace(s.id, in: wid) { $0.focusedPaneID = id }
     }
 
+    /// Set by the Agents view: the selected task's pane / project take the place of the selected space's
+    /// (Files panel, "insert path", the project Slack calls "selected"). nil in the Workspaces view.
+    @Published var focusOverride: (paneID: UUID?, projectID: UUID)? = nil
+
     /// The focused pane's runtime in the selected space (for "insert path" etc).
     var focusedRuntime: TerminalSession? {
+        if let o = focusOverride { return o.paneID.flatMap { runtimes[$0] } }
         guard let s = selectedSpace, let id = s.focusedPaneID ?? s.panes.first?.id else { return nil }
         return runtimes[id]
     }
 
     /// The project shown by default in the file tree: the focused pane's, else the workspace's first.
     var focusedProjectID: UUID? {
+        if let o = focusOverride { return o.projectID }
         guard let w = selectedWorkspace else { return nil }
         if let s = selectedSpace, let p = s.panes.first(where: { $0.id == s.focusedPaneID }) ?? s.panes.first { return p.projectID }
         return w.projectIDs.first
@@ -391,8 +408,21 @@ final class Store: ObservableObject {
         }
 
         let options = LaunchCatalog.explicit(pane.launchOptions, tool: pane.tool, settings: settings)
-        let settings = self.settings
+        var settings = self.settings
+        var agentEnv: [String: String] = [:]
+        if pane.isAgentPane {
+            // Agents get their own MCP servers (in agentArgs) and only their own API keys.
+            let ctx = agentLaunchContext?(pane) ?? AgentLaunchContext()
+            settings.apiKeyNames = ctx.apiKeyNames
+            settings.claudeUseAppMCP = false
+            settings.codexUseAppMCP = false
+            agentEnv = ctx.env
+        }
         let requestedMode = mode
+        let extraArgs = pane.agentArgs ?? []
+        // A first message handed over by the agent harness; consumed by this launch only.
+        let initialPrompt = initialPrompts.removeValue(forKey: pane.id)
+        let exitMarker = pane.isAgentPane ? AgentStore.exitMarker(pane.id) : nil
         let scrollback = scrollbackURL(pane.id)
         let token = UUID()
         pendingLaunches[pane.id] = token
@@ -411,8 +441,11 @@ final class Store: ObservableObject {
             }
             let restored = pane.tool == .terminal && resume
                 ? try? String(contentsOf: scrollback, encoding: .utf8) : nil
+            if let exitMarker { try? FileManager.default.removeItem(at: exitMarker) }
             let plan = Launcher.plan(tool: pane.tool, mode: mode, options: options,
-                                     project: project, workspaceName: w.name, settings: settings)
+                                     project: project, workspaceName: w.name, settings: settings,
+                                     extraArgs: extraArgs, prompt: initialPrompt, exitMarker: exitMarker,
+                                     extraEnv: agentEnv)
             DispatchQueue.main.async { [weak self] in
                 guard let self, self.pendingLaunches[pane.id] == token,
                       let (_, current) = self.pane(pane.id, in: wid) else { return }
@@ -446,6 +479,8 @@ final class Store: ObservableObject {
               let (_, p) = pane(paneID, in: wid) else { return }
         start(p, in: wid, resume: true)
     }
+
+    func hasPendingLaunch(_ id: UUID) -> Bool { pendingLaunches[id] != nil }
 
     func closePane(_ id: UUID, in wid: UUID) {
         discardPane(id)
@@ -691,6 +726,7 @@ final class Store: ObservableObject {
 
     /// Kill the process and forget saved output.
     private func discardPane(_ id: UUID) {
+        initialPrompts.removeValue(forKey: id)
         killRuntime(id)
         try? FileManager.default.removeItem(at: scrollbackURL(id))
     }

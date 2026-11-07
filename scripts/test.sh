@@ -19,5 +19,8 @@ if [ -d "$testing_frameworks/Testing.framework" ]; then
   )
 fi
 
+# The agent helper isn't a test dependency, so build it explicitly (tests run it as Claude Code would).
+swift build --product pn-agent -j "${PROJECTN_BUILD_JOBS:-4}"
+
 swift test --disable-sandbox --disable-xctest --enable-swift-testing \
   -j "${PROJECTN_BUILD_JOBS:-4}" "${testing_flags[@]}" "$@"

@@ -54,6 +54,13 @@ struct Pane: Codable, Identifiable, Hashable {
     /// Latest prompt sent from ProjectN (sticky header). Survives relaunch.
     var lastPrompt: String?
     var createdAt = Date()
+    /// Agent harness: extra CLI arguments of the agent profile (system prompt, tool restrictions),
+    /// re-applied when this pane restarts. nil for ordinary panes.
+    var agentArgs: [String]?
+    /// Agent harness: the task this pane was created for.
+    var agentTaskID: UUID?
+
+    var isAgentPane: Bool { agentTaskID != nil }
 
     var isAutoComplete: Bool { autoComplete ?? false }
 
@@ -88,6 +95,8 @@ struct Workspace: Codable, Identifiable, Hashable {
     var spaces: [Space] = []
     var expanded: Bool = true
     var lastOpened: Date?
+    /// The workspace the agent harness manages (agent task panes live here).
+    var agentHost: Bool = false
 
     init(name: String, projectIDs: [UUID]) {
         self.name = name
@@ -102,7 +111,7 @@ struct Workspace: Codable, Identifiable, Hashable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, name, projectIDs, spaces, expanded, lastOpened, sessions
+        case id, name, projectIDs, spaces, expanded, lastOpened, sessions, agentHost
     }
 
     /// Legacy (v1) session format, migrated into spaces of up to 8 panes.
@@ -121,6 +130,7 @@ struct Workspace: Codable, Identifiable, Hashable {
         projectIDs = (try? c.decode([UUID].self, forKey: .projectIDs)) ?? []
         expanded = (try? c.decode(Bool.self, forKey: .expanded)) ?? true
         lastOpened = try? c.decode(Date.self, forKey: .lastOpened)
+        agentHost = (try? c.decode(Bool.self, forKey: .agentHost)) ?? false
         if let spaces = try? c.decode([Space].self, forKey: .spaces) {
             self.spaces = spaces
         } else {
@@ -143,6 +153,7 @@ struct Workspace: Codable, Identifiable, Hashable {
         try c.encode(spaces, forKey: .spaces)
         try c.encode(expanded, forKey: .expanded)
         try c.encodeIfPresent(lastOpened, forKey: .lastOpened)
+        if agentHost { try c.encode(agentHost, forKey: .agentHost) }
     }
 }
 

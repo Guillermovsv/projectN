@@ -154,7 +154,7 @@ final class UsageModel: ObservableObject {
     struct UsageError: Error { let message: String }
 
     nonisolated private static func fetchClaude() async -> Result<ToolUsage, UsageError> {
-        guard let token = claudeToken() else { return .failure(UsageError(message: "Not signed in to Claude Code")) }
+        guard let token = claudeAccessToken() else { return .failure(UsageError(message: "Not signed in to Claude Code")) }
         var req = URLRequest(url: URL(string: "https://api.anthropic.com/api/oauth/usage")!)
         req.timeoutInterval = 15
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
@@ -180,7 +180,8 @@ final class UsageModel: ObservableObject {
         }
     }
 
-    nonisolated private static func claudeToken() -> String? {
+    /// Claude Code's OAuth access token from the Keychain (also used by ModelCatalog). Never logged.
+    nonisolated static func claudeAccessToken() -> String? {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/security")
         p.arguments = ["find-generic-password", "-s", "Claude Code-credentials", "-w"]

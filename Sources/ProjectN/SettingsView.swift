@@ -4,12 +4,14 @@ import SwiftUI
 /// Settings shown inside the main window (sidebar lists the sections, the panels area shows one).
 struct SettingsView: View {
     enum Tab: String, CaseIterable, Identifiable, Hashable {
-        case appearance, accounts, voice, mcp, tools
+        case appearance, accounts, agents, integrations, voice, mcp, tools
         var id: String { rawValue }
         var label: String {
             switch self {
             case .appearance: return "Appearance"
             case .accounts: return "Accounts & Connections"
+            case .agents: return "Agents"
+            case .integrations: return "Integrations"
             case .voice: return "Voice (NVoice)"
             case .mcp: return "MCP Servers"
             case .tools: return "Tools"
@@ -19,6 +21,8 @@ struct SettingsView: View {
             switch self {
             case .appearance: return "paintpalette"
             case .accounts: return "person.crop.circle"
+            case .agents: return "person.2.badge.gearshape"
+            case .integrations: return "point.3.connected.trianglepath.dotted"
             case .voice: return "waveform"
             case .mcp: return "puzzlepiece.extension"
             case .tools: return "gearshape"
@@ -33,6 +37,8 @@ struct SettingsView: View {
             switch tab {
             case .appearance: AppearanceSettingsView()
             case .accounts: AccountsSettingsView()
+            case .agents: AgentsSettingsView()
+            case .integrations: IntegrationsSettingsView()
             case .voice: VoiceSettingsView()
             case .mcp: MCPServersView()
             case .tools: ToolsSettingsView()

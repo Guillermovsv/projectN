@@ -100,6 +100,10 @@ Quitting saves everything. On the next launch each pane restarts when its space 
 - **Terminal** panes show their previous output (dimmed) above a fresh shell in the project folder.
 - Layout, spaces, focused pane, selected space and Auto settings are restored.
 
+## Version
+
+The line under **Settings** at the bottom of the sidebar shows the build you're running: `v<VERSION> (<build>) · <commit> · <build time>` (`+dirty` = built with uncommitted changes). Click it to copy. The version number lives in the `VERSION` file; `build.sh` stamps the rest automatically, so every build is distinguishable.
+
 ## Shortcuts
 
 | Keys | Action |
@@ -133,7 +137,69 @@ Open from **Settings** at the bottom of the sidebar (or ⌘,) — it opens insid
 - **Accounts** — sign-in status for Claude Code (`claude auth status`), Codex (`codex login status`), GitHub CLI (`gh auth status`) and Gemini CLI. *Sign In / Switch Account / Sign Out* run the CLI's own flow in a small built-in terminal.
 - **API keys & tokens** — e.g. `OPENAI_API_KEY`, `GEMINI_API_KEY`, `GITHUB_TOKEN`: stored in the macOS Keychain and added to every pane's environment. (Note: an `ANTHROPIC_API_KEY` makes Claude Code bill that key instead of your subscription.)
 - **Voice (NVoice)** — the NVoice dictation app, built in (see below).
+- **Agents** and **Integrations (Slack)** — see [Agents & Slack](#agents--slack).
 - **MCP Servers** and **Tools** as before.
+
+## Agents & Slack
+
+ProjectN can run **agent profiles** — reusable, project-independent configurations of Claude Code or Codex — and take instructions for them from **Slack**.
+
+### Agents view (⌃⌘2)
+
+The switch at the top of the sidebar (or ⌃⌘1 / ⌃⌘2) flips between **Workspaces** (the usual projects → spaces → panes) and **Agents**:
+
+- **Left**: every agent with a live status line — *Working · project*, *Needs you* (yellow, with a count), last task and when — and, under each, the projects / terminals it's working in right now. **+** creates an agent; right-click to edit or turn it off.
+- **Center**: the selected agent — model, effort, access, status, ⚙︎ to edit — with one **tab per task** (running ones first). A task shows its request, any approval waiting on you (Approve / Deny right there), and its live **terminal**, or its **result** once finished. The box at the bottom starts a **new task** in the project you pick, or — on a running task — sends your message into **that session**. ⌘↩ sends.
+- **Right**: the same Files · Activity · Browser panel; Files follows the selected task's project.
+
+### Agents (Settings → Agents)
+
+Each profile has: name, role, provider (Anthropic / OpenAI / other compatible), runtime (Claude Code / Codex CLI), model, reasoning effort, instructions, allowed tools, access level, project access, context sources, session policy, concurrency limit, timeout and an on/off switch. Profiles can be created, edited, duplicated and deleted. A **Project Manager** profile (Claude Code, Opus 5.5, effort high, read-only, can delegate, all projects, README as context) is created on first launch.
+
+The editor is split into tabs: **General** (name, role, model, effort, limits) · **Instructions** · **Access** · **Integrations** (MCP servers, CLI tools, API keys) · **Projects** (where it may work, context files) · **Schedules**.
+
+- **Access** has three levels — *Read only*, *Read & write — ask first*, *Read & write* — and picking one ticks the matching tools automatically (read-only agents can't get the editing tools). Untick anything to customise; *Reset* goes back to the preset.
+- **Schedules**: an agent can run tasks by itself — every few hours, every day, weekdays, or on chosen days, at a set time, in a chosen project. Each run is a new task under the usual approval rules. Optionally it posts to a Slack channel or DMs you (start + result in a thread). Schedules run while ProjectN is open; a run missed while it was closed happens once at the next launch (*Run if missed*). *Run Now* starts one immediately.
+
+- **Models are read from the runtime**: Claude models (and the effort levels each supports) come from your Claude login's live model list; Codex models from Codex's own cache. The built-in list is only a fallback when offline. An unknown model is rejected; an unsupported effort is dropped with a note.
+- **Every task starts a new session** with the agent's instructions (as Claude's system prompt), the request, and the project's README + listed context files (marked as untrusted data). Earlier conversations are never included. A previous session is resumed only when the profile allows it *and* the message asks explicitly ("reanuda la sesión…", "resume session").
+- Tasks run as normal panes in a workspace named **Agents** (max 8 panes per space; new spaces are added, and only the harness's own finished panes are ever recycled). Open a task's pane from Settings → Agents → Tasks to watch it or answer an approval prompt.
+- **Access levels**: *Read & plan only* (enforced by the hook; Codex read-only sandbox), *Ask before any change*, *Edit project files (commands ask)*. Modes that skip approvals (bypass, full access, auto) are never used for agents. Agents that can write never run at the same time in the same project.
+- Agents refuse to run in personal/system folders (home, Desktop, Documents, Downloads, Library, ~/.ssh, …); context files must be inside the project and secret files (.env, keys) are skipped.
+- Results, usage, errors and timeouts are recorded in Settings → Agents → Tasks / Audit Log (`~/.projectn/agents/`). *Run Task…* runs a profile locally without Slack.
+
+### Autonomy, delegation & approvals (Settings → Agents → Autonomy)
+
+Every tool call of a Claude Code agent passes ProjectN's approval hook (`pn-agent hook`, shipped inside the app) before it runs — enforced in code, not only in the prompt:
+
+| Tier | Examples | Who decides |
+|---|---|---|
+| Automatic | reading the project, edits (agents allowed to edit), tests/builds/lint, the agent's own CLI tools, MCP tools that only read | nobody — runs |
+| Gray area | other commands, web fetches, MCP tools that change things | the orchestrating agent (or you — switch in Autonomy) |
+| **Always you** | **deleting anything** (files, folders, branches, packages, records, posts — inside the project too), publishing, deploying, pushing, sending, anything outside the project folder, sudo | you: Slack **Aprobar / Rechazar** buttons, a reply in the thread, or Settings → Agents → Tasks |
+
+- **Delegation**: agents with *Can delegate* (the Project Manager by default) get ProjectN's MCP tools `list_agents`, `delegate_task`, `wait_for_tasks`, `get_task`, `answer_request`, `request_review`, `cancel_task`. Delegated tasks are new sessions of the chosen agent; their progress appears in the same Slack thread. Limits: delegation depth and tasks per request.
+- **Questions go up**: any agent can call `ask`; it reaches the agent that delegated the task, or you (answer in the Slack thread). The session continues with the answer.
+- If Claude Code still shows its own prompt for a command ProjectN already approved, ProjectN confirms it (only that command).
+- Unanswered approvals expire as "no" (default 60 min). Read-only agents can't change files at all.
+- **New projects**: "Project Manager, crea el proyecto *Landing García* y …" in Slack creates the folder (with a README) in your projects folder, adds it to ProjectN and runs the task in it — you asked, so no extra confirmation. Agents that can delegate have `create_project`, which always asks you first. Folders are only created inside the projects folder (default: where most of your projects live; Settings → Agents → Autonomy), never overwritten.
+- **Per-agent MCP servers, CLI tools and API keys**: each profile picks servers from Settings → MCP Servers (only those are loaded — `--strict-mcp-config`), commands it may run without asking, and which Keychain API keys are in its environment.
+- Codex agents get their MCP servers but not the hook or delegation tools; they rely on Codex's sandbox and prompt in their pane.
+
+### Slack (Settings → Integrations)
+
+Uses **Socket Mode** (an outbound connection from your Mac, no public server). It only works while ProjectN is open.
+
+1. api.slack.com/apps → *Create New App → From a manifest* → paste the manifest from Settings → Integrations → *How to create and connect the Slack app* (Copy button).
+2. *Basic Information → App-Level Tokens*: create one with scope `connections:write` → **App Token** (`xapp-…`).
+3. *Interactivity & Shortcuts* is on (in the manifest; needed for the approval buttons). *Install App* → copy the *Bot User OAuth Token* → **Bot Token** (`xoxb-…`). Both are stored in the macOS Keychain (service "ProjectN Integrations"), never in files or pane environments.
+4. Add your Slack member ID to **Authorized users** (nobody is authorized while it's empty). For channels, `/invite @ProjectN` and add the channel ID to **Authorized channels**. DMs can be turned on/off.
+5. Press **Check Connection** (verifies both tokens, scopes and Socket Mode), turn on **Enable Slack**, then DM the bot or mention it:
+   `@ProjectN Project Manager, revisa el proyecto seleccionado, consulta su README y dime qué tareas pendientes identificas`
+
+The message's first words pick the agent (else the *Default agent*). The project is the one named in the message, else the project focused in ProjectN, else the agent's only project; otherwise the bot asks in the thread. Progress, approval requests, the result and errors are posted in the message's thread. Duplicate deliveries (Slack retries) are ignored, also across restarts; tasks interrupted by quitting ProjectN are reported on the next connection.
+
+To add an agent: Settings → Agents → **+** (or duplicate one), set role/runtime/model/instructions/access, Save. To change a model: pick it in *Model* (⟳ reloads the list) and Save; running tasks keep the model they started with.
 
 ## Voice dictation (built-in NVoice)
 
@@ -152,6 +218,9 @@ While ProjectN is open, **hold fn anywhere, talk, release** — the text is past
   state.json     projects, workspaces, spaces, panes (+ their Claude/Codex session ids)
   scrollback/    saved terminal output, restored on relaunch
   settings.json  app settings
+  agents.json    agent profiles (no credentials)
+  agents/        task history, audit log, model list cache, handled Slack events
+  integrations.json  Slack settings (tokens are in the Keychain)
   mcp.json       MCP servers for every Claude & Codex session started here
   mcp/           npm prefix for installed MCP server packages (node_modules/.bin is on PATH)
   bin/           your own scripts, on PATH in every session

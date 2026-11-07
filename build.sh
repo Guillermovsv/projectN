@@ -5,12 +5,21 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 APP=build/ProjectN.app
+# Version shown at the bottom of the sidebar: VERSION file + git commit (+dirty) + build time.
+VERSION="$(cat VERSION 2>/dev/null || echo 0.0.0)"
+BUILD_NUMBER="$(git rev-list --count HEAD 2>/dev/null || echo 1)"
+COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+if [ -n "$(git status --porcelain 2>/dev/null)" ]; then COMMIT="$COMMIT+dirty"; fi
+BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 swift build -c release
 BIN="$(swift build -c release --show-bin-path)/ProjectN"
 
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN" "$APP/Contents/MacOS/ProjectN"
+# Agent helper (approval hook + ProjectN MCP server), next to the app binary.
+swift build -c release --product pn-agent
+cp "$(dirname "$BIN")/pn-agent" "$APP/Contents/MacOS/pn-agent"
 
 # SwiftTerm ships a resource bundle; copy any bundles next to the binary.
 for b in "$(dirname "$BIN")"/*.bundle; do [ -e "$b" ] && cp -R "$b" "$APP/Contents/Resources/"; done
@@ -33,8 +42,10 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleExecutable</key><string>ProjectN</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>0.1.0</string>
-  <key>CFBundleVersion</key><string>1</string>
+  <key>CFBundleShortVersionString</key><string>$VERSION</string>
+  <key>CFBundleVersion</key><string>$BUILD_NUMBER</string>
+  <key>ProjectNGitCommit</key><string>$COMMIT</string>
+  <key>ProjectNBuildDate</key><string>$BUILD_DATE</string>
   <key>LSMinimumSystemVersion</key><string>26.0</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>NSPrincipalClass</key><string>NSApplication</string>
@@ -62,7 +73,7 @@ if [ -z "${SIGN_IDENTITY:-}" ]; then
 fi
 codesign --force --deep --sign "${SIGN_IDENTITY:--}" --identifier dev.projectn.app "$APP" >/dev/null
 echo "Signed with: ${SIGN_IDENTITY:-ad-hoc}"
-echo "Built $APP"
+echo "Built $APP — v$VERSION ($BUILD_NUMBER) $COMMIT $BUILD_DATE"
 
 if [ "${1:-}" = "--install" ]; then
   rm -rf /Applications/ProjectN.app

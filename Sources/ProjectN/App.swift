@@ -3,6 +3,7 @@ import SwiftUI
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     var store: Store?
+    var agents: AgentHarness?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Needed when launched as a bare executable (swift run); harmless inside the .app bundle.
@@ -16,6 +17,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Everything (layout, conversations, terminal output) is saved and restored on next launch,
         // so quitting doesn't need a confirmation.
         if let store { MainActor.assumeIsolated { store.terminateAll() } }
+        if let agents { MainActor.assumeIsolated { agents.saveNow() } }
         NVoiceController.shared.shutdown()
         return .terminateNow
     }
@@ -28,6 +30,8 @@ struct ProjectNApp: App {
     @StateObject private var panel = RightPanelModel()
     @StateObject private var usage = UsageModel()
     @StateObject private var nav = NavigationModel()
+    @StateObject private var agents = AgentHarness()
+    @StateObject private var slack = SlackConnector()
 
     var body: some Scene {
         WindowGroup("ProjectN") {
@@ -36,9 +40,15 @@ struct ProjectNApp: App {
                 .environmentObject(panel)
                 .environmentObject(usage)
                 .environmentObject(nav)
+                .environmentObject(agents)
+                .environmentObject(slack)
                 .frame(minWidth: 960, minHeight: 600)
                 .onAppear {
                     delegate.store = store
+                    delegate.agents = agents
+                    // Agent harness + Slack (Socket Mode) live only while ProjectN runs.
+                    agents.attach(store)
+                    slack.attach(store: store, harness: agents)
                     usage.start(store: store)
                     NVoiceController.shared.onOpenSettings = { [weak nav, weak panel] in
                         guard let nav, let panel else { return }
@@ -57,6 +67,30 @@ struct ProjectNApp: App {
 @MainActor
 final class NavigationModel: ObservableObject {
     @Published var settingsTab: SettingsView.Tab?
+
+    /// Workspaces (projects → spaces → panes) or Agents (agents → their tasks). Remembered across launches.
+    enum Mode: String, CaseIterable, Identifiable {
+        case workspaces, agents
+        var id: String { rawValue }
+        var label: String { self == .workspaces ? "Workspaces" : "Agents" }
+        var symbol: String { self == .workspaces ? "rectangle.3.group" : "person.2" }
+    }
+    @Published var mode: Mode = Mode(rawValue: UserDefaults.standard.string(forKey: "viewMode") ?? "") ?? .workspaces {
+        didSet { UserDefaults.standard.set(mode.rawValue, forKey: "viewMode") }
+    }
+    /// Agents view selection.
+    @Published var selectedAgentID: UUID? = UUID(uuidString: UserDefaults.standard.string(forKey: "selectedAgentID") ?? "") {
+        didSet { UserDefaults.standard.set(selectedAgentID?.uuidString, forKey: "selectedAgentID") }
+    }
+    /// Task tab per agent (an id that matches no task = the new-task page).
+    @Published var selectedTaskByAgent: [UUID: UUID] = [:]
+    /// Agent to show when Settings → Agents opens.
+    @Published var focusAgentInSettings: UUID?
+
+    func switchMode(_ m: Mode) {
+        if settingsTab != nil { closeSettings() }
+        withAnimation(.easeInOut(duration: 0.15)) { mode = m }
+    }
     private var panelWasVisible = false
 
     var settingsOpen: Bool { settingsTab != nil }
@@ -92,6 +126,8 @@ struct RootView: View {
                 Group {
                     if nav.settingsOpen {
                         SettingsSidebar()
+                    } else if nav.mode == .agents {
+                        AgentsSidebar(onHide: { withAnimation(.easeInOut(duration: 0.18)) { sidebarVisible = false } })
                     } else {
                         SidebarView(onHide: { withAnimation(.easeInOut(duration: 0.18)) { sidebarVisible = false } })
                     }
@@ -126,6 +162,8 @@ struct RootView: View {
     private var detail: some View {
         if nav.settingsOpen {
             SettingsDetailView()
+        } else if nav.mode == .agents {
+            AgentsDetailView()
         } else if let w = store.selectedWorkspace, let s = store.selectedSpace {
             SpaceView(workspaceID: w.id, spaceID: s.id)
         } else {
@@ -167,6 +205,11 @@ struct AppCommands: Commands {
                 .keyboardShortcut("o", modifiers: [.command])
         }
         CommandGroup(after: .sidebar) {
+            Button("Workspaces View") { nav.switchMode(.workspaces) }
+                .keyboardShortcut("1", modifiers: [.command, .control])
+            Button("Agents View") { nav.switchMode(.agents) }
+                .keyboardShortcut("2", modifiers: [.command, .control])
+            Divider()
             Button(panel.visible ? "Hide Right Panel" : "Show Right Panel") { panel.toggle() }
                 .keyboardShortcut("0", modifiers: [.command, .option])
             ForEach(Array(RightPanelModel.Tab.allCases.enumerated()), id: \.element) { i, tab in
