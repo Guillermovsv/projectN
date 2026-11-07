@@ -42,7 +42,7 @@ struct LiveAcceptanceTests {
         var posts: [(String?, String)] = []
         slack.sender = { _, thread, text in posts.append((thread, text)) }
         slack.attach(store: store, harness: harness)
-        var s = SlackSettings(); s.authorizedUsers = ["U1"]; s.authorizedChannels = ["C1"]
+        var s = SlackSettings(); s.authorizedUsers = ["U1"]; s.authorizedChannels = ["C1"]; s.replyInThreads = true
         slack.settings = s
         slack.setTestIdentity(botUserID: "UBOT")
 
@@ -112,7 +112,7 @@ struct LiveAcceptanceTests {
         var posts: [(String?, String)] = []
         slack.sender = { _, thread, text in posts.append((thread, text)) }
         slack.attach(store: store, harness: harness)
-        var s = SlackSettings(); s.authorizedUsers = ["U1"]; s.authorizedChannels = ["C1"]
+        var s = SlackSettings(); s.authorizedUsers = ["U1"]; s.authorizedChannels = ["C1"]; s.replyInThreads = true
         slack.settings = s
         slack.setTestIdentity(botUserID: "UBOT")
 
@@ -156,5 +156,90 @@ struct LiveAcceptanceTests {
         #expect(harness.requests.contains { $0.route == .user && $0.reason.hasPrefix("Deletes") && $0.status == .denied })
         #expect(FileManager.default.fileExists(atPath: victim.path))            // the deletion was blocked
         #expect(harness.task(root.id)?.status == .completed)
+    }
+
+    /// Two messages about the same project: the second is typed into the same live session (no new process,
+    /// no context reload). Prints the token use of each.
+    @Test func secondMessageContinuesTheSameSession() async throws {
+        _ = TestHome.url
+        _ = NSApplication.shared
+        AppHome.bootstrap()
+        for f in [AgentStore.profilesFile, AgentStore.tasksFile, AgentStore.slackSeenFile, AgentStore.integrationsFile] {
+            try? FileManager.default.removeItem(at: f)
+        }
+        var settings = AppSettings()
+        settings.shell = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh"
+        settings.claudeUseAppMCP = false
+        settings.voiceEnabled = false
+        settings.notificationSound = false
+        AppHome.save(settings, to: AppHome.settingsFile)
+        AppHome.save(PersistedState(), to: AppHome.stateFile)
+        let store = Store()
+        defer { store.terminateAll() }
+        let repo = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let project = store.addProject(url: repo)
+        store.openProject(project)
+        let harness = AgentHarness()
+        harness.attach(store, refreshModels: true)
+        var pm = try #require(harness.profiles.first)
+        pm.model = "claude-sonnet-5-5"; pm.effort = "low"; pm.sessionPolicy = .perProject
+        harness.saveProfile(pm)
+        let deadline = Date().addingTimeInterval(20)
+        while (ModelCatalog.shared.claude.source != .live || harness.bridge.port == nil), Date() < deadline { try await Task.sleep(for: .milliseconds(200)) }
+        let slack = SlackConnector()
+        var posts: [String] = []
+        slack.sender = { _, _, text in posts.append(text) }
+        slack.attach(store: store, harness: harness)
+        var s = SlackSettings(); s.authorizedUsers = ["U1"]; s.replyInThreads = false
+        slack.settings = s
+        slack.setTestIdentity(botUserID: "UBOT")
+        func say(_ text: String, _ ts: String) {
+            slack.handle(event: ["type": "message", "channel_type": "im", "user": "U1", "channel": "D1", "ts": ts, "text": text], eventID: "EvL\(ts)")
+        }
+        func waitDone(_ id: UUID) async throws {
+            let end = Date().addingTimeInterval(240)
+            while harness.task(id)?.status.isFinished != true, Date() < end { try await Task.sleep(for: .seconds(1)) }
+        }
+        say("Project Manager, en el proyecto projectN: lee el README y dime en UNA línea de qué trata la app.", "1")
+        let first = try #require(harness.tasks.last)
+        try await waitDone(first.id)
+        say("Project Manager, ¿cuántas secciones de nivel 2 (##) tiene ese README? Responde solo el número.", "2")
+        let second = try #require(harness.tasks.last)
+        try await waitDone(second.id)
+        let a = try #require(harness.task(first.id)), b = try #require(harness.task(second.id))
+        print("1st: \(a.status) \(Int(a.duration ?? 0))s usage \(String(describing: a.usage))\n   \(a.result ?? a.error ?? "-")")
+        print("2nd: \(b.status) \(Int(b.duration ?? 0))s usage \(String(describing: b.usage)) continued=\(b.continuedSession ?? false)\n   \(b.result ?? b.error ?? "-")")
+        print("Slack:\n" + posts.joined(separator: "\n---\n"))
+        #expect(a.status == .completed && b.status == .completed)
+        #expect(b.continuedSession == true && b.paneID == a.paneID && b.sessionID == a.sessionID)
+        #expect(!(b.result ?? "").isEmpty)
+    }
+
+    /// The AI agent creator against real Claude Code: questions, then a full design.
+    @Test func agentCreatorWithRealClaude() async throws {
+        let env = try await AgentHarnessTests.makeSharedEnv()
+        defer { env.store.terminateAll() }
+        var real = env.store.settings   // the shared test env uses a fake `claude`; this test wants the real one
+        real.claudeCommand = "claude"
+        real.isolateClaudeConfig = false
+        real.shell = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh"
+        env.store.settings = real
+        let creator = AgentCreator(harness: env.harness, store: env.store)
+        creator.description = "Quiero un agente SEO que cada lunes revise el sitio de Florina y me diga qué mejorar, sin tocar archivos."
+        creator.askQuestions()
+        var deadline = Date().addingTimeInterval(120)
+        while creator.stage == .asking, Date() < deadline { try await Task.sleep(for: .milliseconds(200)) }
+        print("Stage: \(creator.stage)")
+        for q in creator.questions { print("Q: \(q.text)  options: \(q.options)") }
+        #expect(creator.stage == .questions)
+        if let first = creator.questions.first { creator.questions[0].answer = first.options.first ?? "" }
+        creator.design()
+        deadline = Date().addingTimeInterval(180)
+        while creator.stage == .designing, Date() < deadline { try await Task.sleep(for: .milliseconds(200)) }
+        print("Stage: \(creator.stage)")
+        let p = try #require(creator.draft)
+        print("Name: \(p.name) · role \(p.role) · \(p.model) \(p.effort ?? "-") · \(p.permission) · emoji \(p.slackEmoji) · tools \(AgentToolCatalog.effective(p).count) · schedules \(p.schedules.map { "\($0.name): \($0.summary)" })")
+        print("Summary: \(creator.summary)\nInstructions:\n\(p.instructions.prefix(900))")
+        #expect(p.permission == .readOnly && !p.instructions.isEmpty)
     }
 }

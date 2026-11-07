@@ -145,7 +145,7 @@ struct AgentUnitTests {
         let pm = AgentProfile.projectManager()
         #expect(pm.name == "Project Manager" && pm.provider == .anthropic && pm.runtime == .claudeCode)
         #expect(pm.model == "claude-opus-5-5" && pm.effort == "high" && pm.permission == .readOnly)
-        #expect(pm.sessionPolicy == .alwaysNew && pm.contextSources == ["README.md"])
+        #expect(pm.sessionPolicy == .perProject && pm.contextSources == ["README.md"])
         #expect(AgentPermission.readOnly.paneValue(for: .claudeCode) == "plan")
         #expect(AgentPermission.allCases.allSatisfy { ![ "bypassPermissions", "full", "auto", "dontAsk", "workspace-auto"].contains($0.paneValue(for: .claudeCode)) && !["full", "workspace-auto"].contains($0.paneValue(for: .codexCLI)) })
         // Tolerant decoding of an older/partial profile.

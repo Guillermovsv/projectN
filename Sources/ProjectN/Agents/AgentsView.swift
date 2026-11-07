@@ -117,6 +117,7 @@ struct AgentsSidebar: View {
     @EnvironmentObject var nav: NavigationModel
     @EnvironmentObject var panel: RightPanelModel
     var onHide: () -> Void
+    @State private var creating = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -127,9 +128,12 @@ struct AgentsSidebar: View {
                 Button(action: onHide) { Image(systemName: "sidebar.left") }
                     .buttonStyle(ChromeButtonStyle())
                     .help("Hide sidebar")
-                Button { newAgent() } label: { Image(systemName: "plus") }
-                    .buttonStyle(ChromeButtonStyle())
-                    .help("New agent")
+                Menu {
+                    Button { creating = true } label: { Label("Create with AI…", systemImage: "sparkles") }
+                    Button { newAgent() } label: { Label("Blank Agent", systemImage: "plus") }
+                } label: { Image(systemName: "plus") }
+                .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
+                .help("New agent")
             }
             .padding(.trailing, 10)
             .frame(height: Chrome.topBarHeight)
@@ -157,6 +161,9 @@ struct AgentsSidebar: View {
         }
         .background(Color.appSidebar)
         .onAppear { if nav.selectedAgentID.flatMap(agents.profile) == nil { nav.selectedAgentID = agents.profiles.first?.id } }
+        .sheet(isPresented: $creating) {
+            AgentCreatorSheet(harness: agents, store: store) { id in nav.selectedAgentID = id }
+        }
     }
 
     private func agentRow(_ p: AgentProfile) -> some View {
@@ -208,6 +215,7 @@ struct AgentsSidebar: View {
     private func newAgent() {
         var p = AgentProfile(name: "New Agent", role: "Developer", model: "claude-sonnet-5-5", effort: "medium",
                              instructions: "Describe what this agent does, how it should work and what it must not do.")
+        p.sessionPolicy = .perProject
         var n = 2
         while agents.profiles.contains(where: { $0.name == p.name }) { p.name = "New Agent \(n)"; n += 1 }
         agents.saveProfile(p)

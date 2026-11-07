@@ -156,13 +156,15 @@ The switch at the top of the sidebar (or ⌃⌘1 / ⌃⌘2) flips between **Work
 
 Each profile has: name, role, provider (Anthropic / OpenAI / other compatible), runtime (Claude Code / Codex CLI), model, reasoning effort, instructions, allowed tools, access level, project access, context sources, session policy, concurrency limit, timeout and an on/off switch. Profiles can be created, edited, duplicated and deleted. A **Project Manager** profile (Claude Code, Opus 5.5, effort high, read-only, can delegate, all projects, README as context) is created on first launch.
 
+**Create with AI** (the **+** menu in the Agents view or in Settings → Agents): describe the agent in a few words, answer 2–4 quick questions (with options to pick), and Claude designs the whole profile — name, role, detailed instructions, access, tools, model and effort, context files, MCP servers, projects, emoji and schedules. Review and edit it, then create it. Uses your Claude Code login (`claude -p`, no tools).
+
 The editor is split into tabs: **General** (name, role, model, effort, limits) · **Instructions** · **Access** · **Integrations** (MCP servers, CLI tools, API keys) · **Projects** (where it may work, context files) · **Schedules**.
 
 - **Access** has three levels — *Read only*, *Read & write — ask first*, *Read & write* — and picking one ticks the matching tools automatically (read-only agents can't get the editing tools). Untick anything to customise; *Reset* goes back to the preset.
 - **Schedules**: an agent can run tasks by itself — every few hours, every day, weekdays, or on chosen days, at a set time, in a chosen project. Each run is a new task under the usual approval rules. Optionally it posts to a Slack channel or DMs you (start + result in a thread). Schedules run while ProjectN is open; a run missed while it was closed happens once at the next launch (*Run if missed*). *Run Now* starts one immediately.
 
 - **Models are read from the runtime**: Claude models (and the effort levels each supports) come from your Claude login's live model list; Codex models from Codex's own cache. The built-in list is only a fallback when offline. An unknown model is rejected; an unsupported effort is dropped with a note.
-- **Every task starts a new session** with the agent's instructions (as Claude's system prompt), the request, and the project's README + listed context files (marked as untrusted data). Earlier conversations are never included. A previous session is resumed only when the profile allows it *and* the message asks explicitly ("reanuda la sesión…", "resume session").
+- **One session per agent and project** (default): the first message opens a terminal with the agent's instructions (as Claude's system prompt), the request and the project's README + context files (marked as untrusted data). Later messages about the same project are typed into **that same terminal** — no new process, no re-read context (Claude's prompt cache makes the earlier context cheap). A message for a busy session waits for it; a closed terminal is resumed (`--resume`). A new session starts when you say *"sesión nueva"* / *"desde cero"*, switch project, or after 12 h unused (Settings → Agents → Autonomy). Profiles can instead use *Always a new session* or *Resume only when asked*.
 - Tasks run as normal panes in a workspace named **Agents** (max 8 panes per space; new spaces are added, and only the harness's own finished panes are ever recycled). Open a task's pane from Settings → Agents → Tasks to watch it or answer an approval prompt.
 - **Access levels**: *Read & plan only* (enforced by the hook; Codex read-only sandbox), *Ask before any change*, *Edit project files (commands ask)*. Modes that skip approvals (bypass, full access, auto) are never used for agents. Agents that can write never run at the same time in the same project.
 - Agents refuse to run in personal/system folders (home, Desktop, Documents, Downloads, Library, ~/.ssh, …); context files must be inside the project and secret files (.env, keys) are skipped.
@@ -197,6 +199,10 @@ Uses **Socket Mode** (an outbound connection from your Mac, no public server). I
 5. Press **Check Connection** (verifies both tokens, scopes and Socket Mode), turn on **Enable Slack**, then DM the bot or mention it:
    `@ProjectN Project Manager, revisa el proyecto seleccionado, consulta su README y dime qué tareas pendientes identificas`
 
+Replies go **straight into the conversation** (turn on *Reply in threads* if you prefer threads); answer questions, approvals (*aprobar* / *rechazar*) and "which project?" by just writing. Not naming a project keeps the one you were talking about with that agent.
+
+**A channel per agent**: ProjectN's app creates a private channel for every agent, named after it (*Project Manager* → `#project-manager`), and invites you. Whatever you write there goes to that agent — no need to mention it — and it answers signed with its own name and emoji (set the emoji in Settings → Agents → General). Renaming an agent renames its channel; new agents get one automatically. Schedules can report to the agent's channel. Needs the scopes `groups:read`, `groups:write`, `chat:write.customize` (in the manifest).
+
 The message's first words pick the agent (else the *Default agent*). The project is the one named in the message, else the project focused in ProjectN, else the agent's only project; otherwise the bot asks in the thread. Progress, approval requests, the result and errors are posted in the message's thread. Duplicate deliveries (Slack retries) are ignored, also across restarts; tasks interrupted by quitting ProjectN are reported on the next connection.
 
 To add an agent: Settings → Agents → **+** (or duplicate one), set role/runtime/model/instructions/access, Save. To change a model: pick it in *Model* (⟳ reloads the list) and Save; running tasks keep the model they started with.
@@ -230,7 +236,7 @@ While ProjectN is open, **hold fn anywhere, talk, release** — the text is past
 
 Override the location with `PROJECTN_HOME=/some/path`.
 
-**MCP servers.** Manage them from the puzzle-piece button on the home screen, or edit `mcp.json` directly (same format as Claude's `.mcp.json`).
+**MCP servers.** Manage them from the puzzle-piece button on the home screen, or edit `mcp.json` directly (same format as Claude's `.mcp.json`). **Import JSON…** (Settings → MCP Servers, or *Add from JSON…* in an agent's Integrations tab) takes the JSON from a server's docs — `{"mcpServers": {…}}` (Claude/Cursor), `{"servers": {…}}` (VS Code), a bare `"name": {…}` or a single server — keeping headers and env. `mcp.json` is readable only by you.
 - Claude gets them through `--mcp-config ~/.projectn/mcp.json`. They're added on top of your normal Claude MCP setup.
 - Codex gets them as per-launch `-c mcp_servers.<name>.*=…` overrides, so your `~/.codex/config.toml` is never modified.
 - "Install" runs `npm install --prefix ~/.projectn/mcp <package>`. Then add a server whose command is the package's bin name.

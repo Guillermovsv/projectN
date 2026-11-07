@@ -53,7 +53,12 @@ struct AgentsSettingsView: View {
                 }
                 .frame(minHeight: 260)
                 HStack(spacing: 4) {
-                    Button { selection = newProfile() } label: { Image(systemName: "plus") }.help("New agent")
+                    Menu {
+                        Button { creatingWithAI = true } label: { Label("Create with AI…", systemImage: "sparkles") }
+                        Button { selection = newProfile() } label: { Label("Blank Agent", systemImage: "plus") }
+                    } label: { Image(systemName: "plus") }
+                    .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
+                    .help("New agent")
                     Button { selection = selection.flatMap { agents.duplicateProfile($0)?.id } ?? selection } label: {
                         Image(systemName: "plus.square.on.square")
                     }
@@ -71,6 +76,9 @@ struct AgentsSettingsView: View {
                 Text("Select or create an agent.").foregroundStyle(.secondary).frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
+        .sheet(isPresented: $creatingWithAI) {
+            AgentCreatorSheet(harness: agents, store: store) { id in selection = id }
+        }
         .alert("Delete \(selection.flatMap { agents.profile($0)?.name } ?? "agent")?", isPresented: $confirmDelete) {
             Button("Delete", role: .destructive) {
                 if let id = selection { agents.deleteProfile(id); selection = agents.profiles.first?.id }
@@ -82,10 +90,12 @@ struct AgentsSettingsView: View {
     }
 
     @State private var confirmDelete = false
+    @State private var creatingWithAI = false
 
     private func newProfile() -> UUID {
         var p = AgentProfile(name: "New Agent", role: "Developer", model: "claude-sonnet-5-5", effort: "medium",
                              instructions: "Describe what this agent does, how it should work and what it must not do.")
+        p.sessionPolicy = .perProject
         var n = 2
         while agents.profiles.contains(where: { $0.name == p.name }) { p.name = "New Agent \(n)"; n += 1 }
         agents.saveProfile(p)
@@ -104,6 +114,7 @@ struct AgentEditor: View {
     @State private var runSheet = false
     @State private var tab: EditorTab = .general
     @State private var editingSchedule: AgentSchedule?
+    @State private var importingMCP = false
     private let original: AgentProfile
 
     enum EditorTab: String, CaseIterable, Identifiable {
@@ -123,6 +134,11 @@ struct AgentEditor: View {
     }
 
     static let rolePresets = ["Project Manager", "Developer", "SEO", "Designer", "Copywriter", "QA / Reviewer", "Analyst"]
+    static let emojiPresets: [(String, String)] = [
+        (":card_index_dividers:", "🗂️"), (":computer:", "💻"), (":mag:", "🔍"), (":art:", "🎨"), (":pencil2:", "✏️"),
+        (":white_check_mark:", "✅"), (":bar_chart:", "📊"), (":mega:", "📣"), (":rocket:", "🚀"), (":robot_face:", "🤖"),
+        (":brain:", "🧠"), (":briefcase:", "💼"),
+    ]
 
     init(profile: AgentProfile, initialTab: EditorTab = .general) {
         original = profile
@@ -196,6 +212,10 @@ struct AgentEditor: View {
             .padding(.horizontal, 12).padding(.vertical, 8)
         }
         .sheet(isPresented: $runSheet) { RunTaskSheet(profile: original) }
+        .sheet(isPresented: $importingMCP) {
+            // Imported servers join ProjectN's list and are switched on for this agent.
+            MCPImportSheet { names in for n in names where !draft.mcpServers.contains(n) { draft.mcpServers.append(n) } }
+        }
         .sheet(item: $editingSchedule) { s in
             ScheduleEditor(schedule: s, profile: draft) { saved in
                 if let i = draft.schedules.firstIndex(where: { $0.id == saved.id }) { draft.schedules[i] = saved } else { draft.schedules.append(saved) }
@@ -216,6 +236,19 @@ struct AgentEditor: View {
                 } label: { Image(systemName: "chevron.down") }
                 .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
             }
+            HStack {
+                TextField("Slack emoji", text: $draft.slackIcon, prompt: Text(draft.slackEmoji))
+                    .font(.body.monospaced())
+                Menu {
+                    ForEach(Self.emojiPresets, id: \.0) { e in Button("\(e.1)  \(e.0)") { draft.slackIcon = e.0 } }
+                    Divider()
+                    Button("From its role") { draft.slackIcon = "" }
+                } label: { Image(systemName: "face.smiling") }
+                .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
+            }
+        } footer: {
+            Text("In Slack it signs as “\(draft.name)” with \(draft.slackEmoji), in its own channel #\(SlackRouter.channelName(for: draft.name)).")
+                .font(.caption).foregroundStyle(.secondary)
         }
         Section("Model") {
             Picker("Provider", selection: $draft.provider) {
@@ -359,6 +392,7 @@ struct AgentEditor: View {
                     }
                 }
             }
+            Button { importingMCP = true } label: { Label("Add from JSON…", systemImage: "curlybraces") }
         } header: { Text("MCP servers") } footer: {
             Text("Only the checked servers (plus ProjectN's own) are loaded for this agent. Tools that read run freely; tools that delete or publish ask you.")
                 .font(.caption).foregroundStyle(.secondary)
@@ -561,6 +595,9 @@ struct ScheduleEditor: View {
                 }
                 HStack {
                     TextField("Post to Slack", text: $schedule.slackTarget, prompt: Text("channel ID (C…) or member ID — empty: ProjectN only"))
+                    if profile.slackChannelID != nil {
+                        Button("\(profile.name)'s channel") { schedule.slackTarget = "agent" }
+                    }
                     if let me = slack.settings.authorizedUsers.first {
                         Button("Me (DM)") { schedule.slackTarget = me }
                     }
@@ -839,6 +876,7 @@ struct AutonomySettingsView: View {
                 Text("1: only agents you message delegate. 2: their delegates may delegate once more.").font(.caption).foregroundStyle(.secondary)
                 Stepper("Max delegated tasks per request: \(agents.policy.maxTasksPerRequest)", value: binding.maxTasksPerRequest, in: 1...50)
                 Stepper("Approvals & questions expire after \(agents.policy.requestTimeoutMinutes) min", value: binding.requestTimeoutMinutes, in: 5...480, step: 5)
+                Stepper("Project sessions start fresh after \(agents.policy.sessionIdleHours) h unused", value: binding.sessionIdleHours, in: 1...168)
                 Text("Unanswered approvals count as “no”; unanswered questions tell the agent to continue with the safest assumption.")
                     .font(.caption).foregroundStyle(.secondary)
             }

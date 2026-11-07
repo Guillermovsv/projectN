@@ -91,11 +91,18 @@ struct SlackSettingsView: View {
                     Toggle("Post when a task is queued or starts", isOn: $slack.settings.notifyOnStart)
                     Toggle("Post approval requests and proposed plans", isOn: $slack.settings.notifyApprovals)
                     Toggle("Post errors, timeouts and cancellations", isOn: $slack.settings.notifyErrors)
+                    Toggle("Reply in threads", isOn: $slack.settings.replyInThreads)
+                    Text(slack.settings.replyInThreads
+                         ? "Replies go in a thread under your message; answer questions and approvals in that thread."
+                         : "Replies go straight into the conversation; answer questions and approvals by just writing there.")
+                        .font(.caption).foregroundStyle(.secondary)
                     Text("Results are always posted in the thread of the original message.").font(.caption).foregroundStyle(.secondary)
                 }
                 .padding(6)
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
+
+            AgentSlackChannelsSection()
 
             DisclosureGroup("How to create and connect the Slack app", isExpanded: $showSetup) { setupGuide }
 
@@ -159,39 +166,48 @@ struct SlackSettingsView: View {
         }
     }
 
-    static let manifest = """
-    display_information:
-      name: ProjectN Agents
-      description: Talk to your ProjectN agents
-    features:
-      bot_user:
-        display_name: ProjectN
-        always_online: false
-      app_home:
-        messages_tab_enabled: true
-        messages_tab_read_only_enabled: false
-    oauth_config:
-      scopes:
-        bot:
-          - app_mentions:read
-          - chat:write
-          - im:history
-          - im:read
-          - channels:history
-          - groups:history
-    settings:
-      event_subscriptions:
-        bot_events:
-          - app_mention
-          - message.im
-          - message.channels
-          - message.groups
-      interactivity:
-        is_enabled: true
-      org_deploy_enabled: false
-      socket_mode_enabled: true
-      token_rotation_enabled: false
-    """
+    static let manifest = manifest(name: "ProjectN Agents", botName: "ProjectN", description: "Talk to your ProjectN agents")
+
+    /// Socket Mode app manifest; used for the general bot and for each agent's own app.
+    static func manifest(name: String, botName: String, description: String) -> String {
+        let safe = { (s: String) in s.replacingOccurrences(of: "\"", with: "'") }
+        return """
+        display_information:
+          name: "\(safe(String(name.prefix(35))))"
+          description: "\(safe(String(description.prefix(120))))"
+        features:
+          bot_user:
+            display_name: "\(safe(String(botName.prefix(80))))"
+            always_online: false
+          app_home:
+            messages_tab_enabled: true
+            messages_tab_read_only_enabled: false
+        oauth_config:
+          scopes:
+            bot:
+              - app_mentions:read
+              - chat:write
+              - im:history
+              - im:read
+              - channels:history
+              - groups:history
+              - groups:read
+              - groups:write
+              - chat:write.customize
+        settings:
+          event_subscriptions:
+            bot_events:
+              - app_mention
+              - message.im
+              - message.channels
+              - message.groups
+          interactivity:
+            is_enabled: true
+          org_deploy_enabled: false
+          socket_mode_enabled: true
+          token_rotation_enabled: false
+        """
+    }
 
     private var setupGuide: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -217,5 +233,46 @@ struct SlackSettingsView: View {
                 .font(.caption).foregroundStyle(.secondary)
         }
         .padding(.top, 6)
+    }
+}
+
+/// Each agent's private channel, created by ProjectN's app and signed with the agent's name and emoji.
+struct AgentSlackChannelsSection: View {
+    @EnvironmentObject var slack: SlackConnector
+    @EnvironmentObject var agents: AgentHarness
+
+    var body: some View {
+        GroupBox("Agent channels") {
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Every agent gets its own private channel, named after it (#project-manager…), with you invited. Whatever you write there goes to that agent — no need to mention it — and it answers signed with its name and emoji. Renaming an agent renames its channel. Change the emoji in Settings → Agents → General.")
+                    .font(.caption).foregroundStyle(.secondary)
+                ForEach(agents.profiles) { p in
+                    HStack(spacing: 10) {
+                        AgentAvatar(profile: p, size: 26)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(p.name).fontWeight(.medium)
+                            if let err = slack.channelErrors[p.id] {
+                                Text(err).font(.caption).foregroundStyle(.red).lineLimit(2)
+                            } else if let name = p.slackChannelName {
+                                Text("#\(name) · \(p.slackEmoji)").font(.caption.monospaced()).foregroundStyle(.secondary)
+                            } else {
+                                Text(p.enabled ? (slack.settings.enabled ? "Channel will be created when Slack connects" : "Slack is off") : "Agent is off — no channel")
+                                    .font(.caption).foregroundStyle(.secondary)
+                            }
+                        }
+                        Spacer()
+                        if let id = p.slackChannelID, let team = slack.teamID {
+                            Button("Open in Slack") { NSWorkspace.shared.open(URL(string: "slack://channel?team=\(team)&id=\(id)")!) }
+                        }
+                    }
+                }
+                HStack {
+                    Spacer()
+                    Button("Sync Channels Now") { slack.syncAgentChannels() }
+                        .disabled({ if case .connected = slack.status { return false }; return true }())
+                }
+            }
+            .padding(6)
+        }
     }
 }

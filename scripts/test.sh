@@ -19,6 +19,9 @@ if [ -d "$testing_frameworks/Testing.framework" ]; then
   )
 fi
 
+# Never let tests see your real ~/.projectn: give the whole run a throw-away home.
+export PROJECTN_HOME="${TMPDIR%/}/projectn-tests-$$-$RANDOM"
+
 # The agent helper isn't a test dependency, so build it explicitly (tests run it as Claude Code would).
 swift build --product pn-agent -j "${PROJECTN_BUILD_JOBS:-4}"
 

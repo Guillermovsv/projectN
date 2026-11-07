@@ -403,4 +403,186 @@ struct AutonomyTests {
         #expect(env.harness.runSchedule(env.harness.profile(pm.id)!.schedules[0], of: env.harness.profile(pm.id)!) == nil)
         #expect(env.harness.tasks.filter { $0.origin.kind == .schedule }.count == 2)
     }
+
+    // MARK: No threads (default) and agents as their own DMs
+
+    @Test func withoutThreadsRepliesGoStraightIntoTheConversation() async throws {
+        let env = try await makeEnv()
+        defer { env.store.terminateAll() }
+        env.slack.settings.replyInThreads = false
+        var signers: [String?] = []
+        env.slack.signedSender = { _, who, _ in signers.append(who) }
+
+        // Clarification answered by just writing in the channel (no thread, no mention needed).
+        env.slack.handle(event: ["type": "app_mention", "user": "U1", "channel": "C1", "ts": "9.1",
+                                 "text": "<@UBOT> Project Manager, revisa el proyecto Fantasma"], eventID: "Ev9.1")
+        try await waitUntil { env.posts.items.contains { $0.text.contains("No encuentro el proyecto") } }
+        #expect(env.posts.items.allSatisfy { $0.thread == nil })
+        #expect(env.posts.items.last?.text.contains("Responde aquí") == true)
+        env.slack.handle(event: ["type": "message", "user": "U1", "channel": "C1", "ts": "9.2", "text": "Tienda"], eventID: "Ev9.2")
+        try await waitUntil { env.harness.tasks.first?.projectID == env.other.id && env.harness.tasks.first?.status == .completed }
+        try await waitUntil { env.posts.items.contains { $0.text.contains("RESULT-new") } }
+        #expect(env.posts.items.allSatisfy { $0.thread == nil })
+        // Task messages are signed by the agent; routing messages ("which project?") by the app itself.
+        #expect(signers.contains("Project Manager"))
+
+        // A question from a running agent is answered by a plain message in the same channel…
+        let pm = try await startPM(env, ts: "9.3")
+        async let q = mcp([("ask", ["question": "¿Qué color?"])], task: pm.id, env: env)
+        try await waitUntil { env.posts.items.contains { $0.text.contains("pregunta") && $0.text.contains("Responde aquí") } }
+        env.slack.handle(event: ["type": "message", "user": "U1", "channel": "C1", "ts": "9.4", "text": "Azul"], eventID: "Ev9.4")
+        #expect(await q.results.first?.contains("Azul") == true)
+        // …while a message that starts with an agent's name is a new request, not an answer.
+        async let q2 = mcp([("ask", ["question": "¿Y el tamaño?"])], task: pm.id, env: env)
+        try await waitUntil { env.harness.requests.contains { $0.isPending && $0.kind == .question } }
+        let before = env.harness.tasks.count
+        env.slack.handle(event: ["type": "message", "user": "U1", "channel": "C1", "ts": "9.5", "channel_type": "channel",
+                                 "text": "Project Manager, revisa Demo"], eventID: "Ev9.5")
+        #expect(env.harness.tasks.count == before + 1)
+        #expect(env.harness.requests.contains { $0.isPending && $0.kind == .question })
+        // Approval by plain "aprobar".
+        async let gate = hook("Bash", ["command": "git push"], task: pm.id, env: env)
+        try await waitUntil { env.harness.pendingUserRequests().contains { $0.kind == .approval } }
+        env.slack.handle(event: ["type": "message", "user": "U1", "channel": "C1", "ts": "9.6", "text": "aprobar"], eventID: "Ev9.6")
+        #expect(await gate.decision == "allow")
+        env.slack.handle(event: ["type": "message", "user": "U1", "channel": "C1", "ts": "9.7", "text": "Grande"], eventID: "Ev9.7")
+        _ = await q2
+        env.harness.cancel(pm.id)
+    }
+
+    @Test func eachAgentGetsItsOwnChannelSignedWithItsName() async throws {
+        let env = try await makeEnv()
+        defer { env.store.terminateAll() }
+        env.slack.settings.replyInThreads = false
+        var calls: [(String, [String: Any])] = []
+        var taken: Set<String> = ["developer"]   // a channel with that name already exists in the workspace
+        env.slack.apiCaller = { method, params in
+            calls.append((method, params))
+            switch method {
+            case "conversations.create":
+                let name = params["name"] as! String
+                if taken.contains(name) { throw SlackAPI.APIError(message: "conversations.create: name_taken") }
+                taken.insert(name)
+                return ["ok": true, "channel": ["id": "G-" + name, "name": name]]
+            case "conversations.rename":
+                return ["ok": true, "channel": ["id": params["channel"]!, "name": params["name"]!]]
+            default:
+                return ["ok": true]
+            }
+        }
+        var said: [(channel: String, who: String?, text: String)] = []
+        env.slack.signedSender = { ch, who, text in said.append((ch, who, text)) }
+        var dev = AgentProfile(name: "Developer", role: "Developer", model: "claude-opus-5-5", instructions: "Code.")
+        dev.permission = .editProject; dev.allProjects = true
+        env.harness.saveProfile(dev)
+
+        env.slack.syncAgentChannels()
+        try await waitUntil { env.harness.profiles.allSatisfy { $0.slackChannelID != nil } }
+        let pm = try #require(env.harness.profiles.first { $0.name == "Project Manager" })
+        dev = try #require(env.harness.profile(dev.id))
+        #expect(pm.slackChannelName == "project-manager" && pm.slackChannelID == "G-project-manager")
+        #expect(dev.slackChannelName == "developer-agente")   // "developer" was taken
+        #expect(calls.contains { $0.0 == "conversations.create" && ($0.1["is_private"] as? Bool) == true })
+        #expect(calls.contains { $0.0 == "conversations.invite" && ($0.1["users"] as? String) == "U1" })
+        try await waitUntil { said.contains { $0.channel == "G-project-manager" && $0.who == "Project Manager" && $0.text.contains("Soy *Project Manager*") } }
+        #expect(pm.slackEmoji == ":card_index_dividers:" && dev.slackEmoji == ":computer:")
+
+        // Writing in the Developer's channel: no name, no mention — it's for the Developer, signed by it.
+        said.removeAll()
+        env.slack.handle(event: ["type": "message", "channel_type": "group", "user": "U1", "channel": "G-developer-agente", "ts": "12.1",
+                                 "text": "arregla el login en Demo"], eventID: "Ev12.1")
+        let t = try #require(env.harness.tasks.last)
+        #expect(t.agentID == dev.id && t.projectID == env.project.id && t.instruction == "arregla el login en Demo")
+        try await waitUntil { env.harness.task(t.id)?.status == .completed }
+        try await waitUntil { said.contains { $0.text.contains("RESULT-new") } }
+        #expect(said.allSatisfy { $0.channel == "G-developer-agente" && $0.who == "Developer" })
+        // Not in the authorized-channels list, yet accepted: it's the agent's own channel. Strangers still aren't.
+        let before = env.harness.tasks.count
+        env.slack.handle(event: ["type": "message", "channel_type": "group", "user": "U999", "channel": "G-developer-agente", "ts": "12.2",
+                                 "text": "borra todo"], eventID: "Ev12.2")
+        #expect(env.harness.tasks.count == before)
+
+        // Renaming the agent renames its channel and its signature.
+        dev.name = "Dev Web"
+        env.harness.saveProfile(dev)
+        env.slack.syncAgentChannels()
+        try await waitUntil { env.harness.profile(dev.id)?.slackChannelName == "dev-web" }
+        #expect(calls.contains { $0.0 == "conversations.rename" && ($0.1["name"] as? String) == "dev-web" })
+        #expect(env.harness.profile(dev.id)?.slackChannelID == "G-developer-agente")   // same channel, new name
+
+        // A schedule can report to the agent's channel.
+        var sch = AgentSchedule(); sch.name = "Diario"; sch.projectID = env.project.id; sch.instruction = "estado"; sch.slackTarget = "agent"
+        dev = env.harness.profile(dev.id)!; dev.schedules = [sch]; env.harness.saveProfile(dev)
+        env.harness.runSchedule(sch, of: dev)
+        let run = try #require(env.harness.tasks.last { $0.origin.kind == .schedule })
+        #expect(run.origin.slackChannel == "G-developer-agente")
+        try await waitUntil { said.contains { $0.text.hasPrefix("🗓 *Dev Web*") && $0.who == "Dev Web" } }
+    }
+
+    // MARK: Per-project sessions (default)
+
+    @Test func messagesAboutTheSameProjectContinueOneSession() async throws {
+        let env = try await makeEnv()
+        defer { env.store.terminateAll() }
+        env.slack.settings.replyInThreads = false
+        var pm = try #require(env.harness.profiles.first)
+        pm.sessionPolicy = .perProject
+        env.harness.saveProfile(pm)
+        func say(_ text: String, _ ts: String) {
+            env.slack.handle(event: ["type": "message", "channel_type": "im", "user": "U1", "channel": "D1", "ts": ts,
+                                     "text": text], eventID: "Ev\(ts)")
+        }
+
+        say("Project Manager, revisa Demo y dime qué falta", "11.1")
+        let first = try #require(env.harness.tasks.last)
+        try await waitUntil { env.harness.task(first.id)?.status == .completed }
+        let argsText = (try? String(contentsOf: TestHome.url.appendingPathComponent("fake/args-\(first.sessionID ?? "")-new"), encoding: .utf8)) ?? ""
+        let firstPrompt = argsText.components(separatedBy: "\n<<ARG>>\n").filter { !$0.isEmpty }.last ?? ""
+        #expect(firstPrompt.contains("<untrusted_file path=\"README.md\""))   // context read once
+
+        // Next message, no project named: same project, same terminal, same session; no new process.
+        say("Project Manager, ahora prioriza esas tareas", "11.2")
+        let second = try #require(env.harness.tasks.last)
+        #expect(second.projectID == env.project.id && second.continuedSession == true)
+        #expect(second.paneID == first.paneID && second.sessionID == first.sessionID)
+        try await waitUntil { env.harness.task(second.id)?.status == .completed }
+        #expect(env.harness.task(second.id)?.result == "RESULT-followup")
+        let followups = (try? String(contentsOf: TestHome.url.appendingPathComponent("fake/followups-\(first.sessionID ?? "")"), encoding: .utf8)) ?? ""
+        #expect(followups.contains("ahora prioriza esas tareas") && !followups.contains("untrusted_file"))   // no context re-sent
+        let launches = (try? FileManager.default.contentsOfDirectory(atPath: TestHome.url.appendingPathComponent("fake").path))?
+            .filter { $0.hasPrefix("args-\(first.sessionID ?? "")") } ?? []
+        #expect(launches == ["args-\(first.sessionID ?? "")-new"])   // launched exactly once
+        try await waitUntil { env.posts.items.contains { $0.text.contains("sigue en *Demo* (misma sesión)") } }
+
+        // The approval hook follows the session to the new task.
+        let token = try #require(env.harness.tokenOfTask[second.id])
+        #expect(env.harness.tokens[token] == second.id)
+
+        // A busy session: the next message waits, then continues in it.
+        say("Project Manager, revisa Demo otra vez", "11.3")
+        say("Project Manager, y resume en una línea", "11.4")
+        let third = env.harness.tasks[env.harness.tasks.count - 2], fourth = env.harness.tasks.last!
+        #expect(fourth.resumedFromTaskID == third.id)
+        try await waitUntil { env.harness.task(fourth.id)?.status == .completed }
+        #expect(env.harness.task(fourth.id)?.paneID == first.paneID)
+
+        // "sesión nueva" and another project start a new session.
+        say("Project Manager, sesión nueva: revisa Demo desde cero", "11.5")
+        let fresh = try #require(env.harness.tasks.last)
+        #expect(fresh.continuedSession != true && fresh.paneID != first.paneID)
+        try await waitUntil { env.harness.task(fresh.id)?.status == .completed }
+        say("Project Manager, revisa Tienda", "11.6")
+        let other = try #require(env.harness.tasks.last)
+        #expect(other.projectID == env.other.id && other.continuedSession != true)
+        try await waitUntil { env.harness.task(other.id)?.status == .completed }
+
+        // The terminal was closed (e.g. ProjectN restarted): the same conversation is resumed (--resume).
+        env.store.killRuntime(other.paneID!)
+        try await waitUntil { env.store.runtimes[other.paneID!] == nil }
+        say("Project Manager, sigue con Tienda", "11.7")
+        let resumed = try #require(env.harness.tasks.last)
+        #expect(resumed.projectID == env.other.id && resumed.sessionID == other.sessionID)
+        try await waitUntil { env.harness.task(resumed.id)?.status == .completed }
+        #expect(env.harness.task(resumed.id)?.result == "RESULT-resume: 1. Arreglar login")
+    }
 }

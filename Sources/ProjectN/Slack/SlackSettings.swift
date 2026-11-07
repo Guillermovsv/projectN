@@ -65,6 +65,8 @@ struct SlackSettings: Codable, Equatable {
     var notifyErrors = true
     /// Tell unauthorised users they aren't allowed (otherwise ignore them silently).
     var replyToUnauthorized = true
+    /// Replies in a thread under your message (off = straight into the channel / DM).
+    var replyInThreads = false
 
     init() {}
     init(from decoder: Decoder) throws {
@@ -79,6 +81,7 @@ struct SlackSettings: Codable, Equatable {
         notifyApprovals = (try? c.decode(Bool.self, forKey: .notifyApprovals)) ?? d.notifyApprovals
         notifyErrors = (try? c.decode(Bool.self, forKey: .notifyErrors)) ?? d.notifyErrors
         replyToUnauthorized = (try? c.decode(Bool.self, forKey: .replyToUnauthorized)) ?? d.replyToUnauthorized
+        replyInThreads = (try? c.decode(Bool.self, forKey: .replyInThreads)) ?? d.replyInThreads
     }
 
     /// Accepts "U123ABC", "<@U123ABC>", "<@U123ABC|name>", "<#C123|general>", commas/newlines.

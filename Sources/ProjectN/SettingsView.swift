@@ -361,6 +361,7 @@ struct MCPServersView: View {
     @State private var servers: [MCPServer] = MCPConfig.load()
     @State private var editing: EditTarget?
     @State private var installPkg = ""
+    @State private var importing = false
     @StateObject private var installer = NPMInstaller()
 
     struct EditTarget: Identifiable {
@@ -378,6 +379,7 @@ struct MCPServersView: View {
                         .font(.callout).foregroundStyle(.secondary)
                 }
                 Spacer()
+                Button { importing = true } label: { Label("Import JSON…", systemImage: "curlybraces") }
                 Button { editing = EditTarget(server: MCPServer(name: "")) } label: { Label("Add Server", systemImage: "plus") }
             }
 
@@ -435,6 +437,7 @@ struct MCPServersView: View {
         .sheet(item: $editing) { target in
             MCPServerEditor(server: target.server, originalName: target.originalName) { reload() }
         }
+        .sheet(isPresented: $importing) { MCPImportSheet { _ in reload() } }
     }
 
     private func reload() { servers = MCPConfig.load() }
@@ -575,5 +578,63 @@ struct ToolsSettingsView: View {
             }
         }
         .formStyle(.grouped)
+    }
+}
+
+/// Paste an MCP configuration as JSON (from a server's docs, Claude, Cursor, VS Code…).
+struct MCPImportSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    let onImported: ([String]) -> Void
+    @State private var text = ""
+    @State private var singleName = ""
+
+    private var parsed: Result<[(name: String, entry: [String: Any])], Error> {
+        Result { try MCPConfig.parseImport(text, singleName: singleName) }
+    }
+
+    var body: some View {
+        let existing = Set(MCPConfig.load().map(\.name))
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Import MCP Servers from JSON").font(.title3.bold())
+            Text("Paste the JSON from the server's instructions — e.g. {\"mcpServers\": {\"notion\": {\"type\": \"http\", \"url\": \"https://mcp.notion.com/mcp\"}}}. Claude, Cursor and VS Code formats work; headers and env are kept.")
+                .font(.caption).foregroundStyle(.secondary)
+            TextEditor(text: $text)
+                .font(.callout.monospaced())
+                .frame(height: 220)
+                .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.3)))
+            if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                EmptyView()
+            } else {
+                switch parsed {
+                case .success(let list):
+                    ForEach(list, id: \.name) { e in
+                        Label("\(e.name) — \((e.entry["url"] as? String) ?? (e.entry["command"] as? String) ?? "")\(existing.contains(e.name) ? " (replaces the existing one)" : "")",
+                              systemImage: "checkmark.circle.fill")
+                            .font(.caption).foregroundStyle(existing.contains(e.name) ? .orange : .green)
+                    }
+                case .failure(let e):
+                    if "\(e)".contains("give it a name") {
+                        TextField("Name for this server", text: $singleName).textFieldStyle(.roundedBorder)
+                    }
+                    Label("\(e)", systemImage: "exclamationmark.triangle").font(.caption).foregroundStyle(.orange)
+                }
+            }
+            Text("Secrets in headers or env are stored in ~/.projectn/mcp.json (readable only by you). Prefer env variables from Settings → Accounts → API keys where the server supports them.")
+                .font(.caption2).foregroundStyle(.tertiary)
+            HStack {
+                Spacer()
+                Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
+                Button("Import") {
+                    if case .success(let list) = parsed {
+                        onImported(MCPConfig.importEntries(list))
+                        dismiss()
+                    }
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled({ if case .success = parsed { return false }; return true }())
+            }
+        }
+        .padding(20)
+        .frame(width: 560)
     }
 }

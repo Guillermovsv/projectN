@@ -16,8 +16,22 @@ enum AppHome {
         if let custom = ProcessInfo.processInfo.environment["PROJECTN_HOME"], !custom.isEmpty {
             return URL(fileURLWithPath: (custom as NSString).expandingTildeInPath)
         }
+        // Tests must never touch your real ~/.projectn: whatever code runs first, a test process gets a
+        // throw-away home (and publishes it so the test helpers use the same one).
+        if isTestProcess {
+            let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("projectn-tests-\(UUID())")
+            setenv("PROJECTN_HOME", tmp.path, 1)
+            return tmp
+        }
         return FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".projectn")
     }()
+
+    static var isTestProcess: Bool {
+        let p = ProcessInfo.processInfo
+        return p.processName.contains("xctest") || p.processName.contains("swiftpm-testing")
+            || Bundle.main.bundlePath.hasSuffix(".xctest") || p.arguments.contains("--testing-library")
+            || p.environment["XCTestConfigurationFilePath"] != nil || NSClassFromString("XCTestCase") != nil
+    }
 
     static var stateFile: URL { root.appendingPathComponent("state.json") }
     static var settingsFile: URL { root.appendingPathComponent("settings.json") }

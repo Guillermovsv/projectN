@@ -28,6 +28,8 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
     /// Replies waiting for a request's outcome (the hook / the `ask` tool call).
     var requestWaiters: [UUID: [(AgentRequest) -> Void]] = [:]
     var lastScheduleCheck = Date.distantPast
+    /// Called after an agent is saved or deleted (Slack keeps each agent's channel in sync).
+    var onProfilesChanged: (() -> Void)?
     /// `wait_for_tasks` calls to wake when something changes for that orchestrator.
     var orchestratorWaiters: [UUID: [() -> Void]] = [:]
     /// Tool calls ProjectN allowed recently, per task (to confirm the CLI's own redundant prompt for them).
@@ -48,7 +50,15 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
         self.catalog = catalog ?? .shared
         let policy = AgentStore.loadPolicy()
         self.policy = policy
-        if let saved = AgentStore.loadProfiles() {
+        if var saved = AgentStore.loadProfiles() {
+            // Older installs started a new session per message; move them to per-project sessions once.
+            if !policy.perProjectSessionsMigrated {
+                for i in saved.indices where saved[i].sessionPolicy == .alwaysNew { saved[i].sessionPolicy = .perProject }
+                var migrated = policy
+                migrated.perProjectSessionsMigrated = true
+                self.policy = migrated
+                AgentStore.saveProfiles(saved, policy: migrated)
+            }
             profiles = saved
         } else {
             let seeded = [AgentProfile.projectManager()]
@@ -115,8 +125,14 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
                 }
             }
         }
+        if let stored = profile(p.id) {
+            // Channel bookkeeping belongs to Slack sync, not to an editor that may be stale.
+            p.slackChannelID = stored.slackChannelID
+            p.slackChannelName = stored.slackChannelName
+        }
         if let i = profiles.firstIndex(where: { $0.id == p.id }) { profiles[i] = p } else { profiles.append(p) }
         AgentStore.saveProfiles(profiles, policy: policy)
+        onProfilesChanged?()
         AuditLog.record("agent.saved", ["agent": p.name, "model": p.model, "permission": p.permission.rawValue])
     }
 
@@ -138,6 +154,7 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
         for t in tasks where t.agentID == id && !t.status.isFinished { cancel(t.id) }
         profiles.removeAll { $0.id == id }
         AgentStore.saveProfiles(profiles, policy: policy)
+        onProfilesChanged?()
         AuditLog.record("agent.deleted", ["agent": p.name])
     }
 
@@ -196,6 +213,14 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
         case .failure(let e): return record(e, request, profile: profile, project: project)
         }
 
+        // Per-project sessions: continue this agent's session for the project instead of opening a new one.
+        var continued = false
+        if resumeFrom == nil, profile.sessionPolicy == .perProject, !request.freshSession,
+           let prev = projectSession(agent: profile, project: project.id, model: resolution.model) {
+            resumeFrom = prev
+            continued = true
+        }
+
         var t = AgentTask(agentID: profile.id, agentName: profile.name, projectID: project.id, projectName: project.name,
                           instruction: request.instruction, origin: request.origin, runtime: profile.runtime,
                           model: resolution.model, effort: resolution.effort, permission: profile.permission)
@@ -210,12 +235,13 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
         if let resumeFrom {
             t.resumedFromTaskID = resumeFrom.id
             t.sessionID = resumeFrom.sessionID
+            if continued { t.continuedSession = true }
         }
         tasks.append(t)
         persist()
         AuditLog.record("task.queued", ["task": t.id.uuidString, "agent": profile.name, "project": project.name,
                                         "origin": t.origin.label, "model": t.model, "effort": t.effort ?? "default",
-                                        "resume": resumeFrom == nil ? "no" : "yes"])
+                                        "resume": resumeFrom == nil ? "no" : (continued ? "project session" : "explicit")])
         pump()
         return .success(task(t.id) ?? t)
     }
@@ -280,6 +306,8 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
                 finish(t.id, status: .failed, error: "The agent profile was deleted.")
                 continue
             }
+            // A message for a busy session waits for it, then continues in it.
+            if let prev = t.resumedFromTaskID.flatMap(task), !prev.status.isFinished { continue }
             guard activeCount(agent: t.agentID) < max(1, profile.concurrencyLimit) else { continue }
             if t.permission.canWrite, projectHasWriter(t.projectID) { continue }
             launch(t.id, profile: profile)
@@ -296,6 +324,7 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
             return
         }
         let resumeFrom = t.resumedFromTaskID.flatMap(task)
+        if let prev = resumeFrom, continueInPlace(&t, after: prev) { return }
         let prompt: String
         if resumeFrom != nil {
             prompt = PromptComposer.resumeMessage(task: t)
@@ -355,6 +384,50 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
                                          "session": t.sessionID ?? "pending", "pane": pane.id.uuidString,
                                          "permission": options.permission ?? "", "model": t.model])
         emit(t, .started)
+    }
+
+    // MARK: Per-project sessions
+
+    /// The session to continue for (agent, project): its latest task that had a session, if it ran on the same
+    /// runtime and model, didn't crash, and was used within the idle window.
+    func projectSession(agent p: AgentProfile, project: UUID, model: String) -> AgentTask? {
+        guard let prev = tasks.last(where: { $0.agentID == p.id && $0.projectID == project && $0.sessionID != nil && $0.paneID != nil })
+        else { return nil }
+        guard prev.runtime == p.runtime, prev.model == model, prev.status != .failed else { return nil }
+        let lastUsed = prev.finishedAt ?? Date()
+        guard Date().timeIntervalSince(lastUsed) < Double(max(1, policy.sessionIdleHours) * 3600) else { return nil }
+        return prev
+    }
+
+    /// The session's terminal is still running: type the next message into it (no new process, no context reload).
+    /// Returns false when it isn't, so the caller resumes the conversation in a new process instead.
+    private func continueInPlace(_ t: inout AgentTask, after prev: AgentTask) -> Bool {
+        guard let store, let paneID = prev.paneID, let wid = prev.workspaceID, let rt = store.runtimes[paneID], rt.isRunning,
+              let (_, pane) = store.pane(paneID, in: wid), pane.agentTaskID == prev.id, let sid = prev.sessionID else { return false }
+        let url = t.runtime == .claudeCode
+            ? TranscriptReader.claudeTranscript(sessionID: sid, settings: store.settings)
+            : TranscriptReader.codexTranscript(sessionID: sid, settings: store.settings)
+        t.transcriptOffset = TranscriptReader.fileSize(url)
+        t.paneID = paneID
+        t.workspaceID = wid
+        t.sessionID = sid
+        t.status = .running
+        t.startedAt = Date()
+        // Hooks of this process carry the session's token: point it at the new task.
+        if let token = tokenOfTask.removeValue(forKey: prev.id) {
+            tokens[token] = t.id
+            tokenOfTask[t.id] = token
+        }
+        store.updatePane(paneID, in: wid) {
+            $0.agentTaskID = t.id
+            $0.lastPrompt = t.instruction
+        }
+        replace(t)
+        rt.submit(PromptComposer.resumeMessage(task: t))
+        AuditLog.record("task.started", ["task": t.id.uuidString, "agent": t.agentName, "project": t.projectName,
+                                         "session": sid, "pane": paneID.uuidString, "mode": "continued in place"])
+        emit(t, .started)
+        return true
     }
 
     // MARK: Monitoring
@@ -474,7 +547,8 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
             $0.finishedAt = Date()
             if let error, !error.isEmpty { $0.error = error }
         }
-        revokeToken(for: id)
+        // A completed task's session stays open for the project's next message; its token moves on with it.
+        if status != .completed { revokeToken(for: id) }
         recentlyApproved.removeValue(forKey: id)
         expireRequests()
         guard let done = task(id) else { return }

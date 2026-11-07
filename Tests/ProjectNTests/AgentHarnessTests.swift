@@ -28,6 +28,14 @@ struct AgentHarnessTests {
     printf '{"type":"user","message":{"role":"user","content":"x"}}\\n' >> "$F"
     printf '{"type":"assistant","message":{"id":"m-%s-%s","role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"RESULT-%s: 1. Arreglar login"}],"usage":{"input_tokens":10,"output_tokens":5}}}\\n' "$MODE" "$$" "$MODE" >> "$F"
     printf '{"type":"system","subtype":"turn_duration","durationMs":5}\\n' >> "$F"
+    # Follow-up messages typed into the same terminal: one answer per message (lines arriving together = one message).
+    while IFS= read -r line; do
+      echo "$line" >> "$PROJECTN_HOME/fake/followups-$SID"
+      while IFS= read -r -t 1 more; do echo "$more" >> "$PROJECTN_HOME/fake/followups-$SID"; done
+      printf '{"type":"user","message":{"role":"user","content":"y"}}\\n' >> "$F"
+      printf '{"type":"assistant","message":{"id":"m-f-%s","role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"RESULT-followup"}],"usage":{"input_tokens":1,"output_tokens":1}}}\\n' "$RANDOM" >> "$F"
+      printf '{"type":"system","subtype":"turn_duration","durationMs":5}\\n' >> "$F"
+    done
     sleep 60
     """
 
@@ -93,6 +101,8 @@ struct AgentHarnessTests {
             source: .live))
         let harness = AgentHarness()
         harness.attach(store, refreshModels: false)
+        // Most tests here count sessions per task; per-project sessions are tested in AutonomyTests.
+        if var pm = harness.profiles.first { pm.sessionPolicy = .alwaysNew; harness.saveProfile(pm) }
         let slack = SlackConnector()
         let posts = PostLog()
         slack.sender = { channel, thread, text in posts.items.append((channel, thread, text)) }
@@ -100,6 +110,7 @@ struct AgentHarnessTests {
         var s = SlackSettings()
         s.authorizedUsers = ["U1"]
         s.authorizedChannels = ["C1"]
+        s.replyInThreads = true   // these tests follow conversations by thread; AutonomyTests covers the default (no threads)
         slack.settings = s
         slack.setTestIdentity(botUserID: "UBOT")
         #expect(FileManager.default.isExecutableFile(atPath: TestHome.helper))
@@ -359,6 +370,11 @@ struct AgentHarnessTests {
         var pm = try #require(env.harness.profiles.first)
         pm.sessionPolicy = .resumeOnExplicitRequest
         env.harness.saveProfile(pm)
+        // Its terminal is gone (e.g. ProjectN restarted), so resuming starts the CLI again with --resume.
+        // (With the terminal still open, the message would simply be typed into it.)
+        let last = try #require(env.harness.tasks.last { $0.sessionID != nil })
+        env.store.killRuntime(last.paneID!)
+        try await waitUntil { env.store.runtimes[last.paneID!] == nil }
         mention("Project Manager, reanuda la sesión y resume en 3 puntos", ts: "900.4", thread: "900.1", env: env)
         let resumed = try #require(env.harness.tasks.last)
         try await waitUntil { env.harness.task(resumed.id)?.status == .completed }

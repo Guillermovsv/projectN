@@ -69,9 +69,61 @@ enum MCPConfig {
         write(raw)
     }
 
+    // MARK: Import from JSON
+
+    struct ImportError: Error, CustomStringConvertible { let description: String }
+
+    /// Accepts what MCP docs and other apps hand out:
+    ///   {"mcpServers": {"name": {...}}}  (Claude, Cursor, …)   {"servers": {...}}  (VS Code)
+    ///   {"name": {"command": …} | {"url": …}}                  a single server {"command": …} / {"url": …} (needs `name`)
+    /// Entries are kept as-is (headers, env, type, …), so nothing a server needs is lost.
+    static func parseImport(_ text: String, singleName: String? = nil) throws -> [(name: String, entry: [String: Any])] {
+        // Tolerate a bare `"name": {…}` fragment (as often copied from docs) by wrapping it in braces.
+        var t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if t.hasPrefix("\""), !t.hasPrefix("{") { t = "{" + t + "}" }
+        guard let data = t.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed]) as? [String: Any] else {
+            throw ImportError(description: "That isn't valid JSON (check commas and quotes).")
+        }
+        func isServer(_ d: [String: Any]) -> Bool { d["command"] is String || d["url"] is String || d["serverUrl"] is String }
+        var map: [String: Any]
+        if let m = obj["mcpServers"] as? [String: Any] { map = m }
+        else if let m = obj["servers"] as? [String: Any] { map = m }
+        else if isServer(obj) {
+            guard let n = singleName?.trimmingCharacters(in: .whitespaces), !n.isEmpty else {
+                throw ImportError(description: "This is a single server: give it a name.")
+            }
+            map = [n: obj]
+        } else { map = obj }
+        var out: [(String, [String: Any])] = []
+        for (name, value) in map.sorted(by: { $0.key < $1.key }) {
+            guard var entry = value as? [String: Any], isServer(entry) else {
+                throw ImportError(description: "“\(name)” isn't an MCP server (it needs a \"command\" or a \"url\").")
+            }
+            if let u = entry.removeValue(forKey: "serverUrl") { entry["url"] = u }
+            if entry["url"] != nil, entry["type"] == nil { entry["type"] = "http" }
+            out.append((name.trimmingCharacters(in: .whitespaces), entry))
+        }
+        guard !out.isEmpty else { throw ImportError(description: "No MCP servers found in that JSON.") }
+        return out
+    }
+
+    /// Adds (or replaces) the servers; returns their names.
+    @discardableResult
+    static func importEntries(_ entries: [(name: String, entry: [String: Any])]) -> [String] {
+        var raw = loadRaw()
+        var servers = raw["mcpServers"] as? [String: Any] ?? [:]
+        for e in entries { servers[e.name] = e.entry }
+        raw["mcpServers"] = servers
+        write(raw)
+        return entries.map(\.name)
+    }
+
     private static func write(_ raw: [String: Any]) {
         guard let data = try? JSONSerialization.data(withJSONObject: raw, options: [.prettyPrinted, .sortedKeys]) else { return }
         try? data.write(to: AppHome.mcpFile, options: .atomic)
+        // May hold tokens (headers / env): readable only by you.
+        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: AppHome.mcpFile.path)
     }
 
     /// Codex reads MCP servers from config.toml; we inject them per-launch with `-c key=value` (TOML values).

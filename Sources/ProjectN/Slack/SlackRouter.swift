@@ -131,6 +131,13 @@ enum SlackRouter {
         return name.isEmpty ? nil : name
     }
 
+    /// "sesión nueva", "desde cero", "new session": start over instead of continuing the project's session.
+    static func wantsNewSession(_ text: String) -> Bool {
+        let f = text.folded
+        return ["sesion nueva", "nueva sesion", "desde cero", "new session", "fresh session", "start over", "empieza de cero"]
+            .contains { f.contains($0) }
+    }
+
     // MARK: Resume
 
     /// Only an explicit request continues an earlier session ("reanuda la sesión", "resume session", "--resume").
@@ -140,6 +147,17 @@ enum SlackRouter {
                        "continuar la sesion", "continua en la misma sesion", "misma sesion", "resume session", "resume the session",
                        "continue the session", "continue session", "same session", "--resume"]
         return phrases.contains { f.contains($0) } || f.hasPrefix("resume:") || f.hasPrefix("reanudar:")
+    }
+
+    // MARK: Agent channels
+
+    /// Slack channel name for an agent: its name, lowercase, accents removed, words joined by "-" (max 80).
+    static func channelName(for agentName: String) -> String {
+        let f = agentName.folded
+        let slug = f.unicodeScalars.map { CharacterSet.alphanumerics.contains($0) && $0.isASCII ? String($0) : "-" }.joined()
+            .replacingOccurrences(of: #"-+"#, with: "-", options: .regularExpression)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "-"))
+        return String((slug.isEmpty ? "agente" : slug).prefix(80))
     }
 
     // MARK: Formatting

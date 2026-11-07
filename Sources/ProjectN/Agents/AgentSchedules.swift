@@ -27,7 +27,9 @@ extension AgentHarness {
             AuditLog.record("schedule.failed", ["agent": p.name, "schedule": s.name, "reason": "no project chosen"])
             return .projectNotFound
         }
-        let target = s.slackTarget.trimmingCharacters(in: .whitespaces).uppercased()
+        var target = s.slackTarget.trimmingCharacters(in: .whitespaces).uppercased()
+        // "AGENT" = the agent's own Slack channel.
+        if target == "AGENT" { target = p.slackChannelID ?? "" }
         let origin = TaskOrigin(kind: .schedule, slackChannel: target.isEmpty ? nil : target,
                                 scheduleID: s.id, scheduleName: s.name)
         AuditLog.record("schedule.run", ["agent": p.name, "schedule": s.name, "reason": reason])

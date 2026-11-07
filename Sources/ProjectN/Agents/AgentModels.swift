@@ -83,13 +83,17 @@ enum AgentPermission: String, Codable, CaseIterable, Identifiable {
 }
 
 enum SessionPolicy: String, Codable, CaseIterable, Identifiable {
-    /// Every task gets a brand-new session (default).
+    /// One session per project: later messages about the same project continue it (no new terminal, no
+    /// re-read context). "sesión nueva" / "desde cero" or a long idle time starts a new one.
+    case perProject
+    /// Every task gets a brand-new session.
     case alwaysNew
     /// New session by default; a previous session of the same thread is resumed only when the user asks explicitly.
     case resumeOnExplicitRequest
     var id: String { rawValue }
     var label: String {
         switch self {
+        case .perProject: return "One session per project (continues)"
         case .alwaysNew: return "Always a new session"
         case .resumeOnExplicitRequest: return "New session; resume only when explicitly asked"
         }
@@ -162,6 +166,23 @@ struct AgentProfile: Codable, Identifiable, Hashable {
     var apiKeys: [String] = []
     /// Tasks this agent runs on its own on a schedule (while ProjectN is open).
     var schedules: [AgentSchedule] = []
+    /// Emoji the agent signs its Slack messages with (":robot_face:" style). Empty = chosen from its role.
+    var slackIcon: String = ""
+    /// The agent's own private Slack channel (created by ProjectN's app), and the name it was created with.
+    var slackChannelID: String?
+    var slackChannelName: String?
+
+    /// The emoji actually used in Slack.
+    var slackEmoji: String {
+        let e = slackIcon.trimmingCharacters(in: .whitespaces)
+        if !e.isEmpty { return e.hasPrefix(":") ? e : ":\(e):" }
+        let r = (role + " " + name).folded
+        let byRole: [(String, String)] = [("project manager", ":card_index_dividers:"), ("manager", ":card_index_dividers:"),
+                                          ("develop", ":computer:"), ("seo", ":mag:"), ("design", ":art:"), ("copy", ":pencil2:"),
+                                          ("writ", ":pencil2:"), ("qa", ":white_check_mark:"), ("review", ":white_check_mark:"),
+                                          ("analy", ":bar_chart:"), ("market", ":mega:"), ("support", ":speech_balloon:")]
+        return byRole.first { r.contains($0.0) }?.1 ?? ":robot_face:"
+    }
 
     init(name: String, role: String, provider: AgentProvider = .anthropic, runtime: AgentRuntime = .claudeCode,
          model: String, effort: String? = nil, instructions: String) {
@@ -203,6 +224,9 @@ struct AgentProfile: Codable, Identifiable, Hashable {
         cliTools = (try? c.decode([String].self, forKey: .cliTools)) ?? []
         apiKeys = (try? c.decode([String].self, forKey: .apiKeys)) ?? []
         schedules = (try? c.decode([AgentSchedule].self, forKey: .schedules)) ?? []
+        slackIcon = (try? c.decode(String.self, forKey: .slackIcon)) ?? ""
+        slackChannelID = try? c.decode(String.self, forKey: .slackChannelID)
+        slackChannelName = try? c.decode(String.self, forKey: .slackChannelName)
     }
 
     /// The first profile created on a fresh install (section 6 of the spec).
@@ -228,6 +252,7 @@ struct AgentProfile: Codable, Identifiable, Hashable {
             """)
         p.permission = .readOnly
         p.canDelegate = true
+        p.sessionPolicy = .perProject
         p.allProjects = true
         p.contextSources = ["README.md"]
         p.concurrencyLimit = 2
@@ -248,6 +273,8 @@ struct TaskOrigin: Codable, Hashable {
     /// For delegated tasks: the task (agent) that created this one.
     var parentTaskID: UUID?
     var delegatedBy: String?
+    /// Which Slack app received the request (and posts the replies): "main" or an agent's own app.
+    var slackBot: String?
     /// For scheduled tasks: which schedule.
     var scheduleID: UUID?
     var scheduleName: String?
@@ -312,8 +339,10 @@ struct AgentTask: Codable, Identifiable, Hashable {
     var paneID: UUID?
     /// Claude session id / Codex session id once known.
     var sessionID: String?
-    /// Set when this task explicitly resumed an earlier task's session.
+    /// Set when this task continues an earlier task's session.
     var resumedFromTaskID: UUID?
+    /// Continues the project's session (per-project policy) rather than an explicit resume.
+    var continuedSession: Bool?
     /// Transcript bytes that existed before this task (resumed sessions): only later entries count.
     var transcriptOffset: UInt64 = 0
     var result: String?
@@ -344,6 +373,8 @@ struct AgentTaskRequest {
     var origin: TaskOrigin
     /// Explicitly continue this earlier task's session (only if the profile allows it).
     var resumeTaskID: UUID?
+    /// Don't continue the project's session even if the profile would ("sesión nueva").
+    var freshSession = false
     /// Tasks that must finish (completed) before this one starts.
     var dependsOn: [UUID] = []
 }
@@ -414,6 +445,10 @@ struct AgentPolicy: Codable, Equatable {
     var maxTasksPerRequest = 10
     /// How long an agent's question / approval waits for an answer before it's treated as "no".
     var requestTimeoutMinutes = 60
+    /// Per-project sessions idle longer than this start fresh.
+    var sessionIdleHours = 12
+    /// Profiles were moved to per-project sessions once (older installs defaulted to a new session per message).
+    var perProjectSessionsMigrated = false
     /// Agents (with your approval) and your own Slack requests may create new projects.
     var allowProjectCreation = true
     /// Where new project folders are created. Empty = the folder most of your projects live in (else ~/Documents).
@@ -427,6 +462,8 @@ struct AgentPolicy: Codable, Equatable {
         maxDelegationDepth = (try? c.decode(Int.self, forKey: .maxDelegationDepth)) ?? d.maxDelegationDepth
         maxTasksPerRequest = (try? c.decode(Int.self, forKey: .maxTasksPerRequest)) ?? d.maxTasksPerRequest
         requestTimeoutMinutes = (try? c.decode(Int.self, forKey: .requestTimeoutMinutes)) ?? d.requestTimeoutMinutes
+        sessionIdleHours = (try? c.decode(Int.self, forKey: .sessionIdleHours)) ?? d.sessionIdleHours
+        perProjectSessionsMigrated = (try? c.decode(Bool.self, forKey: .perProjectSessionsMigrated)) ?? false
         allowProjectCreation = (try? c.decode(Bool.self, forKey: .allowProjectCreation)) ?? d.allowProjectCreation
         newProjectsFolder = (try? c.decode(String.self, forKey: .newProjectsFolder)) ?? d.newProjectsFolder
     }
