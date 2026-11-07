@@ -42,7 +42,7 @@ extension AgentHarness {
         var servers: [String: Any] = [:]
         // Claude Code's own servers (yours, then the project's), so agents can use what you use.
         if profile.useClaudeMCP, profile.runtime == .claudeCode, let project = store?.project(task.projectID) {
-            for (k, v) in Self.claudeCodeMCPServers(projectPath: project.path) { servers[k] = v }
+            for (k, v) in Self.claudeCodeMCPServers(projectPath: project.path) where profile.usesClaudeMCP(k) { servers[k] = v }
         }
         for (k, v) in (MCPConfig.loadRaw()["mcpServers"] as? [String: Any] ?? [:]) where profile.mcpServers.contains(k) { servers[k] = v }
         if let helper { servers["projectn"] = ["command": helper, "args": ["mcp"]] }
@@ -56,21 +56,57 @@ extension AgentHarness {
     /// MCP servers configured in Claude Code: user-level `mcpServers` in ~/.claude.json plus that file's entry for
     /// the project folder, plus a `.mcp.json` in the project. Later ones win on a name clash.
     nonisolated static func claudeCodeMCPServers(projectPath: String, home: String = NSHomeDirectory()) -> [String: Any] {
-        var out: [String: Any] = [:]
+        let json = claudeJSON(home: home)
+        var out = userClaudeMCPServers(json)
+        for (k, v) in projectClaudeMCPServers(projectPath: projectPath, claudeJSON: json) { out[k] = v }
+        out.removeValue(forKey: "projectn")
+        return out
+    }
+
+    nonisolated static func claudeJSON(home: String = NSHomeDirectory()) -> [String: Any] {
         let file = URL(fileURLWithPath: home).appendingPathComponent(".claude.json")
-        if let data = try? Data(contentsOf: file), let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-            for (k, v) in json["mcpServers"] as? [String: Any] ?? [:] { out[k] = v }
-            let projects = json["projects"] as? [String: Any] ?? [:]
-            let key = PathGuard.canonical(projectPath)
-            let entry = (projects[projectPath] ?? projects[key]) as? [String: Any]
-            for (k, v) in entry?["mcpServers"] as? [String: Any] ?? [:] { out[k] = v }
-        }
+        guard let data = try? Data(contentsOf: file) else { return [:] }
+        return (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
+    }
+
+    /// Your own servers in Claude Code (every project).
+    nonisolated static func userClaudeMCPServers(_ claudeJSON: [String: Any]) -> [String: Any] {
+        claudeJSON["mcpServers"] as? [String: Any] ?? [:]
+    }
+
+    /// A project's own servers: its entry in ~/.claude.json, then its `.mcp.json`.
+    nonisolated static func projectClaudeMCPServers(projectPath: String, claudeJSON: [String: Any]) -> [String: Any] {
+        var out: [String: Any] = [:]
+        let projects = claudeJSON["projects"] as? [String: Any] ?? [:]
+        let entry = (projects[projectPath] ?? projects[PathGuard.canonical(projectPath)]) as? [String: Any]
+        for (k, v) in entry?["mcpServers"] as? [String: Any] ?? [:] { out[k] = v }
         let local = URL(fileURLWithPath: projectPath).appendingPathComponent(".mcp.json")
         if let data = try? Data(contentsOf: local), let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
             for (k, v) in json["mcpServers"] as? [String: Any] ?? [:] { out[k] = v }
         }
-        out.removeValue(forKey: "projectn")
         return out
+    }
+
+    /// Claude Code's MCP servers an agent working in these projects could get, with where each comes from
+    /// (shown in the agent editor so each one can be turned off). Claude in Chrome comes first.
+    nonisolated static func claudeMCPCatalog(projects: [(name: String, path: String)], home: String = NSHomeDirectory()) -> [ClaudeMCPEntry] {
+        let json = claudeJSON(home: home)
+        var entries: [String: ClaudeMCPEntry] = [:]
+        for (k, v) in userClaudeMCPServers(json) {
+            entries[k] = ClaudeMCPEntry(name: k, summary: (v as? [String: Any]).map { MCPConfig.parse(k, $0).summary } ?? "", scope: [])
+        }
+        for p in projects {
+            for (k, v) in projectClaudeMCPServers(projectPath: p.path, claudeJSON: json) {
+                if entries[k] == nil {
+                    entries[k] = ClaudeMCPEntry(name: k, summary: (v as? [String: Any]).map { MCPConfig.parse(k, $0).summary } ?? "", scope: [p.name])
+                } else if !(entries[k]!.scope.isEmpty) {
+                    entries[k]!.scope.append(p.name)
+                }
+            }
+        }
+        entries.removeValue(forKey: "projectn")
+        let chrome = ClaudeMCPEntry(name: ClaudeMCPEntry.chromeName, summary: "Claude Code's browser integration (screenshots are heavy on tokens)", scope: [])
+        return [chrome] + entries.values.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
     }
 
     /// `--settings` JSON registering the PreToolUse hook for every tool.
@@ -322,7 +358,7 @@ extension AgentHarness {
             let projectPath = store?.project(t.projectID)?.path ?? ""
             let inherited = Array(Self.claudeCodeMCPServers(projectPath: projectPath).keys)
             let list = availableAgents().filter { $0.id != profile.id }.map { p -> [String: Any] in
-                let servers = Set(p.mcpServers + (p.useClaudeMCP && p.runtime == .claudeCode ? inherited : []))
+                let servers = Set(p.mcpServers + inherited.filter(p.usesClaudeMCP))
                 return ["name": p.name, "role": p.role, "runtime": p.runtime.label, "model": p.model, "access": p.permission.label,
                         "autonomy": p.autoMode ? "Auto mode" : p.autonomy.label,
                         "projects": p.allProjects ? "all" : (store?.state.projects.filter { p.mayAccess($0.id) }.map(\.name).joined(separator: ", ") ?? ""),
@@ -366,7 +402,8 @@ extension AgentHarness {
             switch submit(AgentTaskRequest(agentID: target.id, projectID: projectID, instruction: instruction, origin: origin, dependsOn: deps)) {
             case .success(let child):
                 reply(Self.json(["task_id": child.id.uuidString, "agent": child.agentName, "project": child.projectName,
-                                 "status": child.status.rawValue, "next": "Call wait_for_tasks to follow it."]), false)
+                                 "status": child.status.rawValue,
+                                 "next": "Delegate anything else, then end your turn: the result arrives as a new message. Use wait_for_tasks only if it will finish within a minute or two."]), false)
             case .failure(let e):
                 reply("Couldn't delegate: \(e.description)", true)
             }
@@ -483,7 +520,7 @@ extension AgentHarness {
             out["all_finished"] = allDone
             if children.isEmpty { out["note"] = "You have no delegated tasks." }
             else if !allDone && pending.isEmpty {
-                out["note"] = "Still running. Call wait_for_tasks again, or end your turn telling the user what is in progress: each result will be sent to you as a new message."
+                out["note"] = "Still running. End your turn telling the user what is in progress: each result will be sent to you as a new message. Wait again only if it is about to finish."
             }
             reply(Self.json(out), false)
             return
@@ -519,7 +556,8 @@ extension AgentHarness {
     }
 
     static func json(_ obj: Any) -> String {
-        (try? JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted, .sortedKeys]))
+        // Compact: tool output is read by the model, and every byte stays in its context.
+        (try? JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys]))
             .flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
     }
 }
@@ -539,14 +577,14 @@ enum AgentTools {
         guard canDelegate else { return tools }
         tools += [
             tool("list_agents", "List the agents you can delegate to: role, runtime, access, projects, MCP servers and CLI tools.", [:], []),
-            tool("delegate_task", "Start a task for another agent (a new session). Returns its task_id; follow it with wait_for_tasks.",
+            tool("delegate_task", "Start a task for another agent. Returns its task_id; its result is sent to you as a new message when it finishes.",
                  ["agent": str("Agent name from list_agents."),
                   "instruction": str("What to do, including what done means."),
                   "context": str("Everything the agent needs that it can't see (it doesn't see your conversation): the goal in the user's words, where the inputs live — e.g. Notion task database / pages with links and IDs, site URLs, files —, what's known or decided, constraints, who to ask."),
                   "project": str("Project name; default: your project."),
                   "depends_on": ["type": "array", "items": ["type": "string"], "description": "task_ids that must complete first."]],
                  ["agent", "instruction", "context"]),
-            tool("wait_for_tasks", "Wait (up to 90 s per call) until your delegated tasks finish, or until one of your agents needs an approval or an answer from you. Returns their status/results and requests_for_you. For long work you may instead end your turn: results are sent to you as new messages.",
+            tool("wait_for_tasks", "Wait (up to 90 s per call) until your delegated tasks finish or one of your agents needs an approval / answer from you. Only for work about to finish: for anything longer end your turn instead (results and requests are sent to you as new messages).",
                  ["task_ids": ["type": "array", "items": ["type": "string"], "description": "Default: all your delegated tasks."],
                   "timeout_seconds": ["type": "number", "description": "Max wait (5–90, default 90)."]], []),
             tool("get_task", "Status and result of one of your delegated tasks.", ["task_id": str("The task_id.")], ["task_id"]),
@@ -563,5 +601,19 @@ enum AgentTools {
                   "description": str("One or two sentences for the README.")], ["name"]),
         ]
         return tools
+    }
+}
+
+/// A Claude Code MCP server as listed in the agent editor.
+struct ClaudeMCPEntry: Identifiable, Hashable {
+    /// Pseudo-server for Claude in Chrome (not an `mcpServers` entry: turned off with `--no-chrome`).
+    static let chromeName = "claude-in-chrome"
+    var id: String { name }
+    var name: String
+    var summary: String
+    /// Projects it belongs to; empty = yours, in every project.
+    var scope: [String]
+    var scopeLabel: String {
+        name == Self.chromeName ? "Claude Code" : scope.isEmpty ? "All projects" : scope.joined(separator: ", ")
     }
 }

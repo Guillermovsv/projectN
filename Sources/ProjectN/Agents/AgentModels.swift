@@ -186,6 +186,9 @@ struct AgentProfile: Codable, Identifiable, Hashable {
     var autoMode: Bool = false
     /// Also load the MCP servers configured in Claude Code (~/.claude.json: yours + the project's).
     var useClaudeMCP = true
+    /// Claude Code MCP servers (names) this agent doesn't get even with `useClaudeMCP`. Also holds
+    /// `ClaudeMCPEntry.chromeName` to start the session without Claude in Chrome (`--no-chrome`).
+    var claudeMCPDisabled: [String] = []
     /// Simultaneous tasks of this profile (across all projects).
     var concurrencyLimit: Int = 2
     /// A task is stopped after this many minutes.
@@ -235,6 +238,11 @@ struct AgentProfile: Codable, Identifiable, Hashable {
     }
 
     func mayAccess(_ projectID: UUID) -> Bool { allProjects || projectIDs.contains(projectID) }
+
+    /// Whether this agent gets that Claude Code MCP server (or Claude in Chrome).
+    func usesClaudeMCP(_ name: String) -> Bool {
+        runtime == .claudeCode && useClaudeMCP && !claudeMCPDisabled.contains(name)
+    }
 
     /// The Project Manager's instructions on installs before autonomous agents (replaced once if unchanged).
     static let legacyProjectManagerInstructions = """
@@ -287,6 +295,7 @@ struct AgentProfile: Codable, Identifiable, Hashable {
         autonomy = (try? c.decode(AgentAutonomy.self, forKey: .autonomy)) ?? d.autonomy
         autoMode = (try? c.decode(Bool.self, forKey: .autoMode)) ?? false
         useClaudeMCP = (try? c.decode(Bool.self, forKey: .useClaudeMCP)) ?? d.useClaudeMCP
+        claudeMCPDisabled = (try? c.decode([String].self, forKey: .claudeMCPDisabled)) ?? []
         concurrencyLimit = max(1, (try? c.decode(Int.self, forKey: .concurrencyLimit)) ?? d.concurrencyLimit)
         timeoutMinutes = max(1, (try? c.decode(Int.self, forKey: .timeoutMinutes)) ?? d.timeoutMinutes)
         enabled = (try? c.decode(Bool.self, forKey: .enabled)) ?? true
@@ -383,6 +392,8 @@ struct TokenUsage: Codable, Hashable {
     var outputTokens = 0
     var cacheReadTokens = 0
     var cacheWriteTokens = 0
+    /// Size of the conversation at the last model call (input + cache): what every further step re-reads.
+    var contextTokens: Int?
     var total: Int { inputTokens + outputTokens + cacheReadTokens + cacheWriteTokens }
 }
 
@@ -526,6 +537,9 @@ struct AgentPolicy: Codable, Equatable {
     var requestTimeoutMinutes = 60
     /// Per-project sessions idle longer than this start fresh.
     var sessionIdleHours = 12
+    /// Per-project sessions whose conversation grew past this many thousand tokens start fresh (with a short recap)
+    /// instead of continuing: every step of a session re-reads its whole conversation.
+    var maxSessionContextK = 120
     /// Profiles were moved to per-project sessions once (older installs defaulted to a new session per message).
     var perProjectSessionsMigrated = false
     /// Second migration: "resume only when asked" → per project, orchestrators off Haiku, PM instructions.
@@ -548,6 +562,7 @@ struct AgentPolicy: Codable, Equatable {
         maxTasksPerRequest = (try? c.decode(Int.self, forKey: .maxTasksPerRequest)) ?? d.maxTasksPerRequest
         requestTimeoutMinutes = (try? c.decode(Int.self, forKey: .requestTimeoutMinutes)) ?? d.requestTimeoutMinutes
         sessionIdleHours = (try? c.decode(Int.self, forKey: .sessionIdleHours)) ?? d.sessionIdleHours
+        maxSessionContextK = max(40, (try? c.decode(Int.self, forKey: .maxSessionContextK)) ?? d.maxSessionContextK)
         perProjectSessionsMigrated = (try? c.decode(Bool.self, forKey: .perProjectSessionsMigrated)) ?? false
         autonomyMigrated = (try? c.decode(Bool.self, forKey: .autonomyMigrated)) ?? false
         idleCloseMinutes = max(5, (try? c.decode(Int.self, forKey: .idleCloseMinutes)) ?? d.idleCloseMinutes)

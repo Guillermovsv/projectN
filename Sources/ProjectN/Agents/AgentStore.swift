@@ -201,8 +201,10 @@ enum ContextLoader {
         var readmeFound = false
     }
 
-    static let perFileLimit = 24_000
-    static let totalLimit = 60_000
+    // Characters. Whatever goes into the first message is re-read on every step of the session: keep it small;
+    // the agent can open the rest of a file itself when it needs it.
+    static let perFileLimit = 12_000
+    static let totalLimit = 30_000
     static let readmeNames = ["README.md", "README.MD", "Readme.md", "readme.md", "README", "README.txt", "README.rst"]
 
     static func load(projectPath: String, sources: [String]) -> Bundle {
@@ -282,6 +284,10 @@ enum PromptComposer {
           the information can't be found anywhere.
         - The user may send new messages while you work ("## New message from the user"): take them into account
           right away, without restarting what's already done.
+        - Be economical: everything you read or write stays in this session and is re-read on every step. Search
+          before reading and read only the parts of files you need; cap long command output (`| head`, `| tail`,
+          quiet flags); prefer page text / DOM queries over screenshots; don't fetch again what you already have;
+          don't paste file contents or long tool output into your messages; skip narration between steps.
         - Finish with a clear, short, self-contained answer: it is sent back to the requester as-is (often to a
           Slack chat). Don't end with questions about things you could decide yourself.
         - Format the answer for chat: a one-line summary first, then short sections with `##` headings only if
@@ -336,12 +342,14 @@ enum PromptComposer {
               URLs, files), what is already known or decided, constraints, and who to ask. Never just "check the
               project": point to the exact source (e.g. "the tasks are T1–T12 in Notion › Project Hub › Tasks,
               linked to <project page URL>").
-            - Short tasks: `wait_for_tasks` (it waits up to 90 s per call; call it again while they run). It also
-              returns approval requests and questions from your agents: handle each with `answer_request` — approve
-              routine work you are confident about; `escalate` (to the user) anything risky or unclear.
-            - Long tasks: you may end your turn after delegating, saying what is in progress and with whom. ProjectN
-              sends you each delegated task's result as a new message in this session when it finishes; then review
-              it and give the user the combined answer.
+            - After delegating, usually end your turn: say in one or two lines what is in progress and with whom.
+              ProjectN sends you each delegated task's result as a new message in this session when it finishes;
+              then review it and give the user the combined answer. While you are working, approval requests and
+              questions from your agents reach you as messages: handle each with `answer_request` — approve routine
+              work you are confident about; `escalate` (to the user) anything risky or unclear. After your turn ends
+              they go to the user.
+            - `wait_for_tasks` only for work that will finish within a minute or two: each call re-reads your whole
+              conversation, so don't poll long tasks with it.
             - If the work needs a project that doesn't exist yet, `create_project` makes one; then delegate into it
               with `delegate_task(project: …)`.
             """
@@ -386,7 +394,7 @@ enum PromptComposer {
                 s += "<untrusted_file path=\"\(f.relativePath)\" boundary=\"\(boundary)\">\n"
                 // Neutralise an attempt to close the block early.
                 s += f.text.replacingOccurrences(of: "</untrusted_file", with: "</untrusted-file")
-                if f.truncated { s += "\n[… truncated by ProjectN …]" }
+                if f.truncated { s += "\n[… truncated by ProjectN; read the file for the rest if you need it …]" }
                 s += "\n</untrusted_file boundary=\"\(boundary)\">\n\n"
             }
         }

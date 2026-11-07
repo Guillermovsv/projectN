@@ -227,7 +227,7 @@ struct AgentUnitTests {
         snap = TranscriptReader.parseClaude(lines(entries))
         #expect(snap.finished && snap.result == "Tareas: 1. login")
         // Usage counted once per message id.
-        #expect(snap.usage == TokenUsage(inputTokens: 20, outputTokens: 10, cacheReadTokens: 200, cacheWriteTokens: 2))
+        #expect(snap.usage == TokenUsage(inputTokens: 20, outputTokens: 10, cacheReadTokens: 200, cacheWriteTokens: 2, contextTokens: 111))
         // A new user prompt starts a new turn.
         entries.append(["type": "user", "message": ["role": "user", "content": "otra"]])
         #expect(!TranscriptReader.parseClaude(lines(entries)).finished)

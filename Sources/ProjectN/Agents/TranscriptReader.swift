@@ -80,6 +80,8 @@ enum TranscriptReader {
                     usage.outputTokens += (u["output_tokens"] as? Int) ?? 0
                     usage.cacheReadTokens += (u["cache_read_input_tokens"] as? Int) ?? 0
                     usage.cacheWriteTokens += (u["cache_creation_input_tokens"] as? Int) ?? 0
+                    usage.contextTokens = ((u["input_tokens"] as? Int) ?? 0) + ((u["cache_read_input_tokens"] as? Int) ?? 0)
+                        + ((u["cache_creation_input_tokens"] as? Int) ?? 0)
                 }
                 for part in (m["content"] as? [[String: Any]]) ?? [] {
                     switch part["type"] as? String {
@@ -143,6 +145,7 @@ enum TranscriptReader {
                 u.inputTokens = (t["input_tokens"] as? Int) ?? 0
                 u.cacheReadTokens = (t["cached_input_tokens"] as? Int) ?? 0
                 u.outputTokens = (t["output_tokens"] as? Int) ?? 0
+                if let last = info["last_token_usage"] as? [String: Any] { u.contextTokens = last["input_tokens"] as? Int }
                 snap.usage = u
             } else if type == "response_item", ptype == "message", p["role"] as? String == "assistant" {
                 let parts = (p["content"] as? [[String: Any]]) ?? []

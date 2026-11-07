@@ -421,6 +421,7 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
             args += ["--append-system-prompt", PromptComposer.systemPrompt(profile: profile, project: project, capabilities: tools)]
             // Built-in tools for the access level (or the profile's own selection). MCP tools aren't affected.
             if let tools = AgentToolCatalog.claudeFlag(profile) { args += ["--tools", tools] }
+            if !profile.usesClaudeMCP(ClaudeMCPEntry.chromeName) { args.append("--no-chrome") }
             // Only this agent's MCP servers (+ ProjectN's), never the user's global MCP setup.
             if let file = writeMCPConfig(task: t, profile: profile, helper: helper) {
                 args += ["--strict-mcp-config", "--mcp-config", file.path]
@@ -476,7 +477,26 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
         guard prev.runtime == p.runtime, prev.status != .failed else { return nil }
         let lastUsed = prev.finishedAt ?? Date()
         guard Date().timeIntervalSince(lastUsed) < Double(max(1, policy.sessionIdleHours) * 3600) else { return nil }
+        // A long conversation is re-read on every step: past the limit, start fresh (the new session gets a recap).
+        if let size = sessionContextTokens(prev), size >= policy.maxSessionContextK * 1000 {
+            AuditLog.record("session.rotated", ["agent": prev.agentName, "project": prev.projectName,
+                                                "session": prev.sessionID ?? "", "context_tokens": String(size)])
+            return nil
+        }
         return prev
+    }
+
+    /// Conversation size of the session `t` belongs to, at its last model call (walks back to the last task of
+    /// the session that recorded usage: a queued continuation has none yet).
+    func sessionContextTokens(_ t: AgentTask) -> Int? {
+        var cur: AgentTask? = t
+        var seen = Set<UUID>()
+        while let c = cur, !seen.contains(c.id) {
+            seen.insert(c.id)
+            if let n = c.usage?.contextTokens { return n }
+            cur = c.resumedFromTaskID.flatMap(task)
+        }
+        return nil
     }
 
     /// The session's terminal is still running: type the next message into it (no new process, no context reload).

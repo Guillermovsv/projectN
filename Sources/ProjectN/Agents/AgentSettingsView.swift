@@ -115,6 +115,7 @@ struct AgentEditor: View {
     @State private var tab: EditorTab = .general
     @State private var editingSchedule: AgentSchedule?
     @State private var importingMCP = false
+    @State private var claudeMCP: [ClaudeMCPEntry] = []
     private let original: AgentProfile
 
     enum EditorTab: String, CaseIterable, Identifiable {
@@ -403,14 +404,55 @@ struct AgentEditor: View {
 
     // MARK: Integrations
 
+    private func loadClaudeMCP() {
+        let projects = store.state.projects.filter { draft.mayAccess($0.id) }.map { (name: $0.name, path: $0.path) }
+        claudeMCP = AgentHarness.claudeMCPCatalog(projects: projects)
+    }
+
     @ViewBuilder private var integrationsTab: some View {
         if draft.runtime == .claudeCode {
             Section {
-                Toggle("Also use Claude Code's MCP servers", isOn: $draft.useClaudeMCP)
+                Toggle("Use Claude Code's MCP servers", isOn: $draft.useClaudeMCP)
+                if draft.useClaudeMCP {
+                    if claudeMCP.count <= 1 {
+                        Text("No MCP servers set up in Claude Code for this agent's projects.").font(.caption).foregroundStyle(.secondary)
+                    }
+                    ForEach(claudeMCP) { m in
+                        Toggle(isOn: Binding(get: { !draft.claudeMCPDisabled.contains(m.name) },
+                                             set: { on in
+                                                 draft.claudeMCPDisabled.removeAll { $0 == m.name }
+                                                 if !on { draft.claudeMCPDisabled.append(m.name) }
+                                             })) {
+                            VStack(alignment: .leading, spacing: 1) {
+                                HStack(spacing: 6) {
+                                    Text(m.name)
+                                    Text(m.scopeLabel).font(.caption2).foregroundStyle(.secondary)
+                                        .padding(.horizontal, 5).padding(.vertical, 1)
+                                        .background(Capsule().fill(Color.secondary.opacity(0.12)))
+                                }
+                                Text(m.summary).font(.caption.monospaced()).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+                            }
+                        }
+                    }
+                }
+            } header: {
+                HStack {
+                    Text("Claude Code MCP servers")
+                    Spacer()
+                    if draft.useClaudeMCP, claudeMCP.count > 1 {
+                        Button("All on") { draft.claudeMCPDisabled.removeAll { n in claudeMCP.contains { $0.name == n } } }.font(.caption)
+                        Button("All off") {
+                            draft.claudeMCPDisabled = Array(Set(draft.claudeMCPDisabled + claudeMCP.map(\.name))).sorted()
+                        }.font(.caption)
+                    }
+                }
             } footer: {
-                Text("The servers you set up in Claude Code (yours and each project's, from ~/.claude.json and .mcp.json) — e.g. WordPress / Elementor — are available to this agent too.")
+                Text("From Claude Code: yours (~/.claude.json, every project) and each project's (~/.claude.json, .mcp.json). Every server adds its tools to each step of the session: turn off the ones this agent doesn't need to save tokens.")
                     .font(.caption).foregroundStyle(.secondary)
             }
+            .onAppear(perform: loadClaudeMCP)
+            .onChange(of: draft.allProjects) { _, _ in loadClaudeMCP() }
+            .onChange(of: draft.projectIDs) { _, _ in loadClaudeMCP() }
         }
         Section {
             let library = MCPConfig.load()
@@ -428,7 +470,7 @@ struct AgentEditor: View {
             }
             Button { importingMCP = true } label: { Label("Add from JSON…", systemImage: "curlybraces") }
         } header: { Text("MCP servers") } footer: {
-            Text("The checked servers (plus ProjectN's own\(draft.useClaudeMCP && draft.runtime == .claudeCode ? " and Claude Code's" : "")) are loaded for this agent. Tools that read run freely; tools that delete or publish ask you.")
+            Text("The checked servers (plus ProjectN's own\(draft.useClaudeMCP && draft.runtime == .claudeCode ? " and the Claude Code ones turned on above" : "")) are loaded for this agent. Tools that read run freely; tools that delete or publish ask you.")
                 .font(.caption).foregroundStyle(.secondary)
         }
         Section {
@@ -911,6 +953,7 @@ struct AutonomySettingsView: View {
                 Stepper("Max delegated tasks per request: \(agents.policy.maxTasksPerRequest)", value: binding.maxTasksPerRequest, in: 1...50)
                 Stepper("Approvals & questions expire after \(agents.policy.requestTimeoutMinutes) min", value: binding.requestTimeoutMinutes, in: 5...480, step: 5)
                 Stepper("Project sessions start fresh after \(agents.policy.sessionIdleHours) h unused", value: binding.sessionIdleHours, in: 1...168)
+                Stepper("…or once their conversation passes \(agents.policy.maxSessionContextK)k tokens (saves tokens)", value: binding.maxSessionContextK, in: 40...400, step: 20)
                 Stepper("Stop an idle session's process after \(agents.policy.idleCloseMinutes) min", value: binding.idleCloseMinutes, in: 5...240, step: 5)
                 Stepper("Idle sessions kept running per agent: \(agents.policy.maxIdleSessionsPerAgent)", value: binding.maxIdleSessionsPerAgent, in: 1...8)
                 Text("A stopped session keeps its terminal and conversation: the next message resumes it.")

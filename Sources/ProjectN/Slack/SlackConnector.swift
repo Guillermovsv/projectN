@@ -573,7 +573,11 @@ final class SlackConnector: ObservableObject {
         let thread = t.origin.slackThreadTS   // nil only for a scheduled run whose start couldn't be posted
         var footer: [String] = []
         if let d = t.duration { footer.append("\(Int(d / 60)) min \(Int(d) % 60) s") }
-        if let u = t.usage { footer.append("\(u.outputTokens.formatted()) output tokens (\(u.total.formatted()) incl. cache)") }
+        if let u = t.usage {
+            var line = "\(u.outputTokens.formatted()) output tokens (\(u.total.formatted()) incl. cache)"
+            if let c = u.contextTokens { line += " · session \(c / 1000)k" }
+            footer.append(line)
+        }
         let notes = t.notes.isEmpty ? "" : "\n" + t.notes.map { "ℹ️ \($0)" }.joined(separator: "\n")
         switch t.status {
         case .completed:

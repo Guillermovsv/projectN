@@ -156,7 +156,7 @@ struct AutonomyTests {
         let child = try #require(env.harness.tasks.first { $0.origin.parentTaskID == pm.id })
         #expect(child.depth == 1 && child.rootTaskID == pm.id && child.origin.delegatedBy == "Project Manager")
         #expect(child.origin.slackThreadTS == "2.1")
-        #expect(r1.count == 2 && r1[1].contains("\"all_finished\" : true") && r1[1].contains("RESULT-new"))
+        #expect(r1.count == 2 && r1[1].contains("\"all_finished\":true") && r1[1].contains("RESULT-new"))
         try await waitUntil { env.posts.texts(thread: "2.1").contains { $0.contains("↳ *Project Manager* delegó a *Developer*") } }
 
         // The developer's session has only `ask` (it can't delegate).
@@ -352,7 +352,7 @@ struct AutonomyTests {
         // 2. An agent's create_project: created directly (balanced autonomy)…
         let pm = try await startPM(env, ts: "8.4")
         let (_, direct) = await mcp([("create_project", ["name": "Directo PM"])], task: pm.id, env: env)
-        #expect(direct.first?.contains("\"project\" : \"Directo PM\"") == true)
+        #expect(direct.first?.contains("\"project\":\"Directo PM\"") == true)
         #expect(FileManager.default.fileExists(atPath: base.appendingPathComponent("Directo PM/README.md").path))
         // …or, for a cautious agent, it asks you; denied → nothing; approved → created.
         if var cautious = env.harness.profile(pm.agentID) { cautious.autonomy = .cautious; env.harness.saveProfile(cautious) }
@@ -367,7 +367,7 @@ struct AutonomyTests {
         async let approved = mcp([("create_project", ["name": "Sitio Florina", "description": "Web nueva."])], task: pm.id, env: env)
         try await waitUntil { env.harness.pendingUserRequests().contains { $0.summary.contains("Sitio Florina") } }
         env.harness.resolveRequest(env.harness.pendingUserRequests()[0].id, approve: true, by: "you")
-        #expect(await approved.results.first?.contains("\"project\" : \"Sitio Florina\"") == true)
+        #expect(await approved.results.first?.contains("\"project\":\"Sitio Florina\"") == true)
         #expect(env.store.state.projects.contains { $0.name == "Sitio Florina" })
         #expect(try String(contentsOf: base.appendingPathComponent("Sitio Florina/README.md"), encoding: .utf8).contains("Web nueva."))
         env.harness.cancel(pm.id)
@@ -546,6 +546,74 @@ struct AutonomyTests {
     }
 
     // MARK: Per-project sessions (default)
+
+    @Test func claudeMCPServersCanBeTurnedOffOneByOne() async throws {
+        let env = try await makeEnv()
+        defer { env.store.terminateAll() }
+        // A project with its own Claude Code servers (.mcp.json), and a home with yours (~/.claude.json).
+        let mcp = ["mcpServers": ["elementor": ["command": "npx", "args": ["elementor-mcp"]], "notion": ["url": "https://mcp.notion.com", "type": "http"]]]
+        try JSONSerialization.data(withJSONObject: mcp).write(to: URL(fileURLWithPath: env.project.path).appendingPathComponent(".mcp.json"))
+        let home = TestHome.url.appendingPathComponent("claude-home-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+        try JSONSerialization.data(withJSONObject: ["mcpServers": ["zernio": ["command": "zernio"], "projectn": ["command": "x"]]])
+            .write(to: home.appendingPathComponent(".claude.json"))
+
+        let catalog = AgentHarness.claudeMCPCatalog(projects: [(env.project.name, env.project.path)], home: home.path)
+        #expect(catalog.map(\.name) == [ClaudeMCPEntry.chromeName, "elementor", "notion", "zernio"])
+        #expect(catalog.first { $0.name == "zernio" }?.scopeLabel == "All projects")
+        #expect(catalog.first { $0.name == "notion" }?.scopeLabel == env.project.name)
+        #expect(catalog.first { $0.name == "elementor" }?.summary == "npx elementor-mcp")
+
+        // Turned off: not in the session's MCP config; Claude in Chrome off → --no-chrome.
+        var pm = try #require(env.harness.profiles.first)
+        pm.claudeMCPDisabled = ["elementor", ClaudeMCPEntry.chromeName]
+        env.harness.saveProfile(pm)
+        let t = AgentTask(agentID: pm.id, agentName: pm.name, projectID: env.project.id, projectName: env.project.name,
+                          instruction: "x", origin: .local, runtime: .claudeCode, model: pm.model, effort: nil, permission: pm.permission)
+        let file = try #require(env.harness.writeMCPConfig(task: t, profile: pm, helper: nil))
+        let written = try #require(try JSONSerialization.jsonObject(with: Data(contentsOf: file)) as? [String: Any])
+        let names = Set((written["mcpServers"] as? [String: Any] ?? [:]).keys)
+        #expect(names.contains("notion") && !names.contains("elementor"))
+        #expect(pm.usesClaudeMCP("notion") && !pm.usesClaudeMCP(ClaudeMCPEntry.chromeName))
+        pm.useClaudeMCP = false
+        #expect(!pm.usesClaudeMCP("notion"))
+
+        let started = try await startPM(env, ts: "31.1")
+        let argsFile = TestHome.url.appendingPathComponent("fake/args-\(env.harness.task(started.id)?.sessionID ?? "")-new")
+        try await waitUntil { ((try? String(contentsOf: argsFile, encoding: .utf8)) ?? "").contains("## Request") }
+        #expect(((try? String(contentsOf: argsFile, encoding: .utf8)) ?? "").contains("--no-chrome"))
+    }
+
+    @Test func aSessionPastTheContextLimitStartsFreshWithARecap() async throws {
+        let env = try await makeEnv()
+        defer { env.store.terminateAll() }
+        env.slack.settings.replyInThreads = false
+        var pm = try #require(env.harness.profiles.first)
+        pm.sessionPolicy = .perProject
+        env.harness.saveProfile(pm)
+        func say(_ text: String, _ ts: String) {
+            env.slack.handle(event: ["type": "message", "channel_type": "im", "user": "U1", "channel": "D1", "ts": ts,
+                                     "text": text], eventID: "Ev\(ts)")
+        }
+        say("Project Manager, revisa Demo y dime qué falta", "21.1")
+        var first = try #require(env.harness.tasks.last)
+        try await waitUntil { env.harness.task(first.id)?.status == .completed }
+        first = try #require(env.harness.task(first.id))
+        #expect(first.usage?.contextTokens == 10)   // read from the transcript
+
+        // The conversation grew past the limit: the next message starts a new session, with a recap.
+        var big = first
+        big.usage?.contextTokens = env.harness.policy.maxSessionContextK * 1000 + 1
+        env.harness.replaceTask(big)
+        say("Project Manager, ahora prioriza esas tareas", "21.2")
+        let second = try #require(env.harness.tasks.last)
+        #expect(second.continuedSession != true && second.resumedFromTaskID == nil)
+        try await waitUntil { env.harness.task(second.id)?.status == .completed }
+        let sid = try #require(env.harness.task(second.id)?.sessionID)
+        #expect(sid != first.sessionID)
+        let args = (try? String(contentsOf: TestHome.url.appendingPathComponent("fake/args-\(sid)-new"), encoding: .utf8)) ?? ""
+        #expect(args.contains("## Earlier in this conversation") && args.contains("revisa Demo y dime qué falta"))
+    }
 
     @Test func messagesAboutTheSameProjectContinueOneSession() async throws {
         let env = try await makeEnv()

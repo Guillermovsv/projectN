@@ -30,15 +30,19 @@ enum MCPConfig {
         let raw = loadRaw()
         let servers = raw["mcpServers"] as? [String: Any] ?? [:]
         return servers.compactMap { name, value in
-            guard let dict = value as? [String: Any] else { return nil }
-            var s = MCPServer(name: name)
-            s.command = dict["command"] as? String ?? ""
-            s.args = dict["args"] as? [String] ?? []
-            s.env = dict["env"] as? [String: String] ?? [:]
-            s.url = dict["url"] as? String ?? ""
-            s.type = dict["type"] as? String ?? (s.url.isEmpty ? "stdio" : "http")
-            return s
+            (value as? [String: Any]).map { parse(name, $0) }
         }.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
+    /// One `mcpServers` entry (ProjectN's or Claude Code's format: they're the same).
+    static func parse(_ name: String, _ dict: [String: Any]) -> MCPServer {
+        var s = MCPServer(name: name)
+        s.command = dict["command"] as? String ?? ""
+        s.args = dict["args"] as? [String] ?? []
+        s.env = dict["env"] as? [String: String] ?? [:]
+        s.url = dict["url"] as? String ?? ""
+        s.type = dict["type"] as? String ?? (s.url.isEmpty ? "stdio" : "http")
+        return s
     }
 
     static func upsert(_ server: MCPServer, replacing oldName: String? = nil) {
