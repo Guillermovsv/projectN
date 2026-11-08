@@ -682,6 +682,19 @@ struct AutonomyTests {
         #expect(resumed.projectID == env.other.id && resumed.sessionID == other.sessionID)
         try await waitUntil { env.harness.task(resumed.id)?.status == .completed }
         #expect(env.harness.task(resumed.id)?.result == "RESULT-resume: 1. Arreglar login")
+
+        // ProjectN restarted and restored the terminal: the process runs but holds no live token (no ProjectN
+        // tools, no approval hook). The next message must not be typed into it: it resumes in a connected process.
+        let restoredProcess = try #require(env.store.runtimes[resumed.paneID!])
+        #expect(restoredProcess.isRunning)
+        if let stale = env.harness.tokenOfTask.removeValue(forKey: resumed.id) { env.harness.tokens.removeValue(forKey: stale) }
+        say("Project Manager, delega la revisión de Tienda", "11.8")
+        let reconnected = try #require(env.harness.tasks.last)
+        #expect(reconnected.id != resumed.id && reconnected.sessionID == other.sessionID)   // same conversation…
+        try await waitUntil { env.harness.task(reconnected.id)?.paneID.flatMap { env.store.runtimes[$0] }.map { $0 !== restoredProcess } == true }   // …in a new process
+        let fresh2 = try #require(env.harness.tokenOfTask[reconnected.id])
+        #expect(env.harness.tokens[fresh2] == reconnected.id)
+        try await waitUntil { env.harness.task(reconnected.id)?.status == .completed }
     }
 
     @Test func delegatedResultsComeBackToTheCoordinatorsSession() async throws {

@@ -512,7 +512,11 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
     private func continueInPlace(_ t: inout AgentTask, after prev: AgentTask) -> Bool {
         guard let store, let paneID = prev.paneID, let wid = prev.workspaceID, let rt = store.runtimes[paneID], rt.isRunning,
               let (_, pane) = store.pane(paneID, in: wid), pane.agentTaskID == prev.id, let sid = prev.sessionID,
-              prev.model == t.model, !rt.needsInput else { return false }
+              prev.model == t.model, !rt.needsInput,
+              // Only a process ProjectN started this run holds a live token: one restored after an app restart has
+              // none (tokens live in memory), so its ProjectN tools and approval hook can't reach the app. Resume
+              // the conversation in a fresh, connected process instead.
+              tokenOfTask[prev.id] != nil else { return false }
         let url = t.runtime == .claudeCode
             ? TranscriptReader.claudeTranscript(sessionID: sid, settings: store.settings)
             : TranscriptReader.codexTranscript(sessionID: sid, settings: store.settings)
