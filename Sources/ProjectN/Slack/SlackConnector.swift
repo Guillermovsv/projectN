@@ -462,6 +462,8 @@ final class SlackConnector: ObservableObject {
             requestCreated(r, task: t, channel: channel, thread: thread, bot: bot)
         case .requestResolved(let r):
             requestResolved(r, channel: channel, thread: thread, bot: bot)
+        case .requestReminder(let r, let minutes):
+            requestReminder(r, minutes: minutes, task: t, channel: channel, thread: thread, bot: bot)
         }
     }
 
@@ -523,6 +525,21 @@ final class SlackConnector: ObservableObject {
         case .orchestrator:
             guard settings.notifyApprovals else { return }
             post(channel, thread, "🤖 *\(t.agentName)* consulta a *\(t.origin.delegatedBy ?? "su coordinador")*: `\(ApprovalPolicy.clip(r.summary))`", bot: bot, as: t.agentID)
+        }
+    }
+
+    /// Still unanswered: posted again (with buttons) at the bottom of the conversation, where you'll see it.
+    private func requestReminder(_ r: AgentRequest, minutes: Int, task t: AgentTask, channel: String, thread: String, bot: String) {
+        let what = r.kind == .approval ? "tu aprobación" : "tu respuesta"
+        let text = "⏰ *\(t.agentName)* sigue esperando \(what) desde hace \(minutes) min — está detenido hasta que contestes:\n```\(r.summary)```"
+            + (r.kind == .approval ? "\n(o responde *aprobar* / *rechazar* \(replyHere))" : "\n_Responde \(replyHere)._")
+        let old = requestMessages[r.id]
+        Task {
+            let blocks: [[String: Any]]? = r.kind == .approval ? Self.approvalBlocks(text, requestID: r.id) : nil
+            if let ts = await send(channel, thread, text, blocks: blocks, bot: bot, as: t.agentID) {
+                requestMessages[r.id] = (channel, ts, bot)
+                if let old { await update(old.channel, old.ts, "*\(r.agentName)*: `\(ApprovalPolicy.clip(r.summary))`\n⏰ Recordatorio más abajo ↓", bot: old.bot) }
+            }
         }
     }
 

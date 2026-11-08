@@ -348,6 +348,10 @@ enum PromptComposer {
               questions from your agents reach you as messages: handle each with `answer_request` — approve routine
               work you are confident about; `escalate` (to the user) anything risky or unclear. After your turn ends
               they go to the user.
+            - When the user asks how things are going, or you're waiting on an agent, call `list_agents`: `working_on`
+              shows each agent's live tasks, how long they've run, and `blocked_on_user` when one is stopped on an
+              approval or question. Never say an agent "is working" without checking: if it's blocked, tell the user
+              exactly what it is waiting for. `get_task` gives details; `message_task` sends it a message.
             - `wait_for_tasks` only for work that will finish within a minute or two: each call re-reads your whole
               conversation, so don't poll long tasks with it.
             - If the work needs a project that doesn't exist yet, `create_project` makes one; then delegate into it

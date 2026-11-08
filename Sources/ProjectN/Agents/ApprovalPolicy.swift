@@ -146,7 +146,9 @@ enum ApprovalPolicy {
                                            "reflog", "grep", "remote", "config", "branch", "tag", "fetch", "cat-file", "ls-tree", "whatchanged"]
 
     static func classifyCommand(_ command: String, _ ctx: Context) -> ApprovalTier {
-        let trimmed = command.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Heredoc bodies are data (file contents, scripts piped in), not commands: JSX `/>` or a regex there
+        // isn't a path. The command line that writes them (`cat > file <<EOF`) is still judged.
+        let trimmed = stripHeredocs(command).trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return .allow }
         var verdict = ApprovalTier.allow
         let lower = trimmed.lowercased()
@@ -168,6 +170,28 @@ enum ApprovalPolicy {
             if case .deny = verdict { return verdict }
         }
         return verdict
+    }
+
+    /// Removes heredoc bodies (`<<EOF`, `<<'EOF'`, `<<-EOF` … up to the closing word), keeping the command lines.
+    static func stripHeredocs(_ command: String) -> String {
+        guard command.contains("<<"), let re = try? NSRegularExpression(pattern: #"<<-?\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\1"#) else { return command }
+        var out: [String] = []
+        var closing: [(word: String, dash: Bool)] = []
+        for line in command.components(separatedBy: "\n") {
+            if let end = closing.first {
+                let l = end.dash ? line.trimmingCharacters(in: CharacterSet(charactersIn: "\t")) : line
+                if l.trimmingCharacters(in: .whitespaces) == end.word { closing.removeFirst() }
+                continue
+            }
+            out.append(line)
+            let ns = line as NSString
+            for m in re.matches(in: line, range: NSRange(location: 0, length: ns.length)) {
+                // `<<<` is a here-string, not a heredoc.
+                if m.range.location > 0, ns.substring(with: NSRange(location: m.range.location - 1, length: 1)) == "<" { continue }
+                closing.append((ns.substring(with: m.range(at: 2)), ns.substring(with: m.range).hasPrefix("<<-")))
+            }
+        }
+        return out.joined(separator: "\n")
     }
 
     /// Bodies of $(…), <(…) and `…` (outermost level; nested ones are found when the body is classified).
@@ -305,6 +329,7 @@ enum ApprovalPolicy {
         for a in args where !a.hasPrefix("-") {
             let arg = a.split(separator: "=", maxSplits: 1).last.map(String.init) ?? a
             guard arg.hasPrefix("/") || arg.hasPrefix("~") || arg.contains("..") else { continue }
+            guard looksLikePath(arg) else { continue }
             guard !inside(arg, ctx) && !harmlessPath(arg) else { continue }
             if isProtected(arg) { return .user("Touches a path outside the project: \(arg) [protected]") }
             if reads && ctx.autonomy != .cautious { continue }
@@ -356,6 +381,15 @@ enum ApprovalPolicy {
         let c = PathGuard.canonical((path as NSString).expandingTildeInPath)
         let home = PathGuard.canonical(NSHomeDirectory())
         return c.hasPrefix(home + "/") && !c.hasPrefix(home + "/Library/")
+    }
+
+    /// A sed / regex script (`/^import .*/ s/x//`), a URL path or JSX (`/>`) isn't a path: an absolute path's
+    /// first folder must exist (`/Users/…`, `/etc/…`). `~` and `..` paths always count.
+    static func looksLikePath(_ arg: String) -> Bool {
+        guard arg.hasPrefix("/") else { return true }
+        let parts = arg.split(separator: "/", omittingEmptySubsequences: true)
+        guard let first = parts.first else { return true }   // "/" itself
+        return FileManager.default.fileExists(atPath: "/" + first)
     }
 
     static func harmlessPath(_ p: String) -> Bool {

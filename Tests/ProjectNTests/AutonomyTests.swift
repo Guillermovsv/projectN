@@ -707,6 +707,42 @@ struct AutonomyTests {
         env.harness.cancel(pm.id)
     }
 
+    @Test func coordinatorSeesAgentsBlockedOnYouAndYouGetReminded() async throws {
+        let env = try await makeEnv()
+        defer { env.store.terminateAll() }
+        _ = addDeveloper(env)
+        let pm = try await startPM(env, ts: "977.1")
+        _ = await mcp([("delegate_task", ["agent": "Developer", "instruction": "SLOW redacta las specs", "context": "Las tareas están en Notion › Project Hub › Tasks (T13–T16), proyecto Demo."])], task: pm.id, env: env)
+        let worker = try #require(env.harness.tasks.last { $0.origin.parentTaskID == pm.id })
+        try await waitUntil { env.harness.tokenOfTask[worker.id] != nil && env.harness.task(worker.id)?.status.isActive == true }
+        async let del = hook("Bash", ["command": "rm -rf build"], task: worker.id, env: env)
+        try await waitUntil { env.harness.pendingUserRequests().contains { $0.taskID == worker.id } }
+
+        // A later turn of the PM (a new task) still sees what its agent is stopped on, and can reach it.
+        env.harness.cancel(pm.id)
+        let pm2 = try await startPM(env, ts: "977.2")
+        #expect(pm2.id != pm.id)
+        let (_, r) = await mcp([("list_agents", [:]), ("get_task", ["task_id": worker.id.uuidString]),
+                                ("message_task", ["task_id": worker.id.uuidString, "message": "¿cómo vas?"])], task: pm2.id, env: env)
+        #expect(r.count == 3)
+        #expect(r[0].contains("blocked_on_user") && r[0].contains("rm -rf build") && r[0].contains(worker.id.uuidString))
+        #expect(r[1].contains("blocked_on_user") && !r[1].contains("Unknown task_id"))
+        #expect(r[2].contains("\"queued\":true") && r[2].contains("blocked_on_user"))
+        #expect(env.harness.task(worker.id)?.inbox?.contains { $0.contains("¿cómo vas?") } == true)
+
+        // Nobody answered: you're reminded once after 10 min, again after 20 more, not every tick.
+        let req = try #require(env.harness.pendingUserRequests().first { $0.taskID == worker.id })
+        env.harness.remindPendingRequests(now: req.createdAt.addingTimeInterval(5 * 60))
+        env.harness.remindPendingRequests(now: req.createdAt.addingTimeInterval(11 * 60))
+        env.harness.remindPendingRequests(now: req.createdAt.addingTimeInterval(12 * 60))
+        try await waitUntil { env.posts.texts(thread: "977.1").contains { $0.contains("sigue esperando tu aprobación") } }
+        #expect(env.posts.texts(thread: "977.1").filter { $0.contains("sigue esperando") }.count == 1)
+        env.harness.resolveRequest(req.id, approve: false, by: "you")
+        #expect(await del.decision == "deny")
+        env.harness.cancel(worker.id)
+        env.harness.cancel(pm2.id)
+    }
+
     @Test func idleSessionsStopAndResumeOnTheNextMessage() async throws {
         let env = try await makeEnv()
         defer { env.store.terminateAll() }

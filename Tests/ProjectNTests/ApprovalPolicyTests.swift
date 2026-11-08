@@ -18,6 +18,27 @@ struct ApprovalPolicyTests {
     private func isGray(_ t: ApprovalTier) -> Bool { if case .orchestrator = t { return true }; return false }
     private func isDeny(_ t: ApprovalTier) -> Bool { if case .deny = t { return true }; return false }
 
+    @Test func heredocBodiesAndRegexScriptsAreNotPaths() {
+        let jsx = "cd \"\(project)/frontend\" && cat > components/a.tsx <<'EOF'\nexport const A = () => <Globe />\n// see /api/reports\nEOF\nnpx tsc --noEmit"
+        #expect(decide(jsx, .high) == .allow)
+        let sed = "sed -i '' '/^import .*lucide-react/ s/\\bGlobe, //; /^import .*lucide-react/ s/, Globe\\b//' app/page.tsx"
+        #expect(decide(sed, .high) == .allow)
+        // Real paths are still judged, also around a heredoc.
+        #expect(isUser(decide("cat > /etc/hosts <<EOF\nx\nEOF", .high)))
+        #expect(isUser(decide("cat <<EOF > ~/.ssh/config\nHost x\nEOF", .high)))
+        #expect(isUser(decide("cat <<-EOF\n\tx\n\tEOF\nrm -rf build", .high)))
+        // A here-string isn't a heredoc: the next line is a command.
+        #expect(isUser(decide("grep x <<< \"$v\"\nrm -rf build", .high)))
+        #expect(ApprovalPolicy.stripHeredocs("a <<'X'\n/>\nX\nb") == "a <<'X'\nb")
+    }
+
+    @MainActor @Test func agentSessionsTurnOffClaudeCodesOwnReadBlock() throws {
+        let json = try #require(AgentHarness.hookSettings(helper: "/x/pn-agent", timeoutSeconds: 60))
+        let obj = try #require(JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any])
+        #expect((obj["permissions"] as? [String: Any])?["blockReadsOutsideWorkingDirectories"] as? Bool == false)
+        #expect(obj["hooks"] != nil)
+    }
+
     @Test func deletingAnythingAlwaysGoesToTheUser() {
         let deletions = [
             "rm README.md", "rm -rf build", "rmdir old", "unlink a", "find . -name '*.log' -delete", "find . -exec rm {} \\;",

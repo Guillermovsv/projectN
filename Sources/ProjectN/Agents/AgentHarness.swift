@@ -13,6 +13,8 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
         /// An approval / question was created (routed to the orchestrator or to you).
         case requestCreated(AgentRequest)
         case requestResolved(AgentRequest)
+        /// A request has waited on you for a while: nudge again (minutes waiting).
+        case requestReminder(AgentRequest, Int)
     }
 
     @Published private(set) var profiles: [AgentProfile]
@@ -36,6 +38,12 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
     var recentlyApproved: [UUID: [(text: String, at: Date)]] = [:]
     /// A terminal prompt seen on screen, per task, and since when (reported only if it stays up).
     var promptSeen: [UUID: (text: String, at: Date)] = [:]
+    /// When each task's current terminal prompt was last reported.
+    var lastNoticeAt: [UUID: Date] = [:]
+    /// When ProjectN's hook last allowed a tool call for each task (its latest decision was "allow").
+    var lastHookAllowed: [UUID: Date] = [:]
+    /// When each pending request was last reminded about.
+    var remindedAt: [UUID: Date] = [:]
     /// When a message was last typed into each task's session.
     var lastTyped: [UUID: Date] = [:]
     /// Prompts seen in each task's transcript at the last read, and how many must appear before a finished turn
@@ -543,6 +551,7 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
     private func tick() {
         guard let store else { return }
         expireRequests()
+        remindPendingRequests()
         if Date().timeIntervalSince(lastScheduleCheck) >= 30 {
             lastScheduleCheck = Date()
             runDueSchedules()
@@ -580,6 +589,16 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
                         promptSeen.removeValue(forKey: t.id)
                         AuditLog.record("prompt.confirmed", ["task": t.id.uuidString, "agent": t.agentName, "answer": answer,
                                                              "prompt": ApprovalPolicy.clip(q)])
+                    } else if let allowedAt = lastHookAllowed[t.id], Date().timeIntervalSince(allowedAt) < 20,
+                              promptSeen[t.id]?.text == q,
+                              !requests.contains(where: { $0.taskID == t.id && $0.isPending }),
+                              rt.answerPendingPrompt(approve: true) {
+                        // Every tool call passes ProjectN's hook first: a CLI prompt right after the hook allowed the
+                        // call is Claude Code asking again (its own checks), not a new decision for you.
+                        lastHookAllowed.removeValue(forKey: t.id)
+                        promptSeen.removeValue(forKey: t.id)
+                        AuditLog.record("prompt.confirmed", ["task": t.id.uuidString, "agent": t.agentName, "answer": "Yes",
+                                                             "why": "already allowed by ProjectN", "prompt": ApprovalPolicy.clip(q)])
                     } else if let last = rt.lastAutoAnswer, Date().timeIntervalSince(last.at) < 8 {
                         // Just answered: the screen still shows the prompt until the CLI redraws. Not a new one.
                     } else if let seen = promptSeen[t.id], seen.text == q {
@@ -607,15 +626,28 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
         guard let t = task(id), let paneID = t.paneID else { return }
         let q = question.trimmingCharacters(in: .whitespacesAndNewlines)
         update(id) { $0.status = .needsApproval }
-        guard t.lastApprovalNotice != q, !requests.contains(where: { $0.taskID == id && $0.isPending && $0.terminalPrompt == true }) else { return }
-        update(id) { $0.lastApprovalNotice = q }
-        AuditLog.record("task.approval_needed", ["task": id.uuidString, "agent": t.agentName, "prompt": q])
+        guard !requests.contains(where: { $0.taskID == id && $0.isPending && $0.terminalPrompt == true }) else { return }
         let screen = store?.runtimes[paneID]?.scrollbackText(maxLines: 14) ?? ""
         let detail = screen.split(separator: "\n").map { $0.trimmingCharacters(in: CharacterSet(charactersIn: " │┃║╭╮╰╯─━")) }
             .filter { !$0.isEmpty }.suffix(10).joined(separator: "\n")
+        // Keyed by what the prompt shows (the command), not its question: Claude Code asks "Do you want to
+        // proceed?" for every command, and a second one right after an approval used to be swallowed. A prompt
+        // still up with nothing pending for it (answer failed, expired, identical repeat) is re-reported.
+        let key = String((detail.isEmpty ? q : detail).hashValue)
+        if t.lastApprovalNotice == key, let at = lastNoticeAt[id], Date().timeIntervalSince(at) < 60 { return }
+        update(id) { $0.lastApprovalNotice = key }
+        lastNoticeAt[id] = Date()
+        AuditLog.record("task.approval_needed", ["task": id.uuidString, "agent": t.agentName, "prompt": q])
         createRequest(kind: .approval, task: t, summary: Redactor.redact(detail.isEmpty ? q : detail),
                       reason: "\(t.runtime.label) asks in its terminal: \(q)", route: .user, terminalPrompt: true) { [weak self] r in
-            guard let self, let rt = self.store?.runtimes[paneID] else { return }
+            guard let self else { return }
+            // Decided: whatever the CLI asks next is a new prompt, even with the same text.
+            if r.status != .pending {
+                self.promptSeen.removeValue(forKey: id)
+                self.lastNoticeAt.removeValue(forKey: id)
+                if self.task(id)?.lastApprovalNotice?.hasPrefix("plan:") == false { self.update(id) { $0.lastApprovalNotice = nil } }
+            }
+            guard let rt = self.store?.runtimes[paneID] else { return }
             switch r.status {
             case .approved: if !rt.answerPendingPrompt(approve: true) { AuditLog.record("prompt.answer_failed", ["task": id.uuidString]) }
             case .denied: rt.answerPendingPrompt(approve: false)
@@ -623,6 +655,19 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
             }
         }
         if let t = task(id) { emit(t, .approvalNeeded(q)) }
+    }
+
+    /// Requests waiting on you don't sit silently: a reminder after 10 min, then every 20 min.
+    func remindPendingRequests(now: Date = Date()) {
+        remindedAt = remindedAt.filter { id, _ in requests.contains { $0.id == id && $0.isPending } }
+        for r in requests where r.isPending && r.route == .user {
+            let waited = now.timeIntervalSince(r.createdAt)
+            let due = remindedAt[r.id].map { now.timeIntervalSince($0) >= 20 * 60 } ?? (waited >= 10 * 60)
+            guard due, let t = task(r.taskID) else { continue }
+            remindedAt[r.id] = now
+            AuditLog.record("request.reminded", ["request": r.id.uuidString, "agent": r.agentName, "minutes": String(Int(waited / 60))])
+            emit(t, .requestReminder(r, Int(waited / 60)))
+        }
     }
 
     /// The terminal prompt went away (answered there, or by ProjectN): forget it, so the next one is reported.
@@ -715,6 +760,8 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
         recentlyApproved.removeValue(forKey: id)
         expireRequests()
         promptSeen.removeValue(forKey: id)
+        lastNoticeAt.removeValue(forKey: id)
+        lastHookAllowed.removeValue(forKey: id)
         promptsExpected.removeValue(forKey: id)
         promptsSeen.removeValue(forKey: id)
         lastTyped.removeValue(forKey: id)

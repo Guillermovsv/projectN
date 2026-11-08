@@ -109,11 +109,15 @@ extension AgentHarness {
         return [chrome] + entries.values.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
     }
 
-    /// `--settings` JSON registering the PreToolUse hook for every tool.
+    /// `--settings` JSON registering the PreToolUse hook for every tool. ProjectN's policy judges reads outside
+    /// the project itself, so Claude Code's own read block (from your ~/.claude/settings.json) is turned off for
+    /// agents: it asks again for commands it can't check statically (stdin scripts, computed paths, sed) that
+    /// ProjectN already allowed.
     static func hookSettings(helper: String, timeoutSeconds: Int) -> String? {
         let obj: [String: Any] = ["hooks": ["PreToolUse": [["matcher": "*", "hooks": [[
             "type": "command", "command": "\(Shell.quote(helper)) hook", "timeout": max(60, timeoutSeconds),
-        ]]]]]]
+        ]]]]],
+                                  "permissions": ["blockReadsOutsideWorkingDirectories": false]]
         return (try? JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys])).flatMap { String(data: $0, encoding: .utf8) }
     }
 
@@ -154,11 +158,14 @@ extension AgentHarness {
                 AuditLog.record("tool.allowed", ["task": t.id.uuidString, "agent": t.agentName, "tool": tool, "call": summary])
             }
             rememberApproved(t.id, input: input, summary: summary)
+            lastHookAllowed[t.id] = Date()
             reply(["decision": "allow", "reason": "Allowed by ProjectN policy (routine work in the project)."])
         case .deny(let why):
+            lastHookAllowed.removeValue(forKey: t.id)
             AuditLog.record("tool.denied", ["task": t.id.uuidString, "agent": t.agentName, "tool": tool, "call": summary, "reason": why])
             reply(["decision": "deny", "reason": "ProjectN: \(why)"])
         case .orchestrator(let why), .user(let why):
+            lastHookAllowed.removeValue(forKey: t.id)
             var route = AgentRequest.Route.user
             if case .orchestrator = tier, policy.grayApprover == .orchestrator,
                let parent = t.origin.parentTaskID, task(parent)?.status.isFinished == false {
@@ -168,6 +175,7 @@ extension AgentHarness {
                 switch r.status {
                 case .approved:
                     self.rememberApproved(t.id, input: input, summary: summary)
+                    self.lastHookAllowed[t.id] = Date()
                     reply(["decision": "allow", "reason": "Approved by \(r.decidedBy ?? "the user")" + (r.answer.map { ": \($0)" } ?? ".")])
                 case .expired:
                     reply(["decision": "deny", "reason": "No approval within the time limit, so ProjectN blocked it. Don't retry; report that it needs approval."])
@@ -363,9 +371,11 @@ extension AgentHarness {
                         "autonomy": p.autoMode ? "Auto mode" : p.autonomy.label,
                         "projects": p.allProjects ? "all" : (store?.state.projects.filter { p.mayAccess($0.id) }.map(\.name).joined(separator: ", ") ?? ""),
                         "mcp_servers_in_this_project": servers.sorted(), "cli_tools": p.cliTools, "can_delegate": p.canDelegate,
-                        "busy": tasks.contains { $0.agentID == p.id && $0.status.isActive }]
+                        "busy": tasks.contains { $0.agentID == p.id && $0.status.isActive },
+                        "working_on": tasks.filter { $0.agentID == p.id && ($0.status.isActive || $0.status == .queued) }.map(liveStatus)]
             }
-            reply(Self.json(["agents": list]), false)
+            reply(Self.json(["agents": list,
+                             "note": "working_on shows each agent's live tasks; `blocked_on_user` means it is stopped until the user answers (tell the user)."]), false)
 
         case "delegate_task":
             guard needDelegate() else { return }
@@ -428,8 +438,25 @@ extension AgentHarness {
 
         case "get_task":
             guard let id = (a["task_id"] as? String).flatMap(UUID.init(uuidString:)), let c = task(id),
-                  c.origin.parentTaskID == t.id else { reply("Unknown task_id (only your own delegated tasks).", true); return }
-            reply(Self.json(snapshot(c)), false)
+                  isDelegated(c, by: t) else { reply("Unknown task_id (only tasks you delegated; list_agents shows them).", true); return }
+            var d = snapshot(c)
+            d.merge(liveStatus(c)) { cur, _ in cur }
+            reply(Self.json(d), false)
+
+        case "message_task":
+            guard needDelegate() else { return }
+            guard let id = (a["task_id"] as? String).flatMap(UUID.init(uuidString:)), let c = task(id),
+                  isDelegated(c, by: t) else { reply("Unknown task_id (only tasks you delegated; list_agents shows them).", true); return }
+            let text = (a["message"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !text.isEmpty else { reply("Missing `message`.", true); return }
+            guard c.status.isActive || c.status == .queued else { reply("That task already ended (\(c.status.rawValue)); delegate a new one.", true); return }
+            deliverMessage("(from \(t.agentName)) " + text, to: id)
+            var out: [String: Any] = ["queued": true]
+            if let blocked = liveStatus(c)["blocked_on_user"] {
+                out["note"] = "It is stopped waiting for the user, so it reads your message only after that is answered. Tell the user."
+                out["blocked_on_user"] = blocked
+            }
+            reply(Self.json(out), false)
 
         case "wait_for_tasks":
             guard needDelegate() else { return }
@@ -555,6 +582,29 @@ extension AgentHarness {
         return d
     }
 
+    /// A task this agent delegated, in this or an earlier turn (each Slack message is a new coordinator task).
+    func isDelegated(_ c: AgentTask, by t: AgentTask) -> Bool {
+        guard let pid = c.origin.parentTaskID else { return false }
+        return pid == t.id || task(pid)?.agentID == t.agentID
+    }
+
+    /// What a task is doing right now, including anything it's stopped on.
+    func liveStatus(_ c: AgentTask) -> [String: Any] {
+        var d: [String: Any] = ["task_id": c.id.uuidString, "project": c.projectName, "status": c.status.rawValue,
+                                "task": PromptComposer.oneLine(c.instruction, 160)]
+        if let s = c.startedAt { d["minutes_since_start"] = Int(Date().timeIntervalSince(s) / 60) }
+        if let by = c.origin.delegatedBy { d["delegated_by"] = by }
+        if let r = requests.first(where: { $0.taskID == c.id && $0.isPending }) {
+            let who: String
+            if case .orchestrator = r.route { who = "blocked_on_you" } else { who = "blocked_on_user" }
+            d[who] = ["kind": r.kind.rawValue, "request_id": r.id.uuidString, "what": ApprovalPolicy.clip(r.summary),
+                      "minutes_waiting": Int(Date().timeIntervalSince(r.createdAt) / 60)]
+        } else if let p = c.paneID, let rt = store?.runtimes[p], case .needsInput(let q) = rt.activity {
+            d["blocked_on_user"] = ["kind": "terminal prompt", "what": q]
+        }
+        return d
+    }
+
     static func json(_ obj: Any) -> String {
         // Compact: tool output is read by the model, and every byte stays in its context.
         (try? JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys]))
@@ -576,7 +626,7 @@ enum AgentTools {
                           ["question": str("Self-contained. One line of context, then the question(s) as a numbered list (1., 2.…); put choices under each as `- a) …`, `- b) …`.")], ["question"])]
         guard canDelegate else { return tools }
         tools += [
-            tool("list_agents", "List the agents you can delegate to: role, runtime, access, projects, MCP servers and CLI tools.", [:], []),
+            tool("list_agents", "List the agents you can delegate to (role, runtime, access, projects, MCP servers, CLI tools) and what each is working on right now, including tasks stopped waiting for the user's approval or answer.", [:], []),
             tool("delegate_task", "Start a task for another agent. Returns its task_id; its result is sent to you as a new message when it finishes.",
                  ["agent": str("Agent name from list_agents."),
                   "instruction": str("What to do, including what done means."),
@@ -587,7 +637,9 @@ enum AgentTools {
             tool("wait_for_tasks", "Wait (up to 90 s per call) until your delegated tasks finish or one of your agents needs an approval / answer from you. Only for work about to finish: for anything longer end your turn instead (results and requests are sent to you as new messages).",
                  ["task_ids": ["type": "array", "items": ["type": "string"], "description": "Default: all your delegated tasks."],
                   "timeout_seconds": ["type": "number", "description": "Max wait (5–90, default 90)."]], []),
-            tool("get_task", "Status and result of one of your delegated tasks.", ["task_id": str("The task_id.")], ["task_id"]),
+            tool("get_task", "Status, result and anything blocking one of your delegated tasks (also ones from earlier turns; list_agents shows their ids).", ["task_id": str("The task_id.")], ["task_id"]),
+            tool("message_task", "Send a message to one of your delegated tasks that is still running (e.g. ask for progress or add an instruction). It reaches the agent's session as its next message.",
+                 ["task_id": str("The task_id."), "message": str("The message.")], ["task_id", "message"]),
             tool("answer_request", "Decide an approval or answer a question from one of your agents. Use escalate to pass it to the user.",
                  ["request_id": str("From wait_for_tasks."),
                   "decision": ["type": "string", "enum": ["approve", "deny", "answer", "escalate"]],
