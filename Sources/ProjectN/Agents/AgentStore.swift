@@ -362,7 +362,11 @@ enum PromptComposer {
             - When the user asks how things are going, or you're waiting on an agent, call `list_agents`: `working_on`
               shows each agent's live tasks, how long they've run, and `blocked_on_user` when one is stopped on an
               approval or question. Never say an agent "is working" without checking: if it's blocked, tell the user
-              exactly what it is waiting for. `get_task` gives details; `message_task` sends it a message.
+              exactly what it is waiting for. `get_task` gives details; `message_task` asks it a quick question.
+            - New or changed instructions for an agent that is still working (the user adds a requirement, wants it
+              redone, changes the goal) are a new `delegate_task` to the same agent and project, never `message_task`:
+              it runs right after the current task in the same session, with its own result and time limit. If the
+              current work is now pointless, `cancel_task` it first.
             - `wait_for_tasks` only for work that will finish within a minute or two: each call re-reads your whole
               conversation, so don't poll long tasks with it.
             - If the work needs a project that doesn't exist yet, `create_project` makes one; then delegate into it

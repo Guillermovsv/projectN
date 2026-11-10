@@ -55,14 +55,18 @@ enum AutoResponder {
     static func pendingPrompt(screen: [String]) -> String? {
         guard let window = window(screen) else { return nil }
         if inlineYesNoDecision(window) != nil { return window.last }
-        if let hint = findKeyHintMenu(window) {
+        // Numbered menus first, as in `decide` (Codex's "1. Allow (y) … 4. Cancel (esc)" also looks like key hints).
+        guard let menu = findMenu(window) else {
+            guard let hint = findKeyHintMenu(window) else { return nil }
             return window[max(0, hint.first - 4)..<hint.first].reversed()
                 .first { !$0.isEmpty && $0.rangeOfCharacter(from: .letters) != nil } ?? "Choose an option"
         }
-        guard let menu = findMenu(window) else { return nil }
         let first = menu.block.first!.line
-        // The closest non-empty line above the options that isn't decoration is usually the question.
-        let question = window[max(0, first - 4)..<first].reversed()
+        // A real question ("…?") above the options wins: Codex prints the tool's parameters (e.g. "post_id: 798")
+        // or the command between its question and the menu. Otherwise the closest non-empty line with letters.
+        let above = window[max(0, first - 12)..<first].reversed()
+        let question = above.first { $0.hasSuffix("?") && $0.rangeOfCharacter(from: .letters) != nil }
+            ?? window[max(0, first - 4)..<first].reversed()
             .first { !$0.isEmpty && $0.rangeOfCharacter(from: .letters) != nil }
         return question ?? "Choose an option"
     }
@@ -88,7 +92,10 @@ enum AutoResponder {
         guard let sep = s.first, sep == "." || sep == ")" else { return nil }
         s = s.dropFirst()
         guard s.first == " " else { return nil }
-        let text = s.trimmingCharacters(in: .whitespaces)
+        var text = s.trimmingCharacters(in: .whitespaces)
+        // Codex draws a description column on the option's own row ("Allow          Run the tool and continue"):
+        // the label is what comes before the gap.
+        if let gap = text.range(of: "\\s{3,}", options: .regularExpression) { text = String(text[..<gap.lowerBound]) }
         guard !text.isEmpty else { return nil }
         return Option(line: line, number: n, text: text, hasCursor: hasCursor)
     }
@@ -146,8 +153,23 @@ enum AutoResponder {
 
     private static func isYes(_ text: String) -> Bool {
         let t = text.lowercased()
-        return t == "yes" || t.hasPrefix("yes ") || t.hasPrefix("yes,") || t.hasPrefix("yes.") || t.hasPrefix("yes!")
-            || t.hasPrefix("yes (") || t.hasPrefix("yes -") || t.hasPrefix("yes —")
+        if t == "yes" || t.hasPrefix("yes ") || t.hasPrefix("yes,") || t.hasPrefix("yes.") || t.hasPrefix("yes!")
+            || t.hasPrefix("yes (") || t.hasPrefix("yes -") || t.hasPrefix("yes —") { return true }
+        // Codex asks about MCP tool calls with "Allow / Allow for this session / Always allow / Cancel": the plain
+        // one-time "Allow" (or "Approve") is the yes. Choices that widen permissions beyond this call never are.
+        let core = t.replacingOccurrences(of: "\\s*\\([^()]*\\)\\s*$", with: "", options: .regularExpression)
+            .trimmingCharacters(in: .whitespaces)
+        let widening = ["session", "always", "remember", "future", "don't ask", "do not ask", "all "]
+        guard !widening.contains(where: { core.contains($0) }) else { return false }
+        return core == "allow" || core == "approve" || core == "allow once" || core == "approve once"
+            || core.hasPrefix("allow this request") || core.hasPrefix("approve this request")
+    }
+
+    /// Whether an answer label from `decide` agrees to the request (used when the user approved it elsewhere).
+    /// Inline prompts answer "y"; Cursor's key-hint menus answer "Run (once)".
+    static func approves(_ label: String) -> Bool {
+        let t = label.lowercased().trimmingCharacters(in: .whitespaces)
+        return t == "y" || isYes(label) || t == "run" || t == "run (once)" || t == "run once"
     }
 
     private static func cleanLabel(_ s: String) -> String {

@@ -720,6 +720,31 @@ struct AutonomyTests {
         env.harness.cancel(pm.id)
     }
 
+    @Test func newInstructionsForABusyAgentAreANewTaskNotTypedIntoIt() async throws {
+        let env = try await makeEnv()
+        defer { env.store.terminateAll() }
+        var dev = addDeveloper(env)
+        dev.sessionPolicy = .perProject   // like the user's agents
+        env.harness.saveProfile(dev)
+        let pm = try await startPM(env, ts: "978.1")
+        _ = await mcp([("delegate_task", ["agent": "Developer", "instruction": "SLOW genera la voz", "context": "Proyecto Demo, guion en scripts/ventas.txt; el usuario pidió la voz de Fernando."])], task: pm.id, env: env)
+        let worker = try #require(env.harness.tasks.last { $0.origin.parentTaskID == pm.id })
+        try await waitUntil { env.harness.task(worker.id)?.status.isActive == true }
+        // The user changes the work while it runs: a second delegation, which waits for the running one.
+        let (_, r) = await mcp([("delegate_task", ["agent": "Developer", "instruction": "Añade marcas de dirección y regenera", "context": "Proyecto Demo, guion en scripts/ventas.txt; el usuario pidió la voz de Fernando."])], task: pm.id, env: env)
+        #expect(r.first?.contains("task_id") == true)
+        let change = try #require(env.harness.tasks.last { $0.origin.parentTaskID == pm.id })
+        #expect(change.id != worker.id && change.status == .queued && change.resumedFromTaskID == worker.id)
+        #expect(env.harness.task(worker.id)?.inbox?.isEmpty != false)
+        #expect(env.harness.task(worker.id)?.followUps?.isEmpty != false)
+        // Once the running task ends, the change starts as its own task (same session, own result and time limit).
+        env.harness.cancel(worker.id)
+        try await waitUntil { env.harness.task(change.id)?.status.isActive == true && env.harness.task(change.id)?.status != .starting }
+        #expect(env.harness.task(change.id)?.sessionID == env.harness.task(worker.id)?.sessionID)
+        env.harness.cancel(change.id)
+        env.harness.cancel(pm.id)
+    }
+
     @Test func coordinatorSeesAgentsBlockedOnYouAndYouGetReminded() async throws {
         let env = try await makeEnv()
         defer { env.store.terminateAll() }

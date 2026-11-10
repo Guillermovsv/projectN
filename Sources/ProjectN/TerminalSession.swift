@@ -229,7 +229,7 @@ final class TerminalSession: NSObject, ObservableObject, LocalProcessTerminalVie
         guard isRunning, !terminated, let screen = screenTail(requireCurrent: true),
               AutoResponder.pendingPrompt(screen: screen) != nil,
               let d = AutoResponder.decide(screen: screen), d.fingerprint != answeredFingerprint,
-              d.label.lowercased().hasPrefix("y") else { return nil }
+              AutoResponder.approves(d.label) else { return nil }
         let squash = { (s: String) in String(s.unicodeScalars.filter { !CharacterSet.whitespacesAndNewlines.contains($0) && !"│┃║╭╮╰╯─━".unicodeScalars.contains($0) }.map(Character.init)) }
         let text = squash(screen.joined())
         guard approved.contains(where: { a in let n = squash(a); return n.count >= 2 && text.contains(String(n.prefix(50))) }) else { return nil }
@@ -246,7 +246,7 @@ final class TerminalSession: NSObject, ObservableObject, LocalProcessTerminalVie
     func answerPendingPrompt(approve: Bool) -> Bool {
         guard isRunning, !terminated, let screen = screenTail(), AutoResponder.pendingPrompt(screen: screen) != nil else { return false }
         if approve {
-            guard let d = AutoResponder.decide(screen: screen), d.label.lowercased().hasPrefix("y") else { return false }
+            guard let d = AutoResponder.decide(screen: screen), AutoResponder.approves(d.label) else { return false }
             answeredFingerprint = d.fingerprint
             lastAutoAnswer = (d.label, Date())
             sendKeys(d.keys)

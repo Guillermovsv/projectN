@@ -673,7 +673,7 @@ enum AgentTools {
                  ["task_ids": ["type": "array", "items": ["type": "string"], "description": "Default: all your delegated tasks."],
                   "timeout_seconds": ["type": "number", "description": "Max wait (5–90, default 90)."]], []),
             tool("get_task", "Status, result and anything blocking one of your delegated tasks (also ones from earlier turns; list_agents shows their ids).", ["task_id": str("The task_id.")], ["task_id"]),
-            tool("message_task", "Send a message to one of your delegated tasks that is still running (e.g. ask for progress or add an instruction). It reaches the agent's session as its next message.",
+            tool("message_task", "Ask one of your running delegated tasks a quick question (e.g. progress, where a file is). It is typed into the agent's live session, mid-task. Never use it to add, change or redo work: that stretches the running task past its time limit and its report is lost. For new or changed instructions call delegate_task for the same agent and project instead — it starts right after the current task, in the same session, with its own result and time limit (cancel_task first if the current work is now wrong).",
                  ["task_id": str("The task_id."), "message": str("The message.")], ["task_id", "message"]),
             tool("answer_request", "Decide an approval or answer a question from one of your agents. Use escalate to pass it to the user.",
                  ["request_id": str("From wait_for_tasks."),
