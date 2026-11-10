@@ -87,7 +87,9 @@ extension Store {
         case .cursor, .terminal:
             return nil   // agent runtimes are Claude Code and Codex
         }
-        updateWorkspace(wid) { if !$0.projectIDs.contains(l.projectID) { $0.projectIDs.append(l.projectID) } }
+        if l.projectID != Self.coordinationProjectID {
+            updateWorkspace(wid) { if !$0.projectIDs.contains(l.projectID) { $0.projectIDs.append(l.projectID) } }
+        }
         updateSpace(sid, in: wid) { s in
             s.panes.append(p)
             if s.focusedPaneID == nil { s.focusedPaneID = p.id }

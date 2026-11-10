@@ -8,6 +8,7 @@ final class Store: ObservableObject {
         didSet {
             AppHome.save(settings, to: AppHome.settingsFile)
             applyFontSize()
+            UserDefaults.standard.set(settings.browserSuspendMinutes, forKey: "browserSuspendMinutes")
             if settings.theme != oldValue.theme { applyTheme() }
             if settings.voiceEnabled != oldValue.voiceEnabled || settings.voiceMenuBarIcon != oldValue.voiceMenuBarIcon {
                 applyVoice()
@@ -52,6 +53,7 @@ final class Store: ObservableObject {
         state = AppHome.load(PersistedState.self, from: AppHome.stateFile) ?? PersistedState()
         settings = AppHome.load(AppSettings.self, from: AppHome.settingsFile) ?? AppSettings()
         AppHome.save(settings, to: AppHome.settingsFile)
+        UserDefaults.standard.set(settings.browserSuspendMinutes, forKey: "browserSuspendMinutes")
         AppTheme.current = AppTheme.named(settings.theme)
         applyAppAppearance()
         makeLaunchOptionsExplicit()
@@ -168,6 +170,55 @@ final class Store: ObservableObject {
         discoverCodexSessions()
         refreshLastPrompts()
         if tickCount % 12 == 0 { saveScrollback() }   // every ~60s
+        sleepIdlePanes()
+    }
+
+    // MARK: Idle sleep (RAM)
+
+    /// Panes on screen right now (the selected space, plus a pane opened over it).
+    var visiblePaneIDs: Set<UUID> {
+        var visible = Set<UUID>()
+        if let s = selectedSpace { visible.formUnion(s.panes.map(\.id)) }
+        if let id = focusOverride?.paneID { visible.insert(id) }
+        return visible
+    }
+
+    /// Pane ID → last time it was on screen, busy or producing output.
+    private var lastActive: [UUID: Date] = [:]
+    /// Panes stopped by idle-sleep; they restart + resume their conversation when shown again.
+    private(set) var sleptPaneIDs: Set<UUID> = []
+
+    /// Stops Claude/Codex/Cursor panes that are idle, off screen and quiet for `sleepIdleMinutes`.
+    /// Never touches panes that are working, waiting on a prompt, visible, terminals, agent-task
+    /// panes (the harness manages those) or panes that can't resume their conversation.
+    private func sleepIdlePanes() {
+        let minutes = settings.sleepIdleMinutes
+        let now = Date()
+        let visible = visiblePaneIDs
+        for ws in state.workspaces {
+            for sp in ws.spaces {
+                for p in sp.panes where p.tool != .terminal && !p.isAgentPane {
+                    guard let rt = runtimes[p.id], rt.isRunning else { lastActive.removeValue(forKey: p.id); continue }
+                    let busy = visible.contains(p.id) || rt.activity != .idle
+                        || pendingMessages[p.id] != nil || pendingLaunches[p.id] != nil
+                    if busy { lastActive[p.id] = now; continue }
+                    let last = max(lastActive[p.id] ?? now, rt.lastOutputAt)
+                    lastActive[p.id] = last
+                    guard minutes > 0, now.timeIntervalSince(last) >= Double(minutes) * 60 else { continue }
+                    let resumable: Bool
+                    switch p.tool {
+                    case .claude: resumable = p.claudeSessionID != nil
+                    case .codex: resumable = p.codexSessionID != nil
+                    case .cursor: resumable = p.cursorSessionID != nil
+                    case .terminal: resumable = false
+                    }
+                    guard resumable else { continue }
+                    sleptPaneIDs.insert(p.id)
+                    lastActive.removeValue(forKey: p.id)
+                    killRuntime(p.id)
+                }
+            }
+        }
     }
 
     /// Saves terminal panes' output so it can be shown again after relaunch.
@@ -189,7 +240,24 @@ final class Store: ObservableObject {
 
     // MARK: Projects
 
-    func project(_ id: UUID) -> Project? { state.projects.first { $0.id == id } }
+    func project(_ id: UUID) -> Project? {
+        if id == Self.coordinationProjectID { return coordinationProject }
+        return state.projects.first { $0.id == id }
+    }
+
+    /// Where coordinators (the Project Manager) work: a folder of its own, outside every project. It isn't in
+    /// `state.projects`, so it never shows up in project lists, Slack's "which project?" or the file tree.
+    nonisolated static let coordinationProjectID = UUID(uuidString: "C0000000-0000-4000-8000-00000000C0DE")!
+
+    var coordinationProject: Project {
+        let dir = AppHome.root.deletingLastPathComponent().appendingPathComponent(".projectn-coordination")
+        if !FileManager.default.fileExists(atPath: dir.path) {
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            try? "# Coordinación\n\nCarpeta de trabajo de los agentes coordinadores de ProjectN (p. ej. el Project Manager). No pertenece a ningún proyecto: desde aquí ven la lista de proyectos y delegan cada solicitud al proyecto y agente correctos.\n"
+                .write(to: dir.appendingPathComponent("README.md"), atomically: true, encoding: .utf8)
+        }
+        return Project(id: Self.coordinationProjectID, name: "Coordinación", path: dir.path)
+    }
 
     @discardableResult
     func addProject(url: URL) -> Project {
@@ -477,6 +545,8 @@ final class Store: ObservableObject {
     func ensureStarted(_ paneID: UUID, in wid: UUID) {
         guard runtimes[paneID] == nil, pendingLaunches[paneID] == nil,
               let (_, p) = pane(paneID, in: wid) else { return }
+        sleptPaneIDs.remove(paneID)
+        lastActive[paneID] = Date()
         start(p, in: wid, resume: true)
     }
 

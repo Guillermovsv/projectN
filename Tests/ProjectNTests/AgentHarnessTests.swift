@@ -112,7 +112,8 @@ struct AgentHarnessTests {
         let harness = AgentHarness(catalog: catalog)
         harness.attach(store, refreshModels: false)
         // Most tests here count sessions per task; per-project sessions are tested in AutonomyTests.
-        if var pm = harness.profiles.first { pm.sessionPolicy = .alwaysNew; harness.saveProfile(pm) }
+        // These suites test the PM inside a project; working outside the projects has its own test (AutonomyTests).
+        if var pm = harness.profiles.first { pm.sessionPolicy = .alwaysNew; pm.worksOutsideProjects = false; harness.saveProfile(pm) }
         let slack = SlackConnector()
         let posts = PostLog()
         slack.sender = { channel, thread, text in posts.items.append((channel, thread, text)) }

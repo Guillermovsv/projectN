@@ -28,6 +28,9 @@ final class TerminalSession: NSObject, ObservableObject, LocalProcessTerminalVie
 
     /// Set from SwiftTerm's I/O thread whenever new output arrives; lets screen scans skip idle panes.
     private let outputDirty = OSAllocatedUnfairLock(initialState: true)
+    /// Last time the process wrote anything (I/O thread); idle-sleep reads it.
+    private let lastOutputLock = OSAllocatedUnfairLock(initialState: Date())
+    var lastOutputAt: Date { lastOutputLock.withLock { $0 } }
     private var cachedScreen: [String]?
     private var screenReadInFlight = false
     private let screenQueue = DispatchQueue(label: "dev.projectn.screen", qos: .utility)
@@ -118,7 +121,10 @@ final class TerminalSession: NSObject, ObservableObject, LocalProcessTerminalVie
         applyTheme(AppTheme.current)
         view.optionAsMetaKey = true
         view.processDelegate = self
-        view.setProcessOutputHandler { [outputDirty] in outputDirty.withLock { $0 = true } }
+        view.setProcessOutputHandler { [outputDirty, lastOutputLock] in
+            outputDirty.withLock { $0 = true }
+            lastOutputLock.withLock { $0 = Date() }
+        }
         if let restoredText, !restoredText.isEmpty {
             // Previous output, dimmed, followed by a separator; the new shell starts below it.
             let body = restoredText.replacingOccurrences(of: "\r\n", with: "\n").replacingOccurrences(of: "\n", with: "\r\n")

@@ -199,6 +199,9 @@ struct AgentProfile: Codable, Identifiable, Hashable {
     /// May hand work to other agents (ProjectN's delegate_task / wait_for_tasks tools) and decide their
     /// gray-area approvals and questions.
     var canDelegate: Bool = false
+    /// Coordinators (e.g. the Project Manager) work from ProjectN's coordination folder instead of inside one
+    /// project: they see the list of projects and send each request to the right project and agent.
+    var worksOutsideProjects: Bool = false
     /// MCP servers (names from Settings → MCP Servers) this agent gets. Only these: the user's global
     /// Claude MCP configuration isn't loaded for agents.
     var mcpServers: [String] = []
@@ -237,7 +240,10 @@ struct AgentProfile: Codable, Identifiable, Hashable {
         self.instructions = instructions
     }
 
-    func mayAccess(_ projectID: UUID) -> Bool { allProjects || projectIDs.contains(projectID) }
+    func mayAccess(_ projectID: UUID) -> Bool {
+        if projectID == Store.coordinationProjectID { return worksOutsideProjects }
+        return allProjects || projectIDs.contains(projectID)
+    }
 
     /// Whether this agent gets that Claude Code MCP server (or Claude in Chrome).
     func usesClaudeMCP(_ name: String) -> Bool {
@@ -301,6 +307,8 @@ struct AgentProfile: Codable, Identifiable, Hashable {
         enabled = (try? c.decode(Bool.self, forKey: .enabled)) ?? true
         createdAt = (try? c.decode(Date.self, forKey: .createdAt)) ?? Date()
         canDelegate = (try? c.decode(Bool.self, forKey: .canDelegate)) ?? false
+        // Older profiles: coordinators move out of the projects.
+        worksOutsideProjects = (try? c.decode(Bool.self, forKey: .worksOutsideProjects)) ?? canDelegate
         mcpServers = (try? c.decode([String].self, forKey: .mcpServers)) ?? []
         cliTools = (try? c.decode([String].self, forKey: .cliTools)) ?? []
         apiKeys = (try? c.decode([String].self, forKey: .apiKeys)) ?? []
@@ -319,6 +327,7 @@ struct AgentProfile: Codable, Identifiable, Hashable {
             instructions: AgentProfile.projectManagerInstructions)
         p.permission = .readOnly
         p.canDelegate = true
+        p.worksOutsideProjects = true
         p.sessionPolicy = .perProject
         p.allProjects = true
         p.contextSources = ["README.md"]

@@ -357,9 +357,31 @@ extension AgentHarness {
         case "save_project_note":
             let note = (a["note"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
             guard note.count >= 10 else { reply("Missing `note` (one durable fact, with links / IDs).", true); return }
-            let added = AgentStore.addProjectNote(t.projectID, note, by: t.agentName)
-            AuditLog.record("project.note", ["agent": t.agentName, "project": t.projectName, "note": note])
-            reply(added ? "Saved. Every agent working on \(t.projectName) gets it from now on." : "Already in the project notes.", false)
+            var target = store?.project(t.projectID)
+            if let pname = a["project"] as? String, !pname.isEmpty {
+                guard let p = namedProject(pname, for: profile) else { reply("No project named “\(pname)” that you can access.", true); return }
+                target = p
+            }
+            guard let target, target.id != Store.coordinationProjectID else {
+                reply("You work outside the projects: pass `project` (the project the fact is about).", true); return
+            }
+            let added = AgentStore.addProjectNote(target.id, note, by: t.agentName)
+            AuditLog.record("project.note", ["agent": t.agentName, "project": target.name, "note": note])
+            reply(added ? "Saved. Every agent working on \(target.name) gets it from now on." : "Already in the project notes.", false)
+
+        case "project_info":
+            guard needDelegate() else { return }
+            let pname = a["project"] as? String ?? ""
+            guard let p = namedProject(pname, for: profile) else { reply("No project named “\(pname)” that you can access.", true); return }
+            var d: [String: Any] = ["name": p.name, "path": p.path,
+                                    "active_tasks": tasks.filter { $0.projectID == p.id && $0.status.isActive }.map(liveStatus)]
+            if let readme = ContextLoader.readmeNames.first(where: { FileManager.default.fileExists(atPath: (p.path as NSString).appendingPathComponent($0)) }),
+               let text = try? String(contentsOfFile: (p.path as NSString).appendingPathComponent(readme), encoding: .utf8) {
+                d["readme_excerpt"] = text.count > 3000 ? String(text.prefix(3000)) + "\n[… read \(readme) for the rest]" : text
+            }
+            let notes = AgentStore.projectNotes(p.id)
+            if !notes.isEmpty { d["project_notes"] = notes }
+            reply(Self.json(d), false)
 
         case "list_agents":
             guard needDelegate() else { return }
@@ -399,10 +421,12 @@ extension AgentHarness {
             }
             var projectID = t.projectID
             if let pname = a["project"] as? String, !pname.isEmpty {
-                guard let p = store?.state.projects.first(where: { $0.name.folded == pname.folded }) else {
-                    reply("No project named “\(pname)”.", true); return
+                guard let p = namedProject(pname, for: profile) else {
+                    reply("No project named “\(pname)” that you can access.", true); return
                 }
                 projectID = p.id
+            } else if projectID == Store.coordinationProjectID {
+                reply("Pass `project`: you work outside the projects, so say which one this task is for (exact name from your list).", true); return
             }
             let deps = (a["depends_on"] as? [String] ?? []).compactMap(UUID.init(uuidString:))
             var origin = t.origin
@@ -605,6 +629,14 @@ extension AgentHarness {
         return d
     }
 
+    /// A project the agent may access, by (folded) name or folder name.
+    func namedProject(_ name: String, for profile: AgentProfile) -> Project? {
+        let n = name.folded.trimmingCharacters(in: .whitespaces)
+        guard !n.isEmpty else { return nil }
+        return store?.state.projects.first { profile.mayAccess($0.id)
+            && ($0.name.folded == n || URL(fileURLWithPath: $0.path).lastPathComponent.folded == n) }
+    }
+
     static func json(_ obj: Any) -> String {
         // Compact: tool output is read by the model, and every byte stays in its context.
         (try? JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys]))
@@ -621,17 +653,20 @@ enum AgentTools {
         }
         let str: (String) -> [String: Any] = { ["type": "string", "description": $0] }
         var tools = [tool("save_project_note", "Save one durable fact about this project for every agent that works on it: where tasks / docs live (Notion page or database links and IDs), site URLs, MCP server names, conventions, decisions. No secrets.",
-                          ["note": str("The fact, self-contained, with links / IDs.")], ["note"]),
+                          ["note": str("The fact, self-contained, with links / IDs."),
+                           "project": str("Project name; default: your project (required for coordinators working outside projects).")], ["note"]),
                      tool("ask", "Ask whoever gave you this task (the coordinating agent or the user) a question you can't resolve yourself. Returns immediately: then end your turn with one short line. The answer arrives as your next message in this session.",
                           ["question": str("Self-contained. One line of context, then the question(s) as a numbered list (1., 2.…); put choices under each as `- a) …`, `- b) …`.")], ["question"])]
         guard canDelegate else { return tools }
         tools += [
+            tool("project_info", "A project's README excerpt, shared project notes and live tasks: use it to pick the right project and give delegated agents the right context.",
+                 ["project": str("Project name.")], ["project"]),
             tool("list_agents", "List the agents you can delegate to (role, runtime, access, projects, MCP servers, CLI tools) and what each is working on right now, including tasks stopped waiting for the user's approval or answer.", [:], []),
             tool("delegate_task", "Start a task for another agent. Returns its task_id; its result is sent to you as a new message when it finishes.",
                  ["agent": str("Agent name from list_agents."),
                   "instruction": str("What to do, including what done means."),
                   "context": str("Everything the agent needs that it can't see (it doesn't see your conversation): the goal in the user's words, where the inputs live — e.g. Notion task database / pages with links and IDs, site URLs, files —, what's known or decided, constraints, who to ask."),
-                  "project": str("Project name; default: your project."),
+                  "project": str("Project name (required when you work outside the projects); default: your project."),
                   "depends_on": ["type": "array", "items": ["type": "string"], "description": "task_ids that must complete first."]],
                  ["agent", "instruction", "context"]),
             tool("wait_for_tasks", "Wait (up to 90 s per call) until your delegated tasks finish or one of your agents needs an approval / answer from you. Only for work about to finish: for anything longer end your turn instead (results and requests are sent to you as new messages).",

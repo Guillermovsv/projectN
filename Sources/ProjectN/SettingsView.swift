@@ -572,6 +572,18 @@ struct ToolsSettingsView: View {
             Section("Terminal") {
                 TextField("Shell", text: $store.settings.shell)
             }
+            Section("Memory") {
+                Picker("Sleep idle agent panes after", selection: $store.settings.sleepIdleMinutes) {
+                    Text("Never").tag(0)
+                    ForEach([10, 15, 30, 60, 120], id: \.self) { Text("\($0) min").tag($0) }
+                }
+                Picker("Unload hidden Browser page after", selection: $store.settings.browserSuspendMinutes) {
+                    Text("Never").tag(0)
+                    ForEach([5, 10, 30, 60], id: \.self) { Text("\($0) min").tag($0) }
+                }
+                Text("A Claude / Codex / Cursor pane that is idle, off screen and quiet is stopped to free RAM and resumes its own conversation when you open it (or message it). Panes that are working, waiting on you, visible, or can't resume are never slept; terminals are left alone.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
             Section {
                 Text("Changes apply to sessions started or restarted after saving. Sessions also get PROJECTN_HOME, PROJECTN_WORKSPACE, PROJECTN_PROJECT and PROJECTN_MCP_CONFIG, and \(AppHome.binDir.path.abbreviatingWithTilde) on PATH.")
                     .font(.caption).foregroundStyle(.secondary)

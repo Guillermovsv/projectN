@@ -360,6 +360,13 @@ struct AgentEditor: View {
                  ? "Can list agents, hand them tasks, follow them, create projects (with your approval), and decide its agents' gray-area approvals and questions. Claude Code only."
                  : "Works on its own. It can still ask whoever gave it the task.")
                 .font(.caption).foregroundStyle(.secondary)
+            if draft.canDelegate {
+                Toggle("Works outside the projects", isOn: $draft.worksOutsideProjects)
+                Text(draft.worksOutsideProjects
+                     ? "Runs in ProjectN's coordination folder, not inside a project: it sees the list of its projects, reads them as needed and sends each request to the right project and agent. Slack doesn't ask it which project."
+                     : "Runs inside the project of each request, with that project's README and notes loaded.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
         }
     }
 

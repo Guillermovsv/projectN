@@ -336,6 +336,12 @@ final class SlackConnector: ObservableObject {
             return
         }
 
+        // Coordinators work outside the projects and pick the project themselves: no "which project?" here.
+        if agent.worksOutsideProjects {
+            submit(agentID: agent.id, project: store.coordinationProject, instruction: instruction, user: user, channel: channel,
+                   threadTS: threadTS, messageTS: messageTS, resume: wantsResume, bot: botKey)
+            return
+        }
         let allowed = store.state.projects.filter { agent.mayAccess($0.id) }
         // Not naming a project = keep working on the one this conversation was about with this agent.
         let lastHere = harness.tasks.last { $0.origin.slackChannel == channel && $0.agentID == agent.id }?.projectID

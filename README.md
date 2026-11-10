@@ -139,6 +139,7 @@ Open from **Settings** at the bottom of the sidebar (or ⌘,) — it opens insid
 - **Voice (NVoice)** — the NVoice dictation app, built in (see below).
 - **Agents** and **Integrations (Slack)** — see [Agents & Slack](#agents--slack).
 - **MCP Servers** and **Tools** as before.
+- **Tools → Memory** — RAM savers. *Sleep idle agent panes after* (default 30 min, 0 = never): a Claude/Codex/Cursor pane that is idle, off screen and silent is stopped and resumes its own conversation (`--resume` / `codex resume`) when you open it or message it. Never slept: working panes, panes waiting on a prompt, visible panes, terminals, agent-task panes, panes without a saved session id. *Unload hidden Browser page after* (default 10 min): the page is replaced by about:blank and reloaded when the tab is shown again.
 
 ## Agents & Slack
 

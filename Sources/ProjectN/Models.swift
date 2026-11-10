@@ -220,6 +220,11 @@ struct AppSettings: Codable, Equatable {
     var voiceEnabled: Bool = true
     /// Show NVoice's waveform icon in the macOS menu bar (person, language, mic, correct last dictation).
     var voiceMenuBarIcon: Bool = true
+    /// Minutes an idle, off-screen Claude/Codex/Cursor pane may sit before its process is stopped to free
+    /// RAM (it resumes its conversation when you open it again). 0 = never.
+    var sleepIdleMinutes: Int = 30
+    /// Minutes the Browser tab may be hidden before its page is unloaded (reloaded when shown). 0 = never.
+    var browserSuspendMinutes: Int = 10
 
     init() {}
 
@@ -248,5 +253,7 @@ struct AppSettings: Codable, Equatable {
         cursorDefaults = (try? c.decode(LaunchOptions.self, forKey: .cursorDefaults)) ?? d.cursorDefaults
         voiceEnabled = (try? c.decode(Bool.self, forKey: .voiceEnabled)) ?? d.voiceEnabled
         voiceMenuBarIcon = (try? c.decode(Bool.self, forKey: .voiceMenuBarIcon)) ?? d.voiceMenuBarIcon
+        sleepIdleMinutes = (try? c.decode(Int.self, forKey: .sleepIdleMinutes)) ?? d.sleepIdleMinutes
+        browserSuspendMinutes = (try? c.decode(Int.self, forKey: .browserSuspendMinutes)) ?? d.browserSuspendMinutes
     }
 }

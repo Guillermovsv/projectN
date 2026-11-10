@@ -74,6 +74,42 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate {
         ]
     }
 
+    // MARK: Suspend while hidden (RAM)
+
+    private var hiddenTimer: Timer?
+    private var suspendedURL: URL?
+
+    /// The Browser tab left the screen: after `browserSuspendMinutes` the page is unloaded (about:blank)
+    /// so its JS, media and web process memory are released; it reloads when the tab is shown again.
+    func didHide() {
+        hiddenTimer?.invalidate()
+        let minutes = UserDefaults.standard.object(forKey: "browserSuspendMinutes") as? Int ?? 10
+        guard minutes > 0, suspendedURL == nil, let url = webView.url, url.absoluteString != "about:blank" else { return }
+        let t = Timer(timeInterval: Double(minutes) * 60, repeats: false) { [weak self] _ in
+            MainActor.assumeIsolated { self?.suspend() }
+        }
+        RunLoop.main.add(t, forMode: .common)
+        hiddenTimer = t
+    }
+
+    private func suspend() {
+        hiddenTimer = nil
+        guard let url = webView.url else { return }
+        suspendedURL = url
+        webView.pauseAllMediaPlayback()
+        webView.load(URLRequest(url: URL(string: "about:blank")!))
+    }
+
+    /// The Browser tab is on screen again.
+    func didShow() {
+        hiddenTimer?.invalidate()
+        hiddenTimer = nil
+        if let url = suspendedURL {
+            suspendedURL = nil
+            load(url)
+        }
+    }
+
     private var didInitialLoad = false
     func loadInitialIfNeeded() {
         guard !didInitialLoad else { return }
@@ -176,7 +212,8 @@ struct BrowserView: View {
                 }
             }
         }
-        .onAppear { model.loadInitialIfNeeded() }
+        .onAppear { model.loadInitialIfNeeded(); model.didShow() }
+        .onDisappear { model.didHide() }
     }
 
     private var toolbar: some View {

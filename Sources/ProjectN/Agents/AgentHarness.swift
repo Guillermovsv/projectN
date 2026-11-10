@@ -220,10 +220,20 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
     /// Validates and queues a task. Validation failures that concern a known agent + project are also recorded
     /// as failed tasks so they show up in the log.
     @discardableResult
-    func submit(_ request: AgentTaskRequest) -> Result<AgentTask, AgentHarnessError> {
+    func submit(_ incoming: AgentTaskRequest) -> Result<AgentTask, AgentHarnessError> {
         guard let store else { return .failure(.invalidRuntime("ProjectN isn't ready yet.")) }
-        guard let profile = profile(request.agentID) else { return fail(.agentNotFound, request) }
-        guard profile.enabled else { return fail(.agentDisabled(profile.name), request) }
+        guard let profile = profile(incoming.agentID) else { return fail(.agentNotFound, incoming) }
+        guard profile.enabled else { return fail(.agentDisabled(profile.name), incoming) }
+        var request = incoming
+        // Coordinators work outside the projects: the request goes to their coordination session, and a project
+        // it was aimed at becomes a hint they use to pick where (and to whom) to send the work.
+        if profile.worksOutsideProjects, request.projectID != Store.coordinationProjectID {
+            if let p = store.project(request.projectID), request.resumeTaskID == nil {
+                request.instruction += "\n\n(Proyecto indicado: \(p.name) — \(p.path))"
+            }
+            request.projectID = Store.coordinationProjectID
+            if let rid = request.resumeTaskID, task(rid)?.projectID != Store.coordinationProjectID { request.resumeTaskID = nil }
+        }
         guard let project = store.project(request.projectID) else { return fail(.projectNotFound, request) }
         guard profile.mayAccess(project.id) else {
             return fail(.projectNotAllowed(agent: profile.name, project: project.name), request)
@@ -411,11 +421,13 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
             t.notesDigest = digest
         } else {
             t.notesDigest = digest
-            let ctx = ContextLoader.load(projectPath: project.path, sources: profile.contextSources)
+            let coordinating = project.id == Store.coordinationProjectID
+            let ctx = coordinating ? ContextLoader.Bundle() : ContextLoader.load(projectPath: project.path, sources: profile.contextSources)
             t.notes += ctx.notes
             prompt = PromptComposer.firstMessage(task: t, profile: profile, project: project, context: ctx,
                                                  includeInstructions: profile.runtime != .claudeCode,
-                                                 recap: t.skipRecap == true || profile.sessionPolicy != .perProject ? [] : recentConversation(for: t))
+                                                 recap: t.skipRecap == true || profile.sessionPolicy != .perProject ? [] : recentConversation(for: t),
+                                                 projects: coordinating ? coordinatedProjects(profile) : [])
             // One terminal per agent + project: earlier sessions of this pair whose work is done are closed.
             closeFinishedPanes(agent: profile.id, project: project.id)
         }
@@ -427,6 +439,10 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
             let tools = helper != nil && depthAllowsDelegation(t, profile) ? PromptComposer.Capabilities.delegate
                       : helper != nil ? .ask : PromptComposer.Capabilities.none
             args += ["--append-system-prompt", PromptComposer.systemPrompt(profile: profile, project: project, capabilities: tools)]
+            if project.id == Store.coordinationProjectID {
+                // Reads the projects it coordinates without Claude Code asking for each folder.
+                for p in coordinatedProjects(profile) { args += ["--add-dir", p.path] }
+            }
             // Built-in tools for the access level (or the profile's own selection). MCP tools aren't affected.
             if let tools = AgentToolCatalog.claudeFlag(profile) { args += ["--tools", tools] }
             if !profile.usesClaudeMCP(ClaudeMCPEntry.chromeName) { args.append("--no-chrome") }
@@ -470,6 +486,11 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
                                          "session": t.sessionID ?? "pending", "pane": pane.id.uuidString,
                                          "permission": options.permission ?? "", "model": t.model])
         emit(t, .started)
+    }
+
+    /// The projects a coordinator sees and sends work to (existing folders it may access).
+    func coordinatedProjects(_ profile: AgentProfile) -> [Project] {
+        (store?.state.projects ?? []).filter { profile.mayAccess($0.id) && $0.exists }
     }
 
     // MARK: Per-project sessions
@@ -887,15 +908,20 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
     /// few per agent stay up. The pane and conversation remain; the next message resumes it.
     func closeIdleSessions(now: Date = Date()) {
         guard let store, let w = store.agentWorkspace else { return }
-        var idle: [(pane: UUID, task: AgentTask)] = []
+        // Idle since the task finished, or since the process last printed / was (re)started: a session you
+        // reopen by looking at it counts as fresh, not as idle since its task ended long ago.
+        var idle: [(pane: UUID, task: AgentTask, since: Date)] = []
+        let visible = store.visiblePaneIDs
         for p in w.spaces.flatMap(\.panes) {
-            guard let tid = p.agentTaskID, let t = task(tid), t.status.isFinished, store.runtimes[p.id]?.isRunning == true else { continue }
-            idle.append((p.id, t))
+            guard let tid = p.agentTaskID, let t = task(tid), t.status.isFinished,
+                  let rt = store.runtimes[p.id], rt.isRunning else { continue }
+            if visible.contains(p.id) { continue }   // on screen: never stopped under your eyes
+            idle.append((p.id, t, max(t.finishedAt ?? now, rt.startedAt, rt.lastOutputAt)))
         }
         let limit = Double(policy.idleCloseMinutes * 60)
         var keep: [UUID: Int] = [:]
-        for item in idle.sorted(by: { ($0.task.finishedAt ?? .distantPast) > ($1.task.finishedAt ?? .distantPast) }) {
-            let age = now.timeIntervalSince(item.task.finishedAt ?? now)
+        for item in idle.sorted(by: { $0.since > $1.since }) {
+            let age = now.timeIntervalSince(item.since)
             let n = keep[item.task.agentID, default: 0]
             if age > limit || n >= policy.maxIdleSessionsPerAgent {
                 store.killRuntime(item.pane)

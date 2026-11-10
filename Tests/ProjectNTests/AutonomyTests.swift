@@ -823,4 +823,48 @@ struct AutonomyTests {
         env.harness.cancel(child.id)
         env.harness.cancel(pm.id)
     }
+
+    @Test func coordinatorWorksOutsideProjectsAndPicksTheProject() async throws {
+        let env = try await makeEnv()
+        defer { env.store.terminateAll() }
+        _ = addDeveloper(env, autonomy: .balanced)
+        var pmProfile = try #require(env.harness.profiles.first { $0.name == "Project Manager" })
+        pmProfile.worksOutsideProjects = true
+        env.harness.saveProfile(pmProfile)
+
+        // No project named and none asked for: it goes to the coordination folder.
+        env.slack.handle(event: ["type": "app_mention", "user": "U1", "channel": "C1", "ts": "4401.1",
+                                 "text": "<@UBOT> Project Manager, qué hay pendiente esta semana SLOW"], eventID: "Ev4401.1")
+        let pm = try #require(env.harness.tasks.last)
+        #expect(pm.projectID == Store.coordinationProjectID)
+        try await waitUntil { env.harness.task(pm.id)?.status == .running || env.harness.task(pm.id)?.status == .starting }
+        #expect(!env.posts.all.contains("¿En qué proyecto"))
+        #expect(env.store.agentWorkspace?.projectIDs.contains(Store.coordinationProjectID) == false)
+
+        // It sees every project (name, path, README summary), not one project's files, and can read them.
+        let argsFile = TestHome.url.appendingPathComponent("fake/args-\(env.harness.task(pm.id)?.sessionID ?? "")-new")
+        try await waitUntil { ((try? String(contentsOf: argsFile, encoding: .utf8)) ?? "").contains("## Projects you coordinate") }
+        let args = (try? String(contentsOf: argsFile, encoding: .utf8)) ?? ""
+        #expect(args.contains("**Demo** — \(env.project.path) — - Arreglar login") && args.contains("**Tienda**"))
+        #expect(!args.contains("<untrusted_file path=") && args.contains("--add-dir") && args.contains(env.other.path))
+        #expect(args.contains("coordination folder, outside every project"))
+
+        // Its tools need a project.
+        let (tools, r) = await mcp([("delegate_task", ["agent": "Developer", "instruction": "Revisa el login",
+                                                       "context": "El login de la tienda falla desde ayer; ver README de Tienda."]),
+                                    ("delegate_task", ["agent": "Developer", "instruction": "Revisa el login", "project": "Tienda",
+                                                       "context": "El login de la tienda falla desde ayer; ver README de Tienda."]),
+                                    ("project_info", ["project": "Demo"]),
+                                    ("save_project_note", ["note": "Las tareas de Demo están en Notion: https://app.notion.com/p/x1"]),
+                                    ("save_project_note", ["note": "Las tareas de Demo están en Notion: https://app.notion.com/p/x1", "project": "Demo"])],
+                                   task: pm.id, env: env)
+        #expect(tools.contains("project_info"))
+        #expect(r[0].contains("Pass `project`"))
+        #expect(r[1].contains("task_id"))
+        #expect(env.harness.tasks.first { $0.origin.parentTaskID == pm.id }?.projectID == env.other.id)
+        #expect(r[2].contains("Arreglar login") && r[2].contains("\"name\":\"Demo\""))
+        #expect(r[3].contains("pass `project`") && r[4].contains("Saved"))
+        #expect(AgentStore.projectNotes(env.project.id).contains("https://app.notion.com/p/x1"))
+        for t in env.harness.tasks where t.status.isActive { env.harness.cancel(t.id) }
+    }
 }
