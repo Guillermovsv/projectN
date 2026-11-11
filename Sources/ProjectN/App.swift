@@ -43,6 +43,13 @@ struct ProjectNApp: App {
                 .environmentObject(agents)
                 .environmentObject(slack)
                 .frame(minWidth: 960, minHeight: 600)
+                .sheet(isPresented: $nav.showAddFromGitHub) {
+                    AddFromGitHubSheet()
+                        .environmentObject(store)
+                        .environmentObject(panel)
+                        .environmentObject(nav)
+                        .environmentObject(agents)
+                }
                 .onAppear {
                     delegate.store = store
                     delegate.agents = agents
@@ -67,6 +74,8 @@ struct ProjectNApp: App {
 @MainActor
 final class NavigationModel: ObservableObject {
     @Published var settingsTab: SettingsView.Tab?
+    /// "Add Project from GitHub…" sheet (menu, ⇧⌘O, sidebar).
+    @Published var showAddFromGitHub = false
 
     /// Workspaces (projects → spaces → panes) or Agents (agents → their tasks). Remembered across launches.
     enum Mode: String, CaseIterable, Identifiable {
@@ -203,6 +212,8 @@ struct AppCommands: Commands {
         CommandGroup(replacing: .newItem) {
             Button("Add Project Folder…") { _ = store.pickProjectFolders() }
                 .keyboardShortcut("o", modifiers: [.command])
+            Button("Add Project from GitHub…") { nav.showAddFromGitHub = true }
+                .keyboardShortcut("o", modifiers: [.command, .shift])
         }
         CommandGroup(after: .sidebar) {
             Button("Workspaces View") { nav.switchMode(.workspaces) }
