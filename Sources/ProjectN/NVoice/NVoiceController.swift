@@ -56,7 +56,7 @@ enum Sound {
 
 final class NVoiceController: NSObject, ObservableObject {
     static let shared = NVoiceController()
-    static let standaloneBundleID = "dev.projectn.nvoice"
+    static let standaloneBundleID = "com.4vmarketing.nvoice"
 
     enum State: Equatable {
         case off
@@ -83,6 +83,7 @@ final class NVoiceController: NSObject, ObservableObject {
     private var statusItem: NSStatusItem?
     private var bag = Set<AnyCancellable>()
     private var permissionTimer: Timer?
+    private var lockRetryTimer: Timer?
     private var observersInstalled = false
     private var wantMenuBarIcon = true
 
@@ -119,8 +120,10 @@ final class NVoiceController: NSObject, ObservableObject {
         guard SingleInstance.acquire() else {
             Diagnostics.log("ProjectN: the NVoice app is running — not starting built-in dictation")
             state = .blockedByStandalone
+            retryWhenStandaloneExits()
             return
         }
+        lockRetryTimer?.invalidate(); lockRetryTimer = nil
         Diagnostics.log("ProjectN: starting built-in NVoice")
         AudioDucker.restoreAfterCrash()
         if overlay == nil {
@@ -150,8 +153,23 @@ final class NVoiceController: NSObject, ObservableObject {
         startHotkeyOrWaitForPermission()
     }
 
+    /// The lock frees when the standalone app quits or crashes: take over without needing a settings change.
+    private func retryWhenStandaloneExits() {
+        guard lockRetryTimer == nil else { return }
+        lockRetryTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] t in
+            guard let self, self.state == .blockedByStandalone else {
+                t.invalidate(); self?.lockRetryTimer = nil
+                return
+            }
+            guard SingleInstance.acquire() else { return }
+            t.invalidate(); self.lockRetryTimer = nil
+            self.apply(enabled: true, menuBarIcon: self.wantMenuBarIcon)
+        }
+    }
+
     private func stop() {
         Diagnostics.log("ProjectN: stopping built-in NVoice")
+        lockRetryTimer?.invalidate(); lockRetryTimer = nil
         permissionTimer?.invalidate(); permissionTimer = nil
         if transcriber.isRecording { transcriber.cancel() }
         restoreOtherAudio()
@@ -178,6 +196,10 @@ final class NVoiceController: NSObject, ObservableObject {
                 SingleInstance.release()
                 self.state = .off
                 self.apply(enabled: true, menuBarIcon: self.wantMenuBarIcon)
+            } else if tries == 6 {
+                // A frozen app never answers a polite quit.
+                Diagnostics.log("NVoice app did not quit — force quitting it")
+                NSRunningApplication.runningApplications(withBundleIdentifier: Self.standaloneBundleID).forEach { $0.forceTerminate() }
             } else if tries > 12 {
                 t.invalidate()
             }

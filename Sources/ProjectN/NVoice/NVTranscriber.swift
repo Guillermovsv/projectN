@@ -38,8 +38,17 @@ final class Transcriber {
         let requestedUID: String?     // what was asked for (nil = system default)
         let switched: Bool            // the device switch actually happened
     }
-    private let audioQueue = DispatchQueue(label: "dev.projectn.nvoice.audio", qos: .userInitiated)
-    private var warm: Warm?           // only touched on audioQueue
+    /// CoreAudio can block forever, so nothing on the main thread waits on it without a limit.
+    private static let startTimeout: TimeInterval = 4      // an on-demand build alone can take ~2.5 s
+    private static let stopTimeout: TimeInterval = 1.5
+    private static let prewarmTimeout: TimeInterval = 15
+    private let worker = AudioWorker(label: "dev.projectn.nvoice.audio")
+    private let warmLock = NSLock()
+    private var warmStorage: Warm?
+    private var warm: Warm? {
+        get { warmLock.withLock { warmStorage } }
+        set { warmLock.withLock { warmStorage = newValue } }
+    }
     private var engine: AVAudioEngine?   // the engine of the current dictation (main thread)
     private var rebuildAfterRecording = false
     private var configObserver: NSObjectProtocol?
@@ -110,30 +119,40 @@ final class Transcriber {
             DispatchQueue.main.async { self.onLevel?(level) }
         }
         // Fast path: the warm engine (~50 ms). If it turns out stale, rebuild once and retry.
-        var micFormat: AVAudioFormat!
-        var lastError: Error = TranscriberError.micUnavailable("no input format")
-        for attempt in 0..<2 {
-            let w = takeWarm(forceRebuild: attempt > 0)
-            guard let w else { continue }
-            do {
-                micFormat = try Self.begin(w, tap: tapBlock)
-                engine = w.engine
-                // Only the engine being recorded with: building an engine fires this too, so a global
-                // observer would rebuild forever.
-                configObserver = NotificationCenter.default.addObserver(forName: .AVAudioEngineConfigurationChange,
-                                                                        object: w.engine, queue: .main) { [weak self] _ in
-                    self?.rebuildAfterRecording = true
+        let outcome = worker.run(timeout: Self.startTimeout, work: { [self] () -> Result<(Warm, AVAudioFormat), Error> in
+            var lastError: Error = TranscriberError.micUnavailable("no input format")
+            for attempt in 0..<2 {
+                guard let w = takeWarm(forceRebuild: attempt > 0) else { continue }
+                do { return .success((w, try Self.begin(w, tap: tapBlock))) }
+                catch {
+                    lastError = error
+                    Diagnostics.log("audio start failed (\(attempt == 0 ? "warm engine" : "fresh engine")): \(error.localizedDescription)")
                 }
-                break
-            } catch {
-                lastError = error
-                Diagnostics.log("audio start failed (\(attempt == 0 ? "warm engine" : "fresh engine")): \(error.localizedDescription)")
             }
-        }
-        guard engine != nil, micFormat != nil else {
+            return .failure(lastError)
+        }, discard: { result in
+            // It started after we gave up: never leave the mic open.
+            if case .success(let started) = result { Self.end(started.0.engine) }
+        })
+        let w: Warm, micFormat: AVAudioFormat
+        do {
+            guard let outcome else {
+                Diagnostics.log("audio start timed out — CoreAudio is not responding, moving to a fresh audio queue")
+                warm = nil
+                throw TranscriberError.micUnavailable("audio system not responding")
+            }
+            (w, micFormat) = try outcome.get()
+        } catch {
             rawCont.finish(); rawContinuation = nil
             prewarm()
-            throw lastError
+            throw error
+        }
+        engine = w.engine
+        // Only the engine being recorded with: building an engine fires this too, so a global
+        // observer would rebuild forever.
+        configObserver = NotificationCenter.default.addObserver(forName: .AVAudioEngineConfigurationChange,
+                                                                object: w.engine, queue: .main) { [weak self] _ in
+            self?.rebuildAfterRecording = true
         }
         isRecording = true
         startDate = Date()
@@ -258,9 +277,12 @@ final class Transcriber {
     }
 
     private func teardownAudio() {
-        if let e = engine {
-            _ = NVTryObjC({ e.inputNode.removeTap(onBus: 0) }, nil)
-            e.stop()
+        if let e = engine, worker.run(timeout: Self.stopTimeout, work: { Self.end(e) }) == nil {
+            Diagnostics.log("audio stop timed out — CoreAudio is not responding, moving to a fresh audio queue")
+            // The job may never have got its turn; the mic must still be released.
+            DispatchQueue.global(qos: .utility).async { Self.end(e) }
+            warm = nil
+            prewarm()
         }
         engine = nil
         if let o = configObserver { NotificationCenter.default.removeObserver(o); configObserver = nil }
@@ -273,12 +295,18 @@ final class Transcriber {
     // MARK: Warm engine
 
     /// Builds the engine in the background (if it isn't ready already) so the next fn press starts instantly.
-    func prewarm() {
-        audioQueue.async { [weak self] in
+    func prewarm(discardExisting: Bool = false) {
+        // Waits on a background thread, so a build that hangs gets abandoned before the next fn press needs the queue.
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
-            let device = self.inputDeviceProvider()
-            if let w = self.warm, w.requestedUID == device?.uid { return }
-            self.warm = Self.build(device)
+            let finished: Void? = self.worker.run(timeout: Self.prewarmTimeout, work: { [weak self] in
+                guard let self else { return }
+                if discardExisting { self.warm = nil }
+                let device = self.inputDeviceProvider()
+                if let w = self.warm, w.requestedUID == device?.uid { return }
+                _ = self.buildWarm(device)
+            })
+            if finished == nil { Diagnostics.log("audio engine build timed out — moving to a fresh audio queue") }
         }
     }
 
@@ -290,24 +318,34 @@ final class Transcriber {
         let w = DispatchWorkItem { [weak self] in
             guard let self, !self.isRecording else { self?.rebuildAfterRecording = true; return }
             Diagnostics.log("rebuilding audio engine — \(reason)")
-            self.audioQueue.async { [weak self] in self?.warm = nil }
-            self.prewarm()
+            self.prewarm(discardExisting: true)
         }
         rebuildWork = w
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.6, execute: w)
     }
 
-    /// Main thread. Returns the warm engine if it matches the current mic, otherwise builds one now
-    /// (waits for a build already running in the background rather than starting a second one).
+    /// On the worker. Returns the warm engine if it matches the current mic, otherwise builds one now
+    /// (the worker is serial, so a build already running finishes first rather than starting a second one).
     private func takeWarm(forceRebuild: Bool) -> Warm? {
-        audioQueue.sync {
-            let device = inputDeviceProvider()
-            if !forceRebuild, let w = warm, w.requestedUID == device?.uid { return w }
-            let t0 = Date()
-            warm = Self.build(device)
-            Diagnostics.log(String(format: "audio engine built on demand in %.0f ms", Date().timeIntervalSince(t0) * 1000))
-            return warm
-        }
+        let device = inputDeviceProvider()
+        if !forceRebuild, let w = warm, w.requestedUID == device?.uid { return w }
+        let t0 = Date()
+        let w = buildWarm(device)
+        Diagnostics.log(String(format: "audio engine built on demand in %.0f ms", Date().timeIntervalSince(t0) * 1000))
+        return w
+    }
+
+    /// On the worker. A build left behind by an abandoned queue must not replace the current engine.
+    private func buildWarm(_ device: AudioInputDevice?) -> Warm? {
+        let generation = worker.generation
+        let w = Self.build(device)
+        if worker.generation == generation { warm = w }
+        return w
+    }
+
+    private static func end(_ engine: AVAudioEngine) {
+        _ = NVTryObjC({ engine.inputNode.removeTap(onBus: 0) }, nil)
+        engine.stop()
     }
 
     private static func build(_ device: AudioInputDevice?) -> Warm? {
