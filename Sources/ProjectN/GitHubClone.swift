@@ -165,6 +165,164 @@ enum GitHubClone {
         }
         return nil
     }
+
+    // MARK: First-time setup: install gh, sign in
+
+    static let loginCommand = "gh auth login --hostname github.com --git-protocol https --web --clipboard --skip-ssh-key"
+    static let deviceURL = URL(string: "https://github.com/login/device")!
+
+    /// The one-time device code in `gh auth login` output ("One-time code (ABCD-1234)…" or "…your one-time code: ABCD-1234").
+    static func deviceCode(in output: String) -> String? {
+        guard let r = output.range(of: #"\b[A-Z0-9]{4}-[A-Z0-9]{4}\b"#, options: .regularExpression) else { return nil }
+        return String(output[r])
+    }
+
+    nonisolated static func hasHomebrew(shell: String, env: [String: String]) -> Bool {
+        AccountsModel.run(shell: shell, "command -v brew >/dev/null 2>&1", env: env).code == 0
+    }
+
+    /// Nil on success, else the tail of brew's output.
+    nonisolated static func installGH(shell: String, env: [String: String]) -> String? {
+        var e = env
+        e["HOMEBREW_NO_AUTO_UPDATE"] = "1"
+        let r = AccountsModel.run(shell: shell, "brew install gh 2>&1", env: e)
+        guard r.code != 0 else { return nil }
+        let tail = r.out.split(separator: "\n").suffix(6).joined(separator: "\n")
+        return tail.isEmpty ? "brew install gh failed (exit \(r.code))." : tail
+    }
+
+    /// The signed-in account (`gh api user`), or nil.
+    nonisolated static func currentLogin(shell: String, env: [String: String]) -> String? {
+        let r = AccountsModel.run(shell: shell, "gh api user --jq .login 2>/dev/null", env: env)
+        let login = r.out.trimmingCharacters(in: .whitespacesAndNewlines)
+        return r.code == 0 && GitHubRepoRef.isValidOwner(login) ? login : nil
+    }
+}
+
+// MARK: - Model (gh calls off the main thread; the sheet only renders)
+
+@MainActor
+final class GitHubConnectModel: ObservableObject {
+    enum Phase: Equatable {
+        case loading, ready
+        case notInstalled, noHomebrew, installing
+        case signedOut, signingIn(code: String?)
+        case failed(String)
+    }
+
+    @Published var phase: Phase = .loading
+    @Published var repos: [GitHubRepo] = []
+    @Published var login: String?
+    private var shell = "/bin/zsh"
+    private var env: [String: String] = [:]
+    private var loginProcess: Process?
+    private var loginOutput = ""
+
+    func configure(settings: AppSettings) {
+        shell = settings.shell.isEmpty ? "/bin/zsh" : settings.shell
+        env = AccountsModel.environment(settings: settings)
+    }
+
+    var shellAndEnv: (String, [String: String]) { (shell, env) }
+
+    func load() {
+        phase = .loading
+        let (shell, env) = (self.shell, self.env)
+        Task.detached {
+            let result = GitHubClone.list(shell: shell, env: env)
+            var who: String?
+            if case .repos = result { who = GitHubClone.currentLogin(shell: shell, env: env) }
+            await self.apply(result, login: who)
+        }
+    }
+
+    private func apply(_ result: GitHubClone.ListResult, login: String?) {
+        switch result {
+        case .repos(let r): repos = r; self.login = login; phase = .ready
+        case .notInstalled: phase = .notInstalled
+        case .signedOut: phase = .signedOut
+        case .failed(let why): phase = .failed(why)
+        }
+    }
+
+    /// Installs gh with Homebrew, then reloads (which leads to Sign in).
+    func installGH() {
+        phase = .installing
+        let (shell, env) = (self.shell, self.env)
+        Task.detached {
+            guard GitHubClone.hasHomebrew(shell: shell, env: env) else {
+                await MainActor.run { self.phase = .noHomebrew }
+                return
+            }
+            if let err = GitHubClone.installGH(shell: shell, env: env) {
+                await MainActor.run { self.phase = .failed(err) }
+            } else {
+                await self.load()
+            }
+        }
+    }
+
+    /// `gh auth login --web` in the background: shows its one-time code here and reloads when GitHub confirms.
+    func signIn() {
+        cancelSignIn()
+        loginOutput = ""
+        phase = .signingIn(code: nil)
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: shell)
+        p.arguments = ["-l", "-c", GitHubClone.loginCommand + " 2>&1"]
+        p.environment = env
+        let out = Pipe(), input = Pipe()
+        p.standardOutput = out
+        p.standardError = out
+        p.standardInput = input
+        out.fileHandleForReading.readabilityHandler = { [weak self] h in
+            let data = h.availableData
+            guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
+            Task { @MainActor in self?.received(text) }
+        }
+        p.terminationHandler = { [weak self] proc in
+            out.fileHandleForReading.readabilityHandler = nil
+            let status = proc.terminationStatus
+            Task { @MainActor in self?.loginFinished(status) }
+        }
+        do {
+            try p.run()
+            loginProcess = p
+            // Older gh versions wait for Enter before polling; a newline is harmless otherwise.
+            input.fileHandleForWriting.write(Data("\n".utf8))
+        } catch {
+            phase = .failed("Couldn't start gh auth login: \(error.localizedDescription)")
+        }
+    }
+
+    private func received(_ text: String) {
+        loginOutput += text
+        if case .signingIn(nil) = phase, let code = GitHubClone.deviceCode(in: loginOutput) {
+            phase = .signingIn(code: code)
+        }
+    }
+
+    private func loginFinished(_ status: Int32) {
+        loginProcess = nil
+        guard case .signingIn = phase else { return }   // cancelled
+        if status == 0 {
+            load()
+        } else {
+            let tail = loginOutput.split(separator: "\n").suffix(4).joined(separator: "\n")
+            phase = .failed(tail.isEmpty ? "gh auth login stopped (exit \(status))." : tail)
+        }
+    }
+
+    func cancelSignIn() {
+        if let p = loginProcess, p.isRunning { p.terminate() }
+        loginProcess = nil
+    }
+
+    func openDevicePage(code: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(code, forType: .string)
+        NSWorkspace.shared.open(GitHubClone.deviceURL)
+    }
 }
 
 // MARK: - Sheet
@@ -172,24 +330,20 @@ enum GitHubClone {
 struct AddFromGitHubSheet: View {
     @EnvironmentObject var store: Store
     @EnvironmentObject var agents: AgentHarness
-    @EnvironmentObject var nav: NavigationModel
-    @EnvironmentObject var panel: RightPanelModel
     @Environment(\.dismiss) private var dismiss
 
-    private enum Phase: Equatable { case loading, ready, notInstalled, signedOut, failed(String) }
-
-    @State private var phase: Phase = .loading
-    @State private var repos: [GitHubRepo] = []
+    @StateObject private var model = GitHubConnectModel()
     @State private var query = ""
     @State private var selection: String?
     @State private var folder = ""
     @State private var working = false
     @State private var error: String?
+    @FocusState private var fieldFocused: Bool
 
     private var filtered: [GitHubRepo] {
         let q = query.trimmingCharacters(in: .whitespaces).lowercased()
-        guard !q.isEmpty else { return repos }
-        return repos.filter { $0.nameWithOwner.lowercased().contains(q) || ($0.description ?? "").lowercased().contains(q) }
+        guard !q.isEmpty else { return model.repos }
+        return model.repos.filter { $0.nameWithOwner.lowercased().contains(q) || ($0.description ?? "").lowercased().contains(q) }
     }
 
     /// The selected row, or what was typed/pasted (`owner/repo` or a GitHub URL).
@@ -199,20 +353,30 @@ struct AddFromGitHubSheet: View {
         return q.contains("/") ? GitHubRepoRef(q) : nil
     }
 
+    private var noReposYet: Bool { model.phase == .ready && model.repos.isEmpty }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack(spacing: 8) {
                 Image(systemName: "arrow.triangle.branch").foregroundStyle(.purple)
                 Text("Add Project from GitHub").font(.headline)
-            }
-            TextField("Search your repositories, or paste owner/repo or a GitHub URL", text: $query)
-                .textFieldStyle(.roundedBorder)
-                .onChange(of: query) { _, _ in
-                    if let s = selection, !filtered.contains(where: { $0.id == s }) { selection = nil }
+                Spacer()
+                if model.phase == .ready, let login = model.login {
+                    Text("Signed in as \(login)").font(.caption).foregroundStyle(.secondary)
                 }
+            }
+            if model.phase == .ready {
+                TextField(noReposYet ? "Paste owner/repo or a GitHub URL"
+                                     : "Search your repositories, or paste owner/repo or a GitHub URL", text: $query)
+                    .textFieldStyle(.roundedBorder)
+                    .focused($fieldFocused)
+                    .onChange(of: query) { _, _ in
+                        if let s = selection, !filtered.contains(where: { $0.id == s }) { selection = nil }
+                    }
+            }
             content
-                .frame(height: 300)
-            destinationRow
+                .frame(height: model.phase == .ready ? 300 : 334)
+            if model.phase == .ready { destinationRow }
             if let error {
                 Text(error).font(.callout).foregroundStyle(.red).textSelection(.enabled)
                     .fixedSize(horizontal: false, vertical: true)
@@ -223,34 +387,66 @@ struct AddFromGitHubSheet: View {
                     Text("Cloning \(target?.slug ?? "")…").font(.callout).foregroundStyle(.secondary)
                 }
                 Spacer()
-                Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
-                Button("Add Project", action: add)
-                    .keyboardShortcut(.defaultAction)
-                    .disabled(target == nil || working || folder.isEmpty)
+                Button("Cancel") { model.cancelSignIn(); dismiss() }.keyboardShortcut(.cancelAction)
+                if model.phase == .ready {
+                    Button("Add Project", action: add)
+                        .keyboardShortcut(.defaultAction)
+                        .disabled(target == nil || working || folder.isEmpty)
+                }
             }
         }
         .padding(20)
         .frame(width: 560)
         .onAppear {
             if folder.isEmpty { folder = agents.projectsFolder }
-            load()
+            model.configure(settings: store.settings)
+            model.load()
+        }
+        .onDisappear { model.cancelSignIn() }
+        .onChange(of: model.phase) { _, p in
+            if p == .ready && model.repos.isEmpty { fieldFocused = true }
         }
     }
 
     @ViewBuilder private var content: some View {
-        switch phase {
+        switch model.phase {
         case .loading:
             VStack { Spacer(); ProgressView("Loading your repositories…"); Spacer() }.frame(maxWidth: .infinity)
         case .notInstalled:
-            message("The GitHub CLI isn't installed.", detail: "Install it with `brew install gh`, then sign in from Settings → Accounts.")
+            message("Connect GitHub to clone your repositories",
+                    detail: "ProjectN uses the GitHub CLI (gh). It isn't installed yet.",
+                    primary: ("Install gh with Homebrew", model.installGH),
+                    note: "Runs brew install gh, then asks you to sign in.")
+        case .noHomebrew:
+            message("Homebrew isn't installed",
+                    detail: "Install Homebrew from brew.sh, then come back and press Try Again.",
+                    primary: ("Open brew.sh", { NSWorkspace.shared.open(URL(string: "https://brew.sh")!) }),
+                    secondary: ("Try Again", model.load))
+        case .installing:
+            VStack(spacing: 10) {
+                Spacer()
+                ProgressView()
+                Text("Installing gh with Homebrew…").font(.body.weight(.medium))
+                Text("This can take a minute. The next step starts by itself.").font(.callout).foregroundStyle(.secondary)
+                Spacer()
+            }
+            .frame(maxWidth: .infinity)
         case .signedOut:
-            message("You're not signed in to GitHub.", detail: "Sign in from Settings → Accounts → GitHub, then try again.",
-                    action: ("Open Accounts", { dismiss(); nav.openSettings(.accounts, panel: panel) }))
+            message("Sign in to GitHub to see your repositories",
+                    detail: "Signs in the GitHub CLI on this Mac. Your token stays in the macOS Keychain.",
+                    primary: ("Sign in with GitHub", model.signIn))
+        case .signingIn(let code):
+            signingIn(code)
         case .failed(let why):
-            message("Couldn't list your repositories.", detail: why, action: ("Try Again", load))
+            message("Something went wrong", detail: why, primary: ("Try Again", model.load))
         case .ready:
-            if filtered.isEmpty {
-                message(target != nil ? "Not in your list — it will be cloned as typed." : "No repositories match.",
+            if noReposYet {
+                message("\(model.login ?? "This account") has no repositories yet",
+                        detail: "Paste any repository you can access above (for example Guillermovsv/projectN), or create one on GitHub and refresh.",
+                        primary: ("Open github.com/new", { NSWorkspace.shared.open(URL(string: "https://github.com/new")!) }),
+                        secondary: ("Refresh", model.load))
+            } else if filtered.isEmpty {
+                message(target != nil ? "Not in your list — it will be cloned as typed." : "No repositories match “\(query)”.",
                         detail: target.map { "github.com/\($0.slug)" } ?? "")
             } else {
                 List(filtered, selection: $selection) { r in
@@ -275,6 +471,27 @@ struct AddFromGitHubSheet: View {
         }
     }
 
+    private func signingIn(_ code: String?) -> some View {
+        VStack(spacing: 10) {
+            Spacer()
+            if let code {
+                Text("Finish in your browser and enter this code").font(.callout).foregroundStyle(.secondary)
+                Text(code).font(.system(size: 26, weight: .bold, design: .monospaced)).textSelection(.enabled)
+                Button("Copy code and open github.com") { model.openDevicePage(code: code) }
+                    .buttonStyle(.borderedProminent)
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.small)
+                    Text("Waiting for GitHub… your repositories load by themselves.").font(.callout).foregroundStyle(.secondary)
+                }
+            } else {
+                ProgressView()
+                Text("Starting GitHub sign-in…").font(.callout).foregroundStyle(.secondary)
+            }
+            Spacer()
+        }
+        .frame(maxWidth: .infinity)
+    }
+
     private var destinationRow: some View {
         HStack(spacing: 8) {
             Text("Clone into").foregroundStyle(.secondary)
@@ -287,33 +504,26 @@ struct AddFromGitHubSheet: View {
         .font(.callout)
     }
 
-    private func message(_ title: String, detail: String, action: (String, () -> Void)? = nil) -> some View {
-        VStack(spacing: 8) {
+    private func message(_ title: String, detail: String,
+                         primary: (String, () -> Void)? = nil,
+                         secondary: (String, () -> Void)? = nil,
+                         note: String? = nil) -> some View {
+        VStack(spacing: 10) {
             Spacer()
-            Text(title).font(.body.weight(.medium))
-            if !detail.isEmpty { Text(detail).font(.callout).foregroundStyle(.secondary).multilineTextAlignment(.center) }
-            if let action { Button(action.0, action: action.1) }
+            Text(title).font(.body.weight(.semibold)).multilineTextAlignment(.center)
+            if !detail.isEmpty {
+                Text(detail).font(.callout).foregroundStyle(.secondary).multilineTextAlignment(.center)
+                    .textSelection(.enabled).frame(maxWidth: 420)
+            }
+            HStack(spacing: 8) {
+                if let primary { Button(primary.0, action: primary.1).buttonStyle(.borderedProminent) }
+                if let secondary { Button(secondary.0, action: secondary.1) }
+            }
+            if let note { Text(note).font(.caption).foregroundStyle(.tertiary) }
             Spacer()
         }
         .frame(maxWidth: .infinity)
         .padding(.horizontal, 24)
-    }
-
-    private func load() {
-        phase = .loading
-        let shell = store.settings.shell.isEmpty ? "/bin/zsh" : store.settings.shell
-        let env = AccountsModel.environment(settings: store.settings)
-        Task.detached {
-            let result = GitHubClone.list(shell: shell, env: env)
-            await MainActor.run {
-                switch result {
-                case .repos(let r): repos = r; phase = .ready
-                case .notInstalled: phase = .notInstalled
-                case .signedOut: phase = .signedOut
-                case .failed(let why): phase = .failed(why)
-                }
-            }
-        }
     }
 
     private func chooseFolder() {
@@ -332,8 +542,7 @@ struct AddFromGitHubSheet: View {
         error = nil
         if let why = GitHubClone.checkFolder(folder) { error = why; return }
         working = true
-        let shell = store.settings.shell.isEmpty ? "/bin/zsh" : store.settings.shell
-        let env = AccountsModel.environment(settings: store.settings)
+        let (shell, env) = model.shellAndEnv
         let base = folder
         Task.detached {
             let dest = (base as NSString).appendingPathComponent(repo.name)

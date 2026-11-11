@@ -57,6 +57,13 @@ struct GitHubCloneTests {
         #expect(GitHubClone.plan(repo: repo, folder: folder, existsKind: .file).isBlocked)
     }
 
+    @Test func readsDeviceCodeFromLoginOutput() {
+        #expect(GitHubClone.deviceCode(in: "! One-time code (E1B6-8548) copied to clipboard\nOpen this URL…") == "E1B6-8548")
+        #expect(GitHubClone.deviceCode(in: "! First copy your one-time code: 1A2B-3C4D\nPress Enter…") == "1A2B-3C4D")
+        #expect(GitHubClone.deviceCode(in: "Open this URL to continue in your web browser: https://github.com/login/device") == nil)
+        #expect(GitHubClone.deviceCode(in: "updated 2026-11-10") == nil)
+    }
+
     @Test func refusesProtectedFolders() {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         #expect(GitHubClone.checkFolder("\(home)/.ssh") != nil || !FileManager.default.fileExists(atPath: "\(home)/.ssh"))
