@@ -70,15 +70,21 @@ enum LaunchCatalog {
     }
 
     /// From Codex's own models cache; falls back to the configured model.
-    nonisolated(unsafe) private static var codexCache: (path: String, mtime: Date?, models: [CodexModel])?
+    nonisolated(unsafe) private static var codexCache: (path: String, mtime: Date?, checked: Date, models: [CodexModel])?
 
-    /// Cached: views call this on every redraw, so only re-read the file when its modification date changes.
+    /// Cached: views call this on every redraw (several times per pane), so the file's modification date is
+    /// checked at most every few seconds and the file is only re-read when it changed.
     static func codexModels(settings: AppSettings) -> [CodexModel] {
         let url = SessionDiscovery.codexHome(settings).appendingPathComponent("models_cache.json")
+        let now = Date()
+        if let c = codexCache, c.path == url.path, now.timeIntervalSince(c.checked) < 5 { return c.models }
         let mtime = (try? FileManager.default.attributesOfItem(atPath: url.path))?[.modificationDate] as? Date
-        if let c = codexCache, c.path == url.path, c.mtime == mtime { return c.models }
+        if let c = codexCache, c.path == url.path, c.mtime == mtime {
+            codexCache?.checked = now
+            return c.models
+        }
         let models = loadCodexModels(url: url, settings: settings)
-        codexCache = (url.path, mtime, models)
+        codexCache = (url.path, mtime, now, models)
         return models
     }
 

@@ -76,6 +76,7 @@ struct ComposerView: View, Equatable {
     @State private var attachments: [URL]
     @State private var recipients: [Store.PaneRef]
     @State private var hasText: Bool
+    @State private var compact = false
 
     init(state: Store.ComposerState, pane: Pane, workspaceID: UUID, runtime: TerminalSession?) {
         self.state = state
@@ -104,12 +105,14 @@ struct ComposerView: View, Equatable {
                 .frame(height: PromptInput.height(lines: 4))
                 .popover(isPresented: $showMentions, arrowEdge: .top) { mentionPicker }
             // Full controls when there's room; icon-only model/effort/permission menus when the pane is narrow.
-            ViewThatFits(in: .horizontal) {
-                controls(compact: false)
-                controls(compact: true)
-            }
+            // Decided from the measured width, not ViewThatFits: that built and measured both sets of native
+            // menus in every pane on each layout pass, which made opening a space or the Agents view take seconds.
+            controls(compact: compact)
         }
         .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
+        .onGeometryChange(for: Bool.self) { proxy in
+            proxy.size.width < LaunchOptionMenus.fullControlsWidth(pane: pane, settings: store.settings)
+        } action: { compact = $0 }
         .padding(.horizontal, 10)
         .padding(.top, 8)
         .padding(.bottom, 6)
@@ -332,6 +335,19 @@ struct LaunchOptionMenus: View {
 
     /// Always concrete values (unset fields resolved from the CLI's own config).
     private var o: LaunchOptions { LaunchCatalog.explicit(pane.launchOptions, tool: pane.tool, settings: store.settings) }
+
+    /// Width the chat box's bottom row needs with labelled menus (otherwise they're shown icon-only).
+    /// Measured from the label text, so no menu has to be built to find out.
+    static func fullControlsWidth(pane: Pane, settings: AppSettings) -> CGFloat {
+        let o = LaunchCatalog.explicit(pane.launchOptions, tool: pane.tool, settings: settings)
+        let s = LaunchCatalog.summary(o, tool: pane.tool, settings: settings)
+        let font = NSFont.preferredFont(forTextStyle: .callout)
+        let labels = pane.tool == .cursor ? [s.model, s.permission] : [s.model, s.effort, s.permission]
+        // Each menu: icon + gap + text + its horizontal padding/hover inset.
+        let menus = labels.reduce(CGFloat(0)) { $0 + 16 + 6 + ($1 as NSString).size(withAttributes: [.font: font]).width + 16 }
+        // Paperclip, @, divider, Auto toggle, send button, spacing and the chat box's own padding.
+        return menus + 190
+    }
 
     var body: some View {
         let s = LaunchCatalog.summary(o, tool: pane.tool, settings: store.settings)

@@ -305,63 +305,72 @@ func usageColor(_ percent: Double) -> Color {
     percent >= 90 ? .red : (percent >= 70 ? .orange : .primary)
 }
 
-/// Compact meters for the top bar: one per agent (Claude, Codex, Cursor) with a pane in the current space,
-/// each showing whichever window (5h, weekly…) is highest. At the limit it shows 100% and when it resets.
+/// The top bar's usage meter: ONE control holding every agent (Claude, Codex, Cursor) with a pane in the current
+/// space, each as a small segment (icon · bar · %) showing whichever window (5h, weekly…) is highest. At the limit
+/// a segment shows 100% and when it resets. One popover with the details of all of them.
 /// Nothing is shown when the space has no agent panes.
 struct UsageMeters: View {
-    let tools: [Tool]
-
-    var body: some View {
-        HStack(spacing: 6) {
-            ForEach(tools) { UsageMeter(tool: $0, others: tools) }
-        }
-        .animation(.easeInOut(duration: 0.2), value: tools)
-    }
-}
-
-struct UsageMeter: View {
     @EnvironmentObject var usage: UsageModel
-    let tool: Tool
-    var others: [Tool] = []
+    let tools: [Tool]
     @State private var showDetails = false
 
     var body: some View {
-        Button { showDetails.toggle() } label: {
-            meter(usage.usage(for: tool))
+        if let first = tools.first {
+            Button { showDetails.toggle() } label: {
+                HStack(spacing: 8) {
+                    ForEach(Array(tools.enumerated()), id: \.element) { i, t in
+                        if i > 0 { Divider().frame(height: 12) }
+                        UsageMeterSegment(tool: t, u: usage.usage(for: t), showLabel: tools.count == 1)
+                    }
+                }
                 .padding(.horizontal, 8)
                 .frame(height: 26)
                 .background(RoundedRectangle(cornerRadius: 7).fill(Color.primary.opacity(0.06)))
                 .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .hoverHighlight(cornerRadius: 7, inset: 0)
-        .help(helpText(usage.usage(for: tool)))
-        .popover(isPresented: $showDetails, arrowEdge: .bottom) {
-            UsageDetails(tool: tool, others: others).environmentObject(usage)
+            }
+            .buttonStyle(.plain)
+            .hoverHighlight(cornerRadius: 7, inset: 0)
+            .help(helpText)
+            .popover(isPresented: $showDetails, arrowEdge: .bottom) {
+                UsageDetails(tool: first, others: tools).environmentObject(usage)
+            }
+            .animation(.easeInOut(duration: 0.2), value: tools)
         }
     }
 
-    private func helpText(_ u: UsageModel.ToolUsage) -> String {
-        var t = "\(tool.label) plan usage — the highest of its windows. Click for details."
-        if let w = u.highest, w.percent >= 100, let r = w.resetsAt {
-            t = "\(tool.label): limit reached — resets \(r.formatted(.relative(presentation: .named))) (\(r.formatted(date: .omitted, time: .shortened))). Click for details."
+    private var helpText: String {
+        var lines = ["Plan usage — the highest of each agent's windows. Click for details."]
+        for t in tools {
+            let u = usage.usage(for: t)
+            if let w = u.highest, w.percent >= 100, let r = w.resetsAt {
+                lines.append("\(t.label): limit reached — resets \(r.formatted(.relative(presentation: .named))) (\(r.formatted(date: .omitted, time: .shortened)))")
+            }
+            if let e = u.error { lines.append("\(t.label): \(e)") }
         }
-        if let e = u.error { t += "\n\(e)" }
-        return t
+        return lines.joined(separator: "\n")
     }
+}
 
-    @ViewBuilder
-    private func meter(_ u: UsageModel.ToolUsage) -> some View {
-        HStack(spacing: 6) {
+/// One agent inside the combined usage meter.
+private struct UsageMeterSegment: View {
+    let tool: Tool
+    let u: UsageModel.ToolUsage
+    /// The name is shown only when it's the sole agent; with several the colored icons tell them apart.
+    let showLabel: Bool
+
+    var body: some View {
+        HStack(spacing: 5) {
             Image(systemName: tool.symbol)
                 .font(.system(size: 11, weight: .semibold))
                 .foregroundStyle(toolColor(tool))
-            Text(tool.label)
-                .font(.caption.weight(.medium))
-                .foregroundStyle(.secondary)
+            if showLabel {
+                Text(tool.label)
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.secondary)
+            }
             if let w = u.highest {
                 UsageBar(percent: w.percent)
-                    .frame(width: 56, height: 5)
+                    .frame(width: showLabel ? 56 : 40, height: 5)
                 Text(usagePercentText(w.percent))
                     .font(.caption.monospacedDigit().weight(.semibold))
                     .foregroundStyle(usageColor(w.percent))
