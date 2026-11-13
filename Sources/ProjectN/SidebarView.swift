@@ -56,6 +56,7 @@ struct SidebarView: View {
             Menu {
                 Button("New Workspace…") { openNewWorkspace([]) }
                 Button("Add Project Folder…") { _ = store.pickProjectFolders() }
+                Button("Add Project from GitHub…") { nav.showAddFromGitHub = true }
             } label: {
                 Image(systemName: "plus")
             }
@@ -179,13 +180,16 @@ struct SidebarView: View {
         VStack(alignment: .leading, spacing: 2) {
             SectionHeader(title: "Projects", collapsed: !store.state.ui.projectsExpanded,
                           onToggle: { store.state.ui.projectsExpanded.toggle() }) {
+                Button { nav.showAddFromGitHub = true } label: { Image(systemName: "arrow.triangle.branch") }
+                    .buttonStyle(.hover)
+                    .help("Add project from GitHub (⇧⌘O)")
                 Button { _ = store.pickProjectFolders() } label: { Image(systemName: "plus") }
                     .buttonStyle(.hover)
                     .help("Add project folder (⌘O)")
             }
             if store.state.ui.projectsExpanded {
                 if store.state.projects.isEmpty {
-                    Text("Add or drop a folder here")
+                    Text("Add or drop a folder here, or clone one from GitHub")
                         .font(.callout).foregroundStyle(.tertiary)
                         .padding(.horizontal, 8).padding(.vertical, 4)
                 }

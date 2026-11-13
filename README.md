@@ -31,6 +31,7 @@ open /Applications/ProjectN.app
 ### First launch
 
 - Add a project folder (⌘O or drop a folder on the sidebar), then press **+** to open a Claude, Codex or Terminal pane.
+- Or clone one from GitHub (⇧⌘O, or the branch icon next to Projects): pick one of your repositories (or paste `owner/repo` or a URL) and ProjectN clones it with the GitHub CLI into your projects folder and adds it. Needs `gh` signed in (Settings → Accounts).
 - For voice dictation, allow **Microphone**, **Input Monitoring** and **Accessibility** when macOS asks.
 
 ## Screenshots
@@ -46,7 +47,7 @@ open /Applications/ProjectN.app
 
 | Thing | What it is |
 |---|---|
-| **Project** | A folder you've declared (sidebar → Projects, ⌘O, or drop folders on it). |
+| **Project** | A folder you've declared (sidebar → Projects, ⌘O, drop folders on it, or clone from GitHub with ⇧⌘O). |
 | **Workspace** | A named group of projects. Shown as a parent in the sidebar. |
 | **Space** | A screen inside a workspace holding **1–8 panes**, tiled automatically: a single pane fills the space, 2–3 sit side by side, 4 → 2×2, 5–6 → 3×2, 7–8 → 4×2. |
 | **Pane** | Claude, Codex or a Terminal running in one of the workspace's projects. Each new pane gets a random name (Ada, Grace, Linus…) so you can tell agents apart; the ⤢ button in its header expands it to fill the space (click again to go back to the split view). |
