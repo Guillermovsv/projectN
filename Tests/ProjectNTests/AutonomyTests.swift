@@ -601,10 +601,13 @@ struct AutonomyTests {
         first = try #require(env.harness.task(first.id))
         #expect(first.usage?.contextTokens == 10)   // read from the transcript
 
-        // The conversation grew past the limit: the next message starts a new session, with a recap.
+        // The conversation grew past the limit and its terminal was closed for idleness (a warm session is kept:
+        // the CLI compacts its own context): the next message starts a new session, with a recap.
         var big = first
         big.usage?.contextTokens = env.harness.policy.maxSessionContextK * 1000 + 1
         env.harness.replaceTask(big)
+        env.harness.closeIdleSessions(now: Date().addingTimeInterval(3 * 3600))
+        #expect(env.store.runtimes[first.paneID!] == nil)
         say("Project Manager, ahora prioriza esas tareas", "21.2")
         let second = try #require(env.harness.tasks.last)
         #expect(second.continuedSession != true && second.resumedFromTaskID == nil)
