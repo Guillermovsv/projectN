@@ -80,7 +80,9 @@ struct SpaceView: View {
         mouseMonitor = NSEvent.addLocalMonitorForEvents(matching: .leftMouseDown) { [store, workspaceID, spaceID] event in
             guard let s = store.space(spaceID, in: workspaceID) else { return event }
             for p in s.panes {
-                guard let v = store.runtimes[p.id]?.view, v.window === event.window, v.superview != nil else { continue }
+                // Hidden = this space is behind the Agents view (or the terminal is shown there instead).
+                guard let v = store.runtimes[p.id]?.view, v.window === event.window, v.superview != nil,
+                      !v.isHiddenOrHasHiddenAncestor else { continue }
                 if v.bounds.contains(v.convert(event.locationInWindow, from: nil)) {
                     store.focusPane(p.id, in: workspaceID)
                     break

@@ -96,9 +96,17 @@ final class NavigationModel: ObservableObject {
     /// Agent to show when Settings → Agents opens.
     @Published var focusAgentInSettings: UUID?
 
+    /// Both views stay mounted (RootView hides the inactive one), so this only cross-fades their opacity:
+    /// no rebuilding the pane grid or re-parenting every terminal.
+    static let switchDuration: TimeInterval = 0.15
+
     func switchMode(_ m: Mode) {
         if settingsTab != nil { closeSettings() }
-        withAnimation(.easeInOut(duration: 0.15)) { mode = m }
+        guard mode != m else { return }
+        // Don't leave keyboard focus in a view that's about to be hidden (a terminal or chat box there would
+        // keep receiving keystrokes). The newly shown focused pane takes focus again (TerminalHostView).
+        NSApp.keyWindow?.makeFirstResponder(nil)
+        withAnimation(.easeInOut(duration: Self.switchDuration)) { mode = m }
     }
     private var panelWasVisible = false
 
@@ -132,14 +140,12 @@ struct RootView: View {
     var body: some View {
         HStack(spacing: 0) {
             if sidebarVisible {
-                Group {
-                    if nav.settingsOpen {
-                        SettingsSidebar()
-                    } else if nav.mode == .agents {
-                        AgentsSidebar(onHide: { withAnimation(.easeInOut(duration: 0.18)) { sidebarVisible = false } })
-                    } else {
-                        SidebarView(onHide: { withAnimation(.easeInOut(duration: 0.18)) { sidebarVisible = false } })
-                    }
+                ZStack {
+                    SidebarView(onHide: { withAnimation(.easeInOut(duration: 0.18)) { sidebarVisible = false } })
+                        .modeLayer(active: !nav.settingsOpen && nav.mode == .workspaces)
+                    AgentsSidebar(onHide: { withAnimation(.easeInOut(duration: 0.18)) { sidebarVisible = false } })
+                        .modeLayer(active: !nav.settingsOpen && nav.mode == .agents)
+                    if nav.settingsOpen { SettingsSidebar() }
                 }
                 .frame(width: sidebarWidth)
                 .transition(.move(edge: .leading))
@@ -167,13 +173,21 @@ struct RootView: View {
         .environment(\.showSidebar, { withAnimation(.easeInOut(duration: 0.18)) { sidebarVisible = true } })
     }
 
-    @ViewBuilder
+    /// Workspaces and Agents both stay mounted; only the active one is shown. Swapping them used to tear down
+    /// the whole pane grid (and detach/re-attach every terminal) on each switch, which is what felt laggy.
     private var detail: some View {
-        if nav.settingsOpen {
-            SettingsDetailView()
-        } else if nav.mode == .agents {
+        ZStack {
+            workspacesDetail
+                .modeLayer(active: !nav.settingsOpen && nav.mode == .workspaces)
             AgentsDetailView()
-        } else if let w = store.selectedWorkspace, let s = store.selectedSpace {
+                .modeLayer(active: !nav.settingsOpen && nav.mode == .agents)
+            if nav.settingsOpen { SettingsDetailView() }
+        }
+    }
+
+    @ViewBuilder
+    private var workspacesDetail: some View {
+        if let w = store.selectedWorkspace, let s = store.selectedSpace {
             SpaceView(workspaceID: w.id, spaceID: s.id)
         } else {
             DashboardView()
@@ -181,9 +195,28 @@ struct RootView: View {
     }
 }
 
+extension View {
+    /// One of the always-mounted top-level views: hidden, inert and without keyboard shortcuts while inactive.
+    /// Terminals inside read `modeActive` to hide themselves (no drawing) and give way to the visible view.
+    func modeLayer(active: Bool) -> some View {
+        self
+            .opacity(active ? 1 : 0)
+            .allowsHitTesting(active)
+            .disabled(!active)
+            .accessibilityHidden(!active)
+            .environment(\.modeActive, active)
+    }
+}
+
+private struct ModeActiveKey: EnvironmentKey { static let defaultValue = true }
 private struct SidebarVisibleKey: EnvironmentKey { static let defaultValue = true }
 private struct ShowSidebarKey: EnvironmentKey { static let defaultValue: () -> Void = {} }
 extension EnvironmentValues {
+    /// false inside the hidden one of Workspaces / Agents (see `modeLayer`).
+    var modeActive: Bool {
+        get { self[ModeActiveKey.self] }
+        set { self[ModeActiveKey.self] = newValue }
+    }
     var sidebarVisible: Bool {
         get { self[SidebarVisibleKey.self] }
         set { self[SidebarVisibleKey.self] = newValue }

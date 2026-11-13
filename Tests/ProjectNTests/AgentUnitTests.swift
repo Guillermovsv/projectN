@@ -251,6 +251,39 @@ struct AgentUnitTests {
         #expect(s.usage == TokenUsage(inputTokens: 50, outputTokens: 7, cacheReadTokens: 20, cacheWriteTokens: 0))
     }
 
+    @Test func codexUsageLimitIsAnError() {
+        let data = lines([
+            ["type": "event_msg", "payload": ["type": "task_started"]],
+            ["type": "response_item", "payload": ["type": "message", "role": "assistant", "content": [["type": "output_text", "text": "turno anterior"]]]],
+            ["type": "event_msg", "payload": ["type": "task_complete", "last_agent_message": "ok"]],
+            ["type": "event_msg", "payload": ["type": "task_started"]],
+            ["type": "event_msg", "payload": ["type": "task_complete", "last_agent_message": NSNull(),
+                "error": ["message": "You’ve hit your usage limit. Try again at 12:54 PM.", "codex_error_info": "usage_limit_exceeded"]]],
+        ])
+        let s = TranscriptReader.parseCodex(data)
+        #expect(s.finished && s.usageLimit)
+        #expect(s.result == nil)   // not the previous turn's text
+        #expect(s.error == "You’ve hit your usage limit. Try again at 12:54 PM.")
+        // The next turn that succeeds clears it.
+        let ok = TranscriptReader.parseCodex(data + lines([
+            ["type": "event_msg", "payload": ["type": "task_started"]],
+            ["type": "event_msg", "payload": ["type": "task_complete", "last_agent_message": "listo"]],
+        ]))
+        #expect(ok.finished && ok.error == nil && !ok.usageLimit && ok.result == "listo")
+    }
+
+    @Test func claudeApiErrorEndsTheTurn() {
+        let data = lines([
+            ["type": "user", "message": ["role": "user", "content": "hola"]],
+            ["type": "assistant", "isApiErrorMessage": true,
+             "message": ["id": "e1", "role": "assistant", "model": "<synthetic>", "stop_reason": "stop_sequence",
+                         "content": [["type": "text", "text": "You've hit your limit · resets 3pm"]]]],
+        ])
+        let s = TranscriptReader.parseClaude(data)
+        #expect(s.finished && s.usageLimit && s.result == nil)
+        #expect(s.error == "You've hit your limit · resets 3pm")
+    }
+
     // MARK: Models
 
     @Test func modelListParsingAndValidation() {

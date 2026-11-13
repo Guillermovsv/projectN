@@ -436,6 +436,8 @@ struct AgentTask: Codable, Identifiable, Hashable {
     var transcriptOffset: UInt64 = 0
     var result: String?
     var error: String?
+    /// It stopped because the CLI's account hit its usage limit.
+    var usageLimit: Bool?
     /// Notes shown with the result (missing README, effort not supported, …).
     var notes: [String] = []
     var usage: TokenUsage?

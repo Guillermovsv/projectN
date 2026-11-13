@@ -231,7 +231,7 @@ struct AgentsSidebar: View {
 
 // MARK: - Detail
 
-/// Agents view, center: the selected agent, a tab per task, the task's terminal or result, and a message box.
+/// Agents view, center: the selected agent, its conversations (one per task) as a vertical list, the task's terminal or result, and a message box.
 struct AgentsDetailView: View {
     @EnvironmentObject var agents: AgentHarness
     @EnvironmentObject var store: Store
@@ -239,6 +239,7 @@ struct AgentsDetailView: View {
     @EnvironmentObject var panel: RightPanelModel
     @Environment(\.sidebarVisible) private var sidebarVisible
     @Environment(\.showSidebar) private var showSidebar
+    @Environment(\.modeActive) private var active
 
     var body: some View {
         Group {
@@ -255,6 +256,8 @@ struct AgentsDetailView: View {
             }
         }
         .background(Color.appSurface)
+        // Stays mounted behind the Workspaces view: hand the Files panel etc. back to the selected space.
+        .onChange(of: active) { _, isActive in if !isActive { store.focusOverride = nil } }
         .onDisappear { store.focusOverride = nil }
     }
 }
@@ -266,12 +269,14 @@ private struct AgentPage: View {
     @EnvironmentObject var panel: RightPanelModel
     @Environment(\.sidebarVisible) private var sidebarVisible
     @Environment(\.showSidebar) private var showSidebar
+    @Environment(\.modeActive) private var active
+    @AppStorage("agentChatListWidth") private var chatListWidth: Double = 250
     let profile: AgentProfile
 
+    /// Every conversation (task) of this agent: running ones first, then newest first.
     private var taskList: [AgentTask] {
         let all = agents.tasks(of: profile.id)
-        let live = all.filter { !$0.status.isFinished }
-        return live + all.filter { $0.status.isFinished }.prefix(max(0, 8 - live.count))
+        return all.filter { !$0.status.isFinished } + all.filter { $0.status.isFinished }
     }
 
     private var selectedTask: AgentTask? {
@@ -305,8 +310,24 @@ private struct AgentPage: View {
                 .buttonStyle(ChromeButtonStyle())
                 .help("Edit \(profile.name)")
             }
-            tabs
             Divider()
+            HStack(spacing: 0) {
+                AgentChatList(profile: profile, tasks: taskList, selectedID: selectedTask?.id,
+                              onSelect: { nav.selectedTaskByAgent[profile.id] = $0 })
+                    .frame(width: chatListWidth)
+                ColumnResizeHandle(width: $chatListWidth, range: 190...420, direction: 1)
+                conversation
+            }
+        }
+        .onAppear(perform: syncFocus)
+        .onChange(of: active) { _, isActive in if isActive { syncFocus() } }
+        .onChange(of: selectedTask?.id) { _, _ in syncFocus() }
+        .onChange(of: selectedTask?.paneID) { _, _ in syncFocus() }
+    }
+
+    /// The selected conversation: its terminal or result, and the message box.
+    private var conversation: some View {
+        VStack(spacing: 0) {
             if !profile.enabled {
                 HStack {
                     Image(systemName: "pause.circle")
@@ -322,9 +343,6 @@ private struct AgentPage: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             AgentMessageBox(profile: profile, task: selectedTask) { newID in nav.selectedTaskByAgent[profile.id] = newID }
         }
-        .onAppear(perform: syncFocus)
-        .onChange(of: selectedTask?.id) { _, _ in syncFocus() }
-        .onChange(of: selectedTask?.paneID) { _, _ in syncFocus() }
     }
 
     private var subtitle: String {
@@ -337,62 +355,18 @@ private struct AgentPage: View {
 
     /// The right panel's Files (and "insert path") follow the selected task.
     private func syncFocus() {
+        guard active else { return }
+        let wanted: (paneID: UUID?, projectID: UUID)?
         if let t = selectedTask {
-            store.focusOverride = (t.paneID, t.projectID)
+            wanted = (t.paneID, t.projectID)
         } else if let pid = store.state.projects.first(where: { profile.mayAccess($0.id) })?.id {
-            store.focusOverride = (nil, pid)
+            wanted = (nil, pid)
         } else {
-            store.focusOverride = nil
+            wanted = nil
         }
-    }
-
-    private var tabs: some View {
-        HStack(spacing: 0) {
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 2) {
-                    ForEach(taskList) { t in
-                        let selected = selectedTask?.id == t.id
-                        Button { nav.selectedTaskByAgent[profile.id] = t.id } label: {
-                            HStack(spacing: 6) {
-                                Circle().fill(dotColor(t)).frame(width: 6, height: 6)
-                                Text(AgentHarness.oneLine(t.instruction, max: 28)).lineLimit(1)
-                                if t.depth > 0 { Image(systemName: "arrow.turn.down.right").font(.caption2).foregroundStyle(.secondary) }
-                            }
-                            .font(.callout.weight(selected ? .semibold : .regular))
-                            .padding(.horizontal, 12).frame(height: 34)
-                            .overlay(alignment: .bottom) { if selected { Rectangle().fill(Color.appAccent).frame(height: 2) } }
-                            .contentShape(Rectangle())
-                        }
-                        .buttonStyle(.plain)
-                        .foregroundStyle(selected ? .primary : .secondary)
-                        .help("\(t.projectName) · \(t.status.label)\n\(t.instruction)")
-                        .contextMenu {
-                            if t.paneID != nil {
-                                Button(t.status.isFinished ? "Close Session" : "Stop and Close Session") { agents.closeSession(t.id) }
-                            }
-                        }
-                    }
-                }
-            }
-            // A fresh id that matches no task = the "new task" page.
-            Button { nav.selectedTaskByAgent[profile.id] = UUID() } label: {
-                Image(systemName: "plus").frame(width: 30, height: 30)
-            }
-            .buttonStyle(ChromeButtonStyle())
-            .help("New task")
-            .padding(.trailing, 8)
-        }
-        .padding(.leading, 8)
-    }
-
-    private func dotColor(_ t: AgentTask) -> Color {
-        if agents.requests.contains(where: { $0.taskID == t.id && $0.isPending }) { return .yellow }
-        switch t.status {
-        case .running, .starting: return .green
-        case .needsApproval, .waitingForUser: return .yellow
-        case .queued: return .blue
-        case .completed: return .secondary
-        default: return .red
+        // focusOverride is published app-wide: only touch it when it actually changes.
+        if store.focusOverride?.paneID != wanted?.paneID || store.focusOverride?.projectID != wanted?.projectID {
+            store.focusOverride = wanted
         }
     }
 
@@ -406,6 +380,126 @@ private struct AgentPage: View {
                 .multilineTextAlignment(.center).font(.callout).foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}
+
+/// Agents view: the agent's conversations as a vertical chat history (newest first, grouped by day),
+/// with "New chat" on top. Each conversation is one task.
+private struct AgentChatList: View {
+    @EnvironmentObject var agents: AgentHarness
+    @EnvironmentObject var store: Store
+    let profile: AgentProfile
+    let tasks: [AgentTask]
+    let selectedID: UUID?
+    let onSelect: (UUID) -> Void
+
+    var body: some View {
+        // Computed once per render, not once per row.
+        let pending = Set(agents.requests.filter(\.isPending).map(\.taskID))
+        VStack(spacing: 0) {
+            Button { onSelect(UUID()) } label: {   // an id that matches no task = the "new chat" page
+                HStack(spacing: 8) {
+                    Image(systemName: "square.and.pencil")
+                    Text("New chat")
+                    Spacer()
+                }
+                .font(.callout.weight(.medium))
+                .padding(.horizontal, 10).frame(height: 32)
+                .background(RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(selectedID == nil || !tasks.contains { $0.id == selectedID } ? Color.primary.opacity(0.1) : .clear))
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .hoverHighlight(cornerRadius: 8, inset: 0)
+            .padding(8)
+
+            if tasks.isEmpty {
+                Text("No conversations yet").font(.callout).foregroundStyle(.secondary).padding(.top, 20)
+                Spacer()
+            } else {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 1, pinnedViews: []) {
+                        ForEach(Self.sections(tasks), id: \.title) { section in
+                            Text(section.title)
+                                .font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                                .padding(.horizontal, 10).padding(.top, 10).padding(.bottom, 3)
+                            ForEach(section.tasks) { t in row(t, pending: pending.contains(t.id)) }
+                        }
+                    }
+                    .padding(.horizontal, 8).padding(.bottom, 12)
+                }
+            }
+        }
+        .background(Color.appSidebar.opacity(0.5))
+    }
+
+    private func row(_ t: AgentTask, pending: Bool) -> some View {
+        let selected = t.id == selectedID
+        return Button { onSelect(t.id) } label: {
+            HStack(alignment: .top, spacing: 8) {
+                Circle().fill(Self.dotColor(t, pending: pending)).frame(width: 7, height: 7).padding(.top, 5)
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 4) {
+                        if t.depth > 0 { Image(systemName: "arrow.turn.down.right").font(.caption2).foregroundStyle(.secondary) }
+                        if t.origin.kind == .slack { Image(systemName: "number").font(.caption2).foregroundStyle(.secondary) }
+                        Text(AgentHarness.oneLine(t.instruction, max: 80).isEmpty ? "(files)" : AgentHarness.oneLine(t.instruction, max: 80))
+                            .font(.callout.weight(selected ? .semibold : .regular))
+                            .lineLimit(2)
+                            .foregroundStyle(.primary)
+                    }
+                    Text(Self.detail(t, pending: pending))
+                        .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 10).padding(.vertical, 7)
+            .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(selected ? Color.primary.opacity(0.1) : .clear))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help("\(t.projectName) · \(t.status.label)\n\(t.instruction)")
+        .contextMenu {
+            if t.paneID != nil {
+                Button(t.status.isFinished ? "Close Session" : "Stop and Close Session") { agents.closeSession(t.id) }
+            }
+        }
+    }
+
+    private static func detail(_ t: AgentTask, pending: Bool) -> String {
+        let status = pending ? "Needs you" : (t.status == .completed ? nil : t.status.label)
+        let when = (t.finishedAt ?? t.createdAt).formatted(date: .omitted, time: .shortened)
+        return [t.projectName, status, when].compactMap { $0 }.joined(separator: " · ")
+    }
+
+    static func dotColor(_ t: AgentTask, pending: Bool) -> Color {
+        if pending { return .yellow }
+        switch t.status {
+        case .running, .starting: return .green
+        case .needsApproval, .waitingForUser: return .yellow
+        case .queued: return .blue
+        case .completed: return .secondary.opacity(0.6)
+        default: return .red
+        }
+    }
+
+    struct Section { let title: String; let tasks: [AgentTask] }
+
+    /// Running · Today · Yesterday · Previous 7 days · Older (by when each conversation was last active).
+    static func sections(_ tasks: [AgentTask], now: Date = Date(), calendar: Calendar = .current) -> [Section] {
+        let live = tasks.filter { !$0.status.isFinished }
+        let done = tasks.filter { $0.status.isFinished }
+        let today = calendar.startOfDay(for: now)
+        let yesterday = calendar.date(byAdding: .day, value: -1, to: today) ?? today
+        let week = calendar.date(byAdding: .day, value: -7, to: today) ?? today
+        func when(_ t: AgentTask) -> Date { t.finishedAt ?? t.createdAt }
+        let groups: [(String, [AgentTask])] = [
+            ("In progress", live),
+            ("Today", done.filter { when($0) >= today }),
+            ("Yesterday", done.filter { when($0) >= yesterday && when($0) < today }),
+            ("Previous 7 days", done.filter { when($0) >= week && when($0) < yesterday }),
+            ("Older", done.filter { when($0) < week }),
+        ]
+        return groups.filter { !$0.1.isEmpty }.map { Section(title: $0.0, tasks: $0.1) }
     }
 }
 

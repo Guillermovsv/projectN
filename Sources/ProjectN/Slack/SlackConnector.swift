@@ -79,6 +79,7 @@ final class SlackConnector: ObservableObject {
         let candidates: [Project]
         let createdAt: Date
         let resume: Bool
+        var files: [SlackFile] = []
     }
     private var pending: [String: PendingClarification] = [:]
 
@@ -252,6 +253,44 @@ final class SlackConnector: ObservableObject {
         let cleaned = SlackRouter.clean(text)
         AuditLog.record("slack.message", ["user": user, "channel": channel, "ts": ts, "text": cleaned, "bot": botKey])
 
+        // Images, PDFs, documents…: fetch them first, then handle the message as usual with them attached.
+        let entries = SlackFiles.entries(event)
+        guard entries.isEmpty else {
+            Task { [weak self] in
+                guard let self else { return }
+                let files = await self.downloadFiles(entries, channel: channel, reply: reply, bot: botKey)
+                self.dispatch(cleaned, files: files, type: type, user: user, channel: channel, ts: ts, threadTS: threadTS,
+                              reply: reply, key: key, isDM: isDM, fixedAgent: fixedAgent, bot: botKey)
+            }
+            return
+        }
+        dispatch(cleaned, files: [], type: type, user: user, channel: channel, ts: ts, threadTS: threadTS,
+                 reply: reply, key: key, isDM: isDM, fixedAgent: fixedAgent, bot: botKey)
+    }
+
+    private func downloadFiles(_ entries: [[String: Any]], channel: String, reply: String, bot botKey: String) async -> [SlackFile] {
+        let token = (bots[botKey] ?? bots[SlackBot.mainKey])?.botToken ?? ""
+        let fetch = fileFetcher ?? SlackFiles.fetcher(token: token)
+        let files = await SlackFiles.download(entries, fetch: fetch) { [weak self] id in
+            guard let self else { return [:] }
+            return try await self.api("files.info", ["file": id])
+        }
+        AuditLog.record("slack.files", ["channel": channel, "files": files.map(\.name).joined(separator: ", "),
+                                        "failed": files.filter { $0.local == nil }.map(\.name).joined(separator: ", ")])
+        let failed = files.filter { $0.local == nil }
+        if !failed.isEmpty {
+            let lines = failed.map { "• *\($0.name)*: \($0.error ?? "error")" }.joined(separator: "\n")
+            let scope = failed.contains { $0.error?.contains("files:read") == true }
+                ? "\nAgrega el permiso *files:read* en OAuth & Permissions de la app de Slack y reinstálala." : ""
+            post(channel, reply, "⚠️ No pude descargar \(failed.count == 1 ? "un archivo" : "\(failed.count) archivos"):\n\(lines)\(scope)", bot: botKey)
+        }
+        log("Received \(files.count - failed.count)/\(files.count) file(s) from Slack")
+        return files
+    }
+
+    /// The rest of `handle`, once any attached files are on disk.
+    private func dispatch(_ cleaned: String, files: [SlackFile], type: String, user: String, channel: String, ts: String,
+                          threadTS: String?, reply: String, key: String, isDM: Bool, fixedAgent: UUID?, bot botKey: String) {
         // A reply where an agent is waiting on you answers it (oldest first). Without threads, a message that
         // starts with an agent's name is a new request instead.
         let namesAgent = fixedAgent == nil && SlackRouter.matchAgent(cleaned, agents: harness?.profiles ?? [], defaultID: nil).agent != nil
@@ -266,7 +305,11 @@ final class SlackConnector: ObservableObject {
                 harness.resolveRequest(a.id, approve: yes, by: "<@\(user)>"); return
             }
             if let q = waiting.first(where: { $0.kind == .question }) {
-                harness.resolveRequest(q.id, answer: cleaned, by: "<@\(user)>"); return
+                var answer = cleaned
+                if !files.isEmpty, let t = harness.task(q.taskID), let project = store?.project(t.projectID) {
+                    answer += SlackFiles.note(SlackFiles.place(files, in: project, stamp: ts), hasText: !cleaned.isEmpty)
+                }
+                harness.resolveRequest(q.id, answer: answer, by: "<@\(user)>"); return
             }
         }
 
@@ -274,7 +317,7 @@ final class SlackConnector: ObservableObject {
             if Date().timeIntervalSince(p.createdAt) < 30 * 60, let project = SlackRouter.pickFromReply(cleaned, candidates: p.candidates) {
                 pending[key] = nil
                 submit(agentID: p.agentID, project: project, instruction: p.instruction, user: user, channel: channel,
-                       threadTS: reply, messageTS: ts, resume: p.resume, bot: botKey)
+                       threadTS: reply, messageTS: ts, resume: p.resume, files: p.files + files, bot: botKey)
                 return
             }
             if Date().timeIntervalSince(p.createdAt) >= 30 * 60 { pending[key] = nil }
@@ -283,13 +326,14 @@ final class SlackConnector: ObservableObject {
                 return
             }
         }
-        route(cleaned, user: user, channel: channel, threadTS: reply, messageTS: ts, inThread: threadTS != nil, bot: botKey)
+        route(cleaned, user: user, channel: channel, threadTS: reply, messageTS: ts, inThread: threadTS != nil, files: files, bot: botKey)
     }
 
-    private func route(_ text: String, user: String, channel: String, threadTS: String, messageTS: String, inThread: Bool, bot botKey: String) {
+    private func route(_ text: String, user: String, channel: String, threadTS: String, messageTS: String, inThread: Bool,
+                       files: [SlackFile] = [], bot botKey: String) {
         guard let harness, let store else { return }
         let fixedAgent = agentForChannel(channel)
-        guard !text.isEmpty else {
+        guard !text.isEmpty || !files.isEmpty else {
             post(channel, threadTS, fixedAgent != nil
                  ? "Hola 👋 Soy \(fixedAgent!.name). Escríbeme qué necesitas y en qué proyecto."
                  : "Hola 👋 Escríbeme una instrucción, por ejemplo: “Project Manager, revisa el proyecto X y dime qué tareas pendientes ves”.", bot: botKey)
@@ -318,7 +362,7 @@ final class SlackConnector: ObservableObject {
            }),
            let project = store.project(prev.projectID) {
             submit(agentID: agent.id, project: project, instruction: instruction, user: user, channel: channel,
-                   threadTS: threadTS, messageTS: messageTS, resume: true, resumeTaskID: prev.id, bot: botKey)
+                   threadTS: threadTS, messageTS: messageTS, resume: true, resumeTaskID: prev.id, files: files, bot: botKey)
             return
         }
 
@@ -329,7 +373,7 @@ final class SlackConnector: ObservableObject {
             case .success(let p):
                 post(channel, threadTS, "📁 Proyecto *\(p.name)* creado en `\(p.path.abbreviatingWithTilde)` y agregado a ProjectN.", bot: botKey)
                 submit(agentID: agent.id, project: p, instruction: instruction, user: user, channel: channel,
-                       threadTS: threadTS, messageTS: messageTS, resume: false, bot: botKey)
+                       threadTS: threadTS, messageTS: messageTS, resume: false, files: files, bot: botKey)
             case .failure(let e):
                 post(channel, threadTS, "❌ No pude crear el proyecto “\(name)”: \(e.description)", bot: botKey)
             }
@@ -339,7 +383,7 @@ final class SlackConnector: ObservableObject {
         // Coordinators work outside the projects and pick the project themselves: no "which project?" here.
         if agent.worksOutsideProjects {
             submit(agentID: agent.id, project: store.coordinationProject, instruction: instruction, user: user, channel: channel,
-                   threadTS: threadTS, messageTS: messageTS, resume: wantsResume, bot: botKey)
+                   threadTS: threadTS, messageTS: messageTS, resume: wantsResume, files: files, bot: botKey)
             return
         }
         let allowed = store.state.projects.filter { agent.mayAccess($0.id) }
@@ -349,48 +393,53 @@ final class SlackConnector: ObservableObject {
                                           conversationProjectID: lastHere) {
         case .project(let p):
             submit(agentID: agent.id, project: p, instruction: instruction, user: user, channel: channel,
-                   threadTS: threadTS, messageTS: messageTS, resume: wantsResume, bot: botKey)
+                   threadTS: threadTS, messageTS: messageTS, resume: wantsResume, files: files, bot: botKey)
         case .ambiguous(let list):
             ask(list, agent: agent, instruction: instruction, user: user, channel: channel, threadTS: threadTS,
-                intro: "Encontré varios proyectos que coinciden. ¿Cuál?", resume: wantsResume, bot: botKey)
+                intro: "Encontré varios proyectos que coinciden. ¿Cuál?", resume: wantsResume, files: files, bot: botKey)
         case .notFound(let name, let list):
             AuditLog.record("slack.project_not_found", ["name": name, "agent": agent.name])
             if list.isEmpty {
                 post(channel, threadTS, "No encuentro el proyecto “\(name)” y \(agent.name) no tiene proyectos autorizados.", bot: botKey)
             } else {
                 ask(list, agent: agent, instruction: instruction, user: user, channel: channel, threadTS: threadTS,
-                    intro: "No encuentro el proyecto “\(name)”. ¿Te refieres a alguno de estos?", resume: wantsResume, bot: botKey)
+                    intro: "No encuentro el proyecto “\(name)”. ¿Te refieres a alguno de estos?", resume: wantsResume, files: files, bot: botKey)
             }
         case .unspecified(let list):
             if list.isEmpty {
                 post(channel, threadTS, "\(agent.name) no tiene proyectos autorizados. Agrégalos en Settings → Agents → Projects.", bot: botKey)
             } else {
                 ask(list, agent: agent, instruction: instruction, user: user, channel: channel, threadTS: threadTS,
-                    intro: "¿En qué proyecto debe trabajar \(agent.name)?", resume: wantsResume, bot: botKey)
+                    intro: "¿En qué proyecto debe trabajar \(agent.name)?", resume: wantsResume, files: files, bot: botKey)
             }
         }
     }
 
     private func ask(_ list: [Project], agent: AgentProfile, instruction: String, user: String, channel: String,
-                     threadTS: String, intro: String, resume: Bool, bot: String) {
+                     threadTS: String, intro: String, resume: Bool, files: [SlackFile] = [], bot: String) {
         let shown = Array(list.prefix(15))
         pending[conversationKey(channel: channel, thread: threadTS, ts: threadTS)] =
-            PendingClarification(agentID: agent.id, instruction: instruction, user: user, candidates: shown, createdAt: Date(), resume: resume)
+            PendingClarification(agentID: agent.id, instruction: instruction, user: user, candidates: shown, createdAt: Date(),
+                                 resume: resume, files: files)
         let items = shown.enumerated().map { "\($0.offset + 1). \($0.element.name)" }.joined(separator: "\n")
         post(channel, threadTS, "\(intro)\n\(items)\nResponde \(replyHere) con el número o el nombre.", bot: bot)
         log("Asked which project for \(agent.name)")
     }
 
     private func submit(agentID: UUID, project: Project, instruction: String, user: String, channel: String,
-                        threadTS: String, messageTS: String, resume: Bool, resumeTaskID: UUID? = nil, bot: String) {
+                        threadTS: String, messageTS: String, resume: Bool, resumeTaskID: UUID? = nil,
+                        files: [SlackFile] = [], bot: String) {
         guard let harness else { return }
+        let routed = instruction
+        // Attached files go into the project the task runs in; their paths are part of the instruction.
+        let instruction = instruction + SlackFiles.note(SlackFiles.place(files, in: project, stamp: messageTS), hasText: !instruction.isEmpty)
         if resume && resumeTaskID == nil {
             post(channel, threadTS, "ℹ️ No hay una sesión anterior \(settings.replyInThreads ? "en este hilo" : "en esta conversación") para reanudar; empiezo una sesión nueva.", bot: bot)
         }
         var origin = TaskOrigin(kind: .slack, slackChannel: channel, slackThreadTS: threadTS, slackMessageTS: messageTS, slackUser: user)
         origin.slackBot = bot
         var req = AgentTaskRequest(agentID: agentID, projectID: project.id, instruction: instruction, origin: origin, resumeTaskID: resumeTaskID)
-        req.freshSession = SlackRouter.wantsNewSession(instruction)
+        req.freshSession = SlackRouter.wantsNewSession(routed)
         let existing = Set(harness.tasks.map(\.id))
         switch harness.submit(req) {
         case .success(let t) where existing.contains(t.id):
@@ -456,8 +505,8 @@ final class SlackConnector: ObservableObject {
             postLong(channel, thread, "📝 *\(t.agentName)* propone este plan (espera tu aprobación en ProjectN):\n\n" + SlackRouter.toSlack(plan), bot: bot, as: t.agentID)
         case .finished:
             if delegated {
-                if settings.notifyOnStart || (t.status != .completed && settings.notifyErrors) {
-                    let icon = t.status == .completed ? "✓" : "✗"
+                if settings.notifyOnStart || t.usageLimit == true || (t.status != .completed && settings.notifyErrors) {
+                    let icon = t.status == .completed ? "✓" : t.usageLimit == true ? "⏳" : "✗"
                     post(channel, thread, "↳ \(icon) *\(t.agentName)* — \(t.status.label)\(t.error.map { ": \(Self.firstLine($0))" } ?? "")", bot: bot, as: t.agentID)
                 }
                 harness?.markDelivered(t.id)
@@ -601,7 +650,9 @@ final class SlackConnector: ObservableObject {
             if let c = u.contextTokens { line += " · session \(c / 1000)k" }
             footer.append(line)
         }
-        let notes = t.notes.isEmpty ? "" : "\n" + t.notes.map { "ℹ️ \($0)" }.joined(separator: "\n")
+        // An error on a turn that still answered (e.g. a partial result) is shown, never dropped.
+        let noteLines = t.notes.map { "ℹ️ \($0)" } + (t.status == .completed ? t.error.map { ["⚠️ \($0)"] } ?? [] : [])
+        let notes = noteLines.isEmpty ? "" : "\n" + noteLines.joined(separator: "\n")
         switch t.status {
         case .completed:
             let (rawBody, questions) = SlackRouter.splitQuestions(t.result ?? "")
@@ -610,8 +661,8 @@ final class SlackConnector: ObservableObject {
             let questionText = questions.isEmpty ? "" : "❓ *Preguntas para ti*\n" + SlackRouter.numberedQuestions(questions)
             let hint = "Responde \(replyHere)" + (questions.count > 1 ? " — puedes contestar por número." : ".")
             var blocks = SlackRouter.sections(body)
-            if !t.notes.isEmpty {
-                blocks.append(["type": "context", "elements": [["type": "mrkdwn", "text": t.notes.map { "ℹ️ \($0)" }.joined(separator: "\n")]]])
+            if !noteLines.isEmpty {
+                blocks.append(["type": "context", "elements": [["type": "mrkdwn", "text": noteLines.joined(separator: "\n")]]])
             }
             if !questions.isEmpty {
                 blocks.append(["type": "divider"])
@@ -627,8 +678,8 @@ final class SlackConnector: ObservableObject {
                 postLong(channel, thread, text, bot: bot, as: t.agentID)   // too long for one message
             }
         case .cancelled, .failed, .timedOut, .interrupted:
-            guard settings.notifyErrors else { break }
-            let icon = t.status == .interrupted ? "⚠️" : "❌"
+            guard settings.notifyErrors || t.usageLimit == true else { break }
+            let icon = t.status == .interrupted ? "⚠️" : t.usageLimit == true ? "⏳" : "❌"
             post(channel, thread, "\(icon) *\(t.agentName)* — \(t.status.label): \(t.error ?? "sin detalles")\(notes)"
                  + (t.status == .interrupted ? "\nVuelve a enviar la instrucción para empezar de nuevo." : ""), bot: bot, as: t.agentID)
         default:
@@ -665,6 +716,8 @@ final class SlackConnector: ObservableObject {
     var updater: ((String, String, String) async -> Void)?
     /// Test hook for other Web API calls (channel sync).
     var apiCaller: ((String, [String: Any]) async throws -> [String: Any])?
+    /// Test hook for downloading attached files.
+    var fileFetcher: SlackFiles.Fetch?
 
     @discardableResult
     private func send(_ channel: String, _ thread: String?, _ text: String, blocks: [[String: Any]]? = nil,
@@ -827,6 +880,10 @@ final class SlackConnector: ObservableObject {
                         out.append(.init(ok: forChannels.isEmpty, label: forChannels.isEmpty
                             ? "Agent channels: scopes OK"
                             : "Agent channels need \(forChannels.joined(separator: ", ")) — add them under OAuth & Permissions and reinstall"))
+                        let canReadFiles = r.scopes.contains("files:read")
+                        out.append(.init(ok: canReadFiles, label: canReadFiles
+                            ? "Files (images, PDFs, documents): scope OK"
+                            : "Receiving files (images, PDFs, documents) needs files:read — add it under OAuth & Permissions and reinstall"))
                     } catch { out.append(.init(ok: false, label: prefix + "bot token: \(error)")) }
                 } else {
                     out.append(.init(ok: false, label: prefix + (bot.isEmpty ? "bot token not saved" : "bot token must start with xoxb-")))

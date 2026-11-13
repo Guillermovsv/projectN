@@ -151,7 +151,7 @@ ProjectN can run **agent profiles** — reusable, project-independent configurat
 The switch at the top of the sidebar (or ⌃⌘1 / ⌃⌘2) flips between **Workspaces** (the usual projects → spaces → panes) and **Agents**:
 
 - **Left**: every agent with a live status line — *Working · project*, *Needs you* (yellow, with a count), last task and when — and, under each, the projects / terminals it's working in right now. **+** creates an agent; right-click to edit or turn it off.
-- **Center**: the selected agent — model, effort, access, status, ⚙︎ to edit — with one **tab per task** (running ones first). A task shows its request, any approval waiting on you (Approve / Deny right there), and its live **terminal**, or its **result** once finished. The box at the bottom starts a **new task** in the project you pick, or — on a running task — sends your message into **that session**. ⌘↩ sends.
+- **Center**: the selected agent — model, effort, access, status, ⚙︎ to edit — with its **conversations listed vertically**, like a chat history (*New chat* on top, then In progress · Today · Yesterday · Previous 7 days · Older; drag the edge to resize). A task shows its request, any approval waiting on you (Approve / Deny right there), and its live **terminal**, or its **result** once finished. The box at the bottom starts a **new task** in the project you pick, or — on a running task — sends your message into **that session**. ⌘↩ sends.
 - **Right**: the same Files · Activity · Browser panel; Files follows the selected task's project.
 
 ### Agents (Settings → Agents)
@@ -204,6 +204,8 @@ Uses **Socket Mode** (an outbound connection from your Mac, no public server). I
 Replies go **straight into the conversation** (turn on *Reply in threads* if you prefer threads); answer questions, approvals (*aprobar* / *rechazar*) and "which project?" by just writing. Not naming a project keeps the one you were talking about with that agent.
 
 **A channel per agent**: ProjectN's app creates a private channel for every agent, named after it (*Project Manager* → `#project-manager`), and invites you. Whatever you write there goes to that agent — no need to mention it — and it answers signed with its own name and emoji (set the emoji in Settings → Agents → General). Renaming an agent renames its channel; new agents get one automatically. Schedules can report to the agent's channel. Needs the scopes `groups:read`, `groups:write`, `chat:write.customize` (in the manifest).
+
+**Files**: attach images, PDFs, Markdown or any other file to your message (with or without text) and the agent gets them. ProjectN downloads them (up to 10 per message, 50 MB each), saves them in the task's project under `.slack-files/` (git-ignored) and adds their paths to the instruction; files sent as the answer to an agent's question reach that session the same way. Needs the scope `files:read` (in the manifest — existing apps: add it under *OAuth & Permissions* and reinstall; *Check Connection* tells you if it's missing).
 
 The message's first words pick the agent (else the *Default agent*). The project is the one named in the message, else the project focused in ProjectN, else the agent's only project; otherwise the bot asks in the thread. Progress, approval requests, the result and errors are posted in the message's thread. Duplicate deliveries (Slack retries) are ignored, also across restarts; tasks interrupted by quitting ProjectN are reported on the next connection.
 

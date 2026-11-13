@@ -15,7 +15,10 @@ enum TranscriptReader {
         /// Plan proposed in plan mode, waiting for approval (Claude ExitPlanMode).
         var pendingPlan: String?
         var usage: TokenUsage?
+        /// The turn ended on an error instead of an answer (usage limit, API error…).
         var error: String?
+        /// The error is the account's usage limit: nothing more can run on this CLI until it resets.
+        var usageLimit = false
         /// Bytes read (so later reads/resumes can start after them).
         var size: UInt64 = 0
         /// User prompts (not tool results) seen: tells whether a message typed in has reached the transcript yet.
@@ -66,6 +69,7 @@ enum TranscriptReader {
         var lastStop: String?
         var endTurnText: String?
         var plan: String?
+        var apiError: String?
         for line in data.split(separator: UInt8(ascii: "\n")) {
             guard let o = try? JSONSerialization.jsonObject(with: Data(line)) as? [String: Any] else { continue }
             let type = o["type"] as? String
@@ -96,7 +100,10 @@ enum TranscriptReader {
                 }
                 if lastStop == "end_turn" { endTurnText = lastTexts.joined(separator: "\n\n") }
                 if (o["isApiErrorMessage"] as? Bool) == true || (o["error"] != nil && lastTexts.isEmpty == false) {
-                    snap.error = lastTexts.joined(separator: "\n")
+                    let text = lastTexts.joined(separator: "\n")
+                    apiError = text.isEmpty ? "\(o["error"] ?? "API error")" : text
+                } else if !lastTexts.isEmpty {
+                    apiError = nil   // it recovered and kept going
                 }
             } else if type == "user", let m = o["message"] as? [String: Any] {
                 // A new prompt (not a tool result) starts a new turn: the previous end_turn no longer counts.
@@ -105,6 +112,8 @@ enum TranscriptReader {
                     snap.prompts += 1
                     endTurnText = nil
                     snap.finished = false
+                    snap.error = nil
+                    apiError = nil
                     plan = nil
                 }
                 if isToolResult { plan = nil }
@@ -117,9 +126,21 @@ enum TranscriptReader {
             snap.finished = true
             snap.result = t
         }
+        // The CLI gave up on an API error (usage limit, overload…): the turn is over, without an answer.
+        if let e = apiError {
+            snap.error = e
+            snap.usageLimit = isUsageLimit(e)
+            if !snap.finished { snap.finished = true; snap.result = nil }
+        }
         if !snap.finished, let plan { snap.pendingPlan = plan }
         snap.usage = countedMessages.isEmpty ? nil : usage
         return snap
+    }
+
+    static func isUsageLimit(_ message: String) -> Bool {
+        let m = message.lowercased()
+        return ["usage limit", "hit your limit", "limit reached", "usage_limit", "rate_limit_error", "out of extra usage"]
+            .contains { m.contains($0) }
     }
 
     // MARK: Codex
@@ -135,10 +156,22 @@ enum TranscriptReader {
             if type == "event_msg", ptype == "task_started" {
                 snap.prompts += 1
                 snap.finished = false
+                snap.error = nil
+                snap.usageLimit = false
+                lastAssistant = nil
             } else if type == "event_msg", ptype == "task_complete" {
                 snap.finished = true
                 snap.result = (p["last_agent_message"] as? String) ?? lastAssistant
-                if let e = p["error"], !(e is NSNull) { snap.error = "\(e)" }
+                snap.error = nil
+                snap.usageLimit = false
+                if let e = p["error"], !(e is NSNull) {
+                    // {"message": "You've hit your usage limit… try again at 12:54 PM.", "codex_error_info": "usage_limit_exceeded"}
+                    let d = e as? [String: Any]
+                    let message = (d?["message"] as? String) ?? (e as? String) ?? "\(e)"
+                    let info = d?["codex_error_info"] as? String ?? ""
+                    snap.error = message
+                    snap.usageLimit = info.contains("usage_limit") || isUsageLimit(message)
+                }
             } else if type == "event_msg", ptype == "token_count",
                       let info = p["info"] as? [String: Any], let t = info["total_token_usage"] as? [String: Any] {
                 var u = TokenUsage()

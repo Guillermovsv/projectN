@@ -194,6 +194,7 @@ struct SlackSettingsView: View {
               - groups:read
               - groups:write
               - chat:write.customize
+              - files:read
         settings:
           event_subscriptions:
             bot_events:

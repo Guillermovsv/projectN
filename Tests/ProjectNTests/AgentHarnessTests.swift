@@ -156,6 +156,34 @@ struct AgentHarnessTests {
 
     // MARK: Acceptance
 
+    @Test func slackFilesReachTheAgentInsideTheProject() async throws {
+        let env = try await makeEnv()
+        defer { env.store.terminateAll() }
+        env.slack.fileFetcher = { url in
+            // Without files:read Slack serves its sign-in page.
+            if url.lastPathComponent == "secret.pdf" { return (Data("<html>sign in</html>".utf8), "text/html") }
+            return (Data("PNGDATA".utf8), "image/png")
+        }
+        let files: [[String: Any]] = [
+            ["id": "F1", "name": "captura de pantalla.png", "mimetype": "image/png", "size": 7,
+             "url_private_download": "https://files.slack.com/files-pri/T1-F1/download/captura.png"],
+            ["id": "F2", "name": "secret.pdf", "mimetype": "application/pdf", "size": 20,
+             "url_private_download": "https://files.slack.com/files-pri/T1-F2/download/secret.pdf"],
+        ]
+        env.slack.handle(event: ["type": "app_mention", "subtype": "file_share", "text": "<@UBOT> Project Manager, mira esta captura",
+                                 "user": "U1", "channel": "C1", "ts": "910.1", "files": files], eventID: "Ev910.1")
+
+        try await waitUntil { env.harness.tasks.contains { $0.origin.slackMessageTS == "910.1" } }
+        let t = try #require(env.harness.tasks.first { $0.origin.slackMessageTS == "910.1" })
+        let saved = URL(fileURLWithPath: env.project.path).appendingPathComponent(".slack-files/910.1/captura de pantalla.png")
+        #expect(t.instruction.hasPrefix("mira esta captura"))
+        #expect(t.instruction.contains(saved.path))
+        #expect(t.instruction.contains("secret.pdf: Slack returned a sign-in page"))
+        #expect((try? String(contentsOf: saved, encoding: .utf8)) == "PNGDATA")
+        #expect(FileManager.default.fileExists(atPath: URL(fileURLWithPath: env.project.path).appendingPathComponent(".slack-files/.gitignore").path))
+        #expect(env.posts.texts(thread: "910.1").contains { $0.contains("secret.pdf") && $0.contains("files:read") })
+    }
+
     @Test func acceptanceProjectManagerFromSlack() async throws {
         let env = try await makeEnv()
         defer { env.store.terminateAll() }

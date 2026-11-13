@@ -6,27 +6,59 @@ import SwiftUI
 struct TerminalHostView: NSViewRepresentable {
     let session: TerminalSession
     var focused: Bool
+    /// false while this host sits in the hidden one of Workspaces / Agents (both stay mounted). An inactive host
+    /// hides itself (AppKit skips drawing it) and never takes the terminal, so the same session can be shown by
+    /// the Agents view and by its pane in the Agents workspace without the two pulling it back and forth.
+    @Environment(\.modeActive) private var active
 
-    final class Coordinator { var wasFocused = false }
+    final class Coordinator {
+        var wasFocused = false
+        /// Hiding waits for the mode cross-fade to finish, so the terminal fades out with its view.
+        var hideWork: DispatchWorkItem?
+    }
     func makeCoordinator() -> Coordinator { Coordinator() }
 
     func makeNSView(context: Context) -> NSView {
         let container = TerminalContainer()
         container.wantsLayer = true
-        container.attach(session.view)
-        if focused { session.focus() }
-        context.coordinator.wasFocused = focused
+        container.isHidden = !active
+        if active {
+            container.attach(session.view)
+            if focused { session.focus() }
+        }
+        context.coordinator.wasFocused = focused && active
         return container
     }
 
     func updateNSView(_ nsView: NSView, context: Context) {
-        (nsView as? TerminalContainer)?.attach(session.view)
-        // Take keyboard focus only when the pane *becomes* focused, so we don't steal it from the chat box.
+        guard let container = nsView as? TerminalContainer else { return }
+        let coordinator = context.coordinator
+        guard active else {
+            if let w = container.window, let fr = w.firstResponder as? NSView, fr.isDescendant(of: container) {
+                w.makeFirstResponder(nil)
+            }
+            coordinator.wasFocused = false
+            if !container.isHidden, coordinator.hideWork == nil {
+                let work = DispatchWorkItem { [weak container, weak coordinator] in
+                    coordinator?.hideWork = nil
+                    container?.isHidden = true
+                }
+                coordinator.hideWork = work
+                DispatchQueue.main.asyncAfter(deadline: .now() + NavigationModel.switchDuration + 0.05, execute: work)
+            }
+            return
+        }
+        coordinator.hideWork?.cancel()
+        coordinator.hideWork = nil
+        container.isHidden = false
+        container.attach(session.view)
+        // Take keyboard focus only when the pane *becomes* focused (or shown again), so we don't steal it from the chat box.
         if focused && !context.coordinator.wasFocused { session.focus() }
         context.coordinator.wasFocused = focused
     }
 
     static func dismantleNSView(_ nsView: NSView, coordinator: Coordinator) {
+        coordinator.hideWork?.cancel()
         // Detach but keep the terminal alive (the Store owns it).
         (nsView as? TerminalContainer)?.detach()
     }

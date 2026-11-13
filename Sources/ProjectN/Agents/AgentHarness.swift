@@ -805,8 +805,12 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
                 if t.status != .waitingForUser { update(id) { $0.status = .waitingForUser; $0.result = s.result } }
                 return
             }
-            update(id) { $0.result = s.result ?? "" }
-            finish(id, status: .completed, error: s.error)
+            update(id) { $0.result = s.result ?? ""; if s.usageLimit { $0.usageLimit = true } }
+            // A turn that ended on an error (usage limit, API error) without an answer didn't complete anything.
+            let empty = (s.result ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            let failed = s.error != nil && (empty || s.usageLimit)
+            finish(id, status: failed ? .failed : .completed,
+                   error: s.usageLimit ? "Límite de uso de \(t.runtime.label) alcanzado — \(s.error ?? "")" : s.error)
             return
         }
         if let plan = snapshot?.pendingPlan, t.lastApprovalNotice != "plan:\(plan.hashValue)" {
@@ -910,6 +914,8 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
     /// not inside wait_for_tasks, which reports it anyway), else as a follow-up that answers the user.
     private func handBackToCoordinator(_ done: AgentTask) {
         guard let pid = done.origin.parentTaskID, let parent = task(pid) else { return }
+        // Same account, same limit: waking the coordinator would only fail again (the user is told directly).
+        if done.usageLimit == true, parent.runtime == done.runtime, !parent.status.isActive { return }
         let message = PromptComposer.delegatedResult(done)
         if parent.status.isActive {
             if orchestratorWaiters[pid]?.isEmpty == false { return }
@@ -1004,17 +1010,26 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
     }
 
     private var saveWork: DispatchWorkItem?
+    /// tasks.json holds up to 500 tasks with their results (MBs of pretty-printed JSON): encoding and writing
+    /// it on the main thread stalled the UI after every task update. Writes run in order on this queue.
+    private static let ioQueue = DispatchQueue(label: "dev.projectn.agent-tasks-io", qos: .utility)
+
     private func persist() {
         saveWork?.cancel()
-        let snapshot = tasks
-        let work = DispatchWorkItem { AgentStore.saveTasks(snapshot) }
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            let snapshot = self.tasks
+            Self.ioQueue.async { AgentStore.saveTasks(snapshot) }
+        }
         saveWork = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: work)
     }
 
+    /// Synchronous (quit, tests): also waits for any write already queued so the file ends up current.
     func saveNow() {
         saveWork?.cancel()
-        AgentStore.saveTasks(tasks)
+        let snapshot = tasks
+        Self.ioQueue.sync { AgentStore.saveTasks(snapshot) }
     }
 
     func clearFinishedTasks() {
