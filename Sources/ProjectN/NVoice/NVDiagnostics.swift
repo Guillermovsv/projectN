@@ -43,7 +43,8 @@ enum Diagnostics {
         Input Monitoring: \(HotkeyMonitor.hasInputMonitoring() ? "granted" : "MISSING")
         Accessibility: \(HotkeyMonitor.hasAccessibility(prompt: false) ? "granted" : "MISSING")
         Microphone: \(mic)
-        fn listener: \(tapRunning ? "running" : "NOT running")
+        Shortcut: \(NVoiceSettings.shared.hotkey.displayName)
+        Key listener: \(tapRunning ? "running" : "NOT running")
         App: \(Bundle.main.bundlePath)
         """
     }

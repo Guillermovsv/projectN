@@ -10,6 +10,7 @@ struct VoiceSettingsView: View {
 
     @EnvironmentObject var store: Store
     @ObservedObject private var voice = NVoiceController.shared
+    @ObservedObject private var voiceSettings = NVoiceSettings.shared
     @State private var section: Section = .general
     @State private var standaloneRunning = NVoiceController.shared.standaloneRunning
     @State private var canPaste = HotkeyMonitor.hasAccessibility(prompt: false)
@@ -52,7 +53,9 @@ struct VoiceSettingsView: View {
                     .background(RoundedRectangle(cornerRadius: 8).fill(Color.appAccent.opacity(0.14)))
                 VStack(alignment: .leading, spacing: 3) {
                     Toggle(isOn: $store.settings.voiceEnabled) {
-                        Text("Dictation — hold fn anywhere, talk, release to paste").font(.headline)
+                        Text(voiceSettings.hotkeyMode == .hold
+                             ? "Dictation — hold \(shortcut) anywhere, talk, release to paste"
+                             : "Dictation — tap \(shortcut) anywhere, talk, tap again to paste").font(.headline)
                     }
                     .toggleStyle(.switch)
                     statusLine
@@ -70,20 +73,22 @@ struct VoiceSettingsView: View {
         .background(RoundedRectangle(cornerRadius: 10).fill(Color.primary.opacity(0.04)))
     }
 
+    private var shortcut: String { voiceSettings.hotkey.displayName }
+
     @ViewBuilder private var statusLine: some View {
         switch voice.state {
         case .off:
-            dot(.secondary, "Off — the fn key does nothing in ProjectN")
+            dot(.secondary, "Off — \(shortcut) does nothing in ProjectN")
         case .running where !canPaste:
             HStack(spacing: 8) {
-                dot(.orange, "Hears fn, but can't paste — Accessibility not allowed for ProjectN")
+                dot(.orange, "Hears \(shortcut), but can't paste — Accessibility not allowed for ProjectN")
                 Button("Grant…") {
                     _ = HotkeyMonitor.hasAccessibility(prompt: true)
                     NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
                 }.controlSize(.small)
             }
         case .running:
-            dot(.green, "Listening for fn — works in every app while ProjectN is open")
+            dot(.green, "Listening for \(shortcut) — works in every app while ProjectN is open")
         case .waitingForPermission:
             HStack(spacing: 8) {
                 dot(.orange, "Waiting for Input Monitoring permission")

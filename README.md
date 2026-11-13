@@ -213,6 +213,7 @@ To add an agent: Settings → Agents → **+** (or duplicate one), set role/runt
 While ProjectN is open, **hold fn anywhere, talk, release** — the text is pasted at your cursor in any app (⇧ + fn enhances that one dictation with Claude/Codex, Esc cancels). It is NVoice's own code (`Sources/ProjectN/NVoice/`), so you no longer need NVoice.app running.
 
 - Settings › **Voice (NVoice)**: on/off switch, menu bar icon on/off, and NVoice's pages — General, AI, People & Words, History, Metrics.
+- The shortcut is configurable in Settings › Voice › General: fn (the default), a right-side ⌘ ⌥ ⌃ on its own, an F-key, or a key with ⌃ ⌥ ⌘ such as ⌃⌥D.
 - Shares NVoice's data and preferences (`~/Library/Application Support/NVoice/`, defaults domain `dev.projectn.nvoice`): people, dictionary, corrections, history and settings carry over both ways.
 - Only one of them listens to fn at a time (same lock file). If NVoice.app is running, Settings › Voice offers *Quit NVoice App & Use ProjectN*; launching NVoice.app while ProjectN has dictation on just opens ProjectN's Voice settings.
 - First run: allow **Microphone**, **Input Monitoring** and **Accessibility** for ProjectN. `build.sh` signs with a stable local identity (`ProjectN Local Signing` if present, or `SIGN_IDENTITY=…`) so these grants survive rebuilds.

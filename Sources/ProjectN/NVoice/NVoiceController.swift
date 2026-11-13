@@ -68,6 +68,8 @@ final class NVoiceController: NSObject, ObservableObject {
     }
 
     @Published private(set) var state: State = .off
+    /// Set when macOS refused to register the chosen shortcut.
+    @Published private(set) var hotkeyProblem: String?
 
     /// Opens ProjectN's Settings › Voice (set by ProjectN).
     var onOpenSettings: (() -> Void)?
@@ -138,6 +140,7 @@ final class NVoiceController: NSObject, ObservableObject {
         bindSettings()
         installObserversOnce()
         wireHotkey()
+        applyHotkey(settings.hotkey)
         transcriber.onLevel = { [weak self] in self?.overlay?.model.push(level: $0) }
         transcriber.inputDeviceProvider = {
             AudioDevices.resolve(NVoiceDefaults.store.string(forKey: "microphone") ?? AudioDevices.automatic)
@@ -247,6 +250,16 @@ final class NVoiceController: NSObject, ObservableObject {
         settings.$microphone.dropFirst().removeDuplicates().sink { [weak self] _ in
             DispatchQueue.main.async { self?.transcriber.invalidateEngine(reason: "microphone setting changed") }
         }.store(in: &bag)
+        settings.$hotkey.dropFirst().removeDuplicates().sink { [weak self] h in
+            DispatchQueue.main.async {
+                guard let self, self.isOn else { return }
+                self.applyHotkey(h)
+                self.rebuildMenu(enhance: self.settings.enhanceEnabled)
+            }
+        }.store(in: &bag)
+        settings.$hotkeyMode.dropFirst().removeDuplicates().sink { [weak self] _ in
+            DispatchQueue.main.async { self?.rebuildMenu(enhance: self?.settings.enhanceEnabled ?? false) }
+        }.store(in: &bag)
         settings.$enhanceEnabled.sink { [weak self] v in self?.overlay?.model.enhance = v; self?.rebuildMenu(enhance: v) }.store(in: &bag)
         settings.$showWidget.dropFirst().sink { [weak self] v in self?.overlay?.setVisible(v) }.store(in: &bag)
         settings.$widgetPosition.dropFirst().sink { [weak self] _ in DispatchQueue.main.async { self?.overlay?.reposition() } }.store(in: &bag)
@@ -286,20 +299,34 @@ final class NVoiceController: NSObject, ObservableObject {
         }
     }
 
+    private func applyHotkey(_ h: DictationHotkey) {
+        if transcriber.isRecording { cancelDictation() }
+        let registered = hotkey.configure(h)
+        hotkeyProblem = registered ? nil : "macOS wouldn't register \(h.displayName). Try another shortcut."
+        overlay?.model.hotkeyLabel = h.displayName
+        Diagnostics.log("dictation shortcut: \(h.displayName)\(registered ? "" : " (could not register)")")
+    }
+
+    /// While Settings records a new shortcut, the current one is switched off.
+    func setCapturingHotkey(_ capturing: Bool) {
+        if capturing && transcriber.isRecording { cancelDictation() }
+        hotkey.setSuspended(capturing)
+    }
+
     private func wireHotkey() {
-        hotkey.onFnDown = { [weak self] in
+        hotkey.onHotkeyDown = { [weak self] in
             guard let self else { return }
-            Diagnostics.log("fn down")
+            Diagnostics.log("hotkey down")
             switch self.settings.hotkeyMode {
             case .hold: self.startDictation()
             case .toggle: self.transcriber.isRecording ? self.finishDictation() : self.startDictation()
             }
         }
-        hotkey.onFnUp = { [weak self] in
+        hotkey.onHotkeyUp = { [weak self] in
             guard let self, self.settings.hotkeyMode == .hold else { return }
             self.finishDictation()
         }
-        hotkey.onFnChord = { [weak self] in
+        hotkey.onHotkeyChord = { [weak self] in
             // fn + another key (fn+arrows, fn+F-keys…) is a shortcut, not a dictation.
             guard let self, self.transcriber.isRecording,
                   Date().timeIntervalSince(self.recordingStart ?? .distantPast) < 1.0 || self.settings.hotkeyMode == .hold else { return }
@@ -475,7 +502,7 @@ final class NVoiceController: NSObject, ObservableObject {
         let status: String
         if !hotkey.isRunning { status = "⚠︎ Grant Input Monitoring + Accessibility…" }
         else if !HotkeyMonitor.hasAccessibility(prompt: false) { status = "⚠︎ Grant Accessibility to paste…" }
-        else { status = "Hold fn to dictate" }
+        else { status = "\(settings.hotkeyMode == .hold ? "Hold" : "Tap") \(settings.hotkey.displayName) to dictate" }
         let ready = hotkey.isRunning && HotkeyMonitor.hasAccessibility(prompt: false)
         let header = NSMenuItem(title: status, action: ready ? nil : #selector(openPermissions), keyEquivalent: "")
         header.target = self

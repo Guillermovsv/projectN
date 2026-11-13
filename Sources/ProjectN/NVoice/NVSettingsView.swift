@@ -1,6 +1,7 @@
 import SwiftUI
 import Charts
 import AVFoundation
+import Carbon.HIToolbox
 
 enum SettingsTab: String, CaseIterable, Identifiable {
     case metrics = "Metrics", people = "People & Words", general = "General", ai = "AI", history = "History"
@@ -98,6 +99,90 @@ func fmtDuration(_ t: TimeInterval) -> String {
 
 // MARK: - General
 
+/// Records a new dictation shortcut from the keys the user presses.
+final class HotkeyRecorderModel: ObservableObject {
+    @Published private(set) var isRecording = false
+    @Published private(set) var message: String?
+    private var monitor: Any?
+    private var capture = HotkeyCapture()
+
+    func start() {
+        guard !isRecording else { return }
+        isRecording = true
+        message = nil
+        capture = HotkeyCapture()
+        NVoiceController.shared.setCapturingHotkey(true)
+        monitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .flagsChanged]) { [weak self] event in
+            self?.handle(event)
+            return nil      // the keys being recorded must not reach the app
+        }
+    }
+
+    func stop() {
+        guard isRecording else { return }
+        if let monitor { NSEvent.removeMonitor(monitor) }
+        monitor = nil
+        isRecording = false
+        NVoiceController.shared.setCapturingHotkey(false)
+    }
+
+    private func handle(_ event: NSEvent) {
+        let outcome: HotkeyCapture.Outcome
+        if event.type == .flagsChanged {
+            outcome = capture.flagsChanged(keyCode: Int(event.keyCode), flags: UInt64(event.modifierFlags.rawValue))
+        } else {
+            guard !event.isARepeat else { return }
+            outcome = capture.keyDown(keyCode: Int(event.keyCode), modifiers: Self.carbonModifiers(event.modifierFlags),
+                                      typed: event.charactersIgnoringModifiers)
+        }
+        switch outcome {
+        case .pending: break
+        case .cancelled: stop()
+        case .rejected(let why): message = why
+        case .captured(let hotkey):
+            NVoiceSettings.shared.hotkey = hotkey
+            stop()
+        }
+    }
+
+    private static func carbonModifiers(_ flags: NSEvent.ModifierFlags) -> Int {
+        var mask = 0
+        if flags.contains(.command) { mask |= cmdKey }
+        if flags.contains(.option) { mask |= optionKey }
+        if flags.contains(.control) { mask |= controlKey }
+        if flags.contains(.shift) { mask |= shiftKey }
+        return mask
+    }
+}
+
+struct HotkeyRecorderRow: View {
+    @ObservedObject private var s = NVoiceSettings.shared
+    @ObservedObject private var voice = NVoiceController.shared
+    @StateObject private var recorder = HotkeyRecorderModel()
+
+    var body: some View {
+        LabeledContent("Shortcut") {
+            HStack(spacing: 8) {
+                Button(recorder.isRecording ? "Press a shortcut… (Esc to cancel)" : s.hotkey.displayName) {
+                    recorder.isRecording ? recorder.stop() : recorder.start()
+                }
+                if s.hotkey != .fn && !recorder.isRecording {
+                    Button("Reset to fn") { s.hotkey = .fn }
+                }
+            }
+        }
+        .onDisappear { recorder.stop() }
+        if let problem = recorder.message ?? voice.hotkeyProblem {
+            Label(problem, systemImage: "exclamationmark.triangle.fill")
+                .font(.caption).foregroundStyle(.orange)
+        }
+        else if let caution = s.hotkey.caution, !recorder.isRecording {
+            Label(caution, systemImage: "info.circle")
+                .font(.caption).foregroundStyle(.secondary)
+        }
+    }
+}
+
 struct GeneralSettingsView: View {
     @ObservedObject var s = NVoiceSettings.shared
     @State private var axTrusted = HotkeyMonitor.hasAccessibility(prompt: false)
@@ -108,15 +193,18 @@ struct GeneralSettingsView: View {
     var body: some View {
         Form {
             Section("Hotkey") {
-                Picker("fn key", selection: $s.hotkeyMode) {
+                HotkeyRecorderRow()
+                Picker("Behavior", selection: $s.hotkeyMode) {
                     ForEach(HotkeyMode.allCases) { Text($0.label).tag($0) }
                 }
                 Text("Language, dictionary and corrections are per person — see People & Words.")
                     .font(.caption).foregroundStyle(.secondary)
-                Text("Hold ⇧ Shift together with fn to enhance a single dictation. Press Esc to cancel.")
+                Text("Hold ⇧ Shift as you finish a dictation to enhance just that one. Press Esc to cancel.")
                     .font(.caption).foregroundStyle(.secondary)
-                Text("Tip: set System Settings › Keyboard › “Press 🌐 key to” → Do Nothing, so macOS doesn’t open the emoji picker.")
-                    .font(.caption).foregroundStyle(.secondary)
+                if s.hotkey == .fn {
+                    Text("Tip: set System Settings › Keyboard › “Press 🌐 key to” → Do Nothing, so macOS doesn’t open the emoji picker.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
             }
             Section("Dictation") {
                 Picker("Microphone", selection: $s.microphone) {
@@ -136,7 +224,7 @@ struct GeneralSettingsView: View {
                     ForEach(WidgetPosition.allCases) { Text($0.label).tag($0) }
                 }
                 Toggle("Play sounds", isOn: $s.playSounds)
-                Toggle("Lower other audio while holding fn", isOn: $s.duckAudio)
+                Toggle("Lower other audio while dictating", isOn: $s.duckAudio)
                 if s.duckAudio {
                     HStack {
                         Text("Volume while dictating")
@@ -146,7 +234,7 @@ struct GeneralSettingsView: View {
                 }
             }
             Section("Permissions") {
-                PermissionRow(name: "Input Monitoring (hear the fn key)", ok: inputOK) {
+                PermissionRow(name: "Input Monitoring (hear the dictation shortcut)", ok: inputOK) {
                     HotkeyMonitor.requestInputMonitoring()
                     NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent")!)
                 }
@@ -294,7 +382,7 @@ struct HistoryView: View {
             .padding([.horizontal, .top], 24).padding(.bottom, 8)
 
             if store.records.isEmpty {
-                ContentUnavailableView("No dictations yet", systemImage: "mic", description: Text("Hold fn and start talking."))
+                ContentUnavailableView("No dictations yet", systemImage: "mic", description: Text("Press \(NVoiceSettings.shared.hotkey.displayName) and start talking."))
             } else {
                 List(store.records) { r in
                     VStack(alignment: .leading, spacing: 4) {

@@ -50,7 +50,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>NSHighResolutionCapable</key><true/>
   <key>NSPrincipalClass</key><string>NSApplication</string>
   <!-- Built-in NVoice dictation -->
-  <key>NSMicrophoneUsageDescription</key><string>ProjectN listens to your microphone while you hold the fn key so it can transcribe your dictation (NVoice).</string>
+  <key>NSMicrophoneUsageDescription</key><string>ProjectN listens to your microphone while you use your dictation shortcut so it can transcribe your dictation (NVoice).</string>
   <key>NSSpeechRecognitionUsageDescription</key><string>ProjectN transcribes your dictation on-device (NVoice).</string>
   <key>NSAppleEventsUsageDescription</key><string>ProjectN pastes transcribed text into the active app (NVoice).</string>
   <key>NSAppTransportSecurity</key>

@@ -12,6 +12,7 @@ final class OverlayModel: ObservableObject {
     @Published var enhance = false
     @Published var hovering = false
     @Published var message: String?
+    @Published var hotkeyLabel = DictationHotkey.fn.displayName
 
     func push(level: Float) {
         // Smooth + keep a rolling window so the wave scrolls.
@@ -124,7 +125,8 @@ struct OverlayView: View {
             if model.hovering {
                 HStack(spacing: 5) {
                     Image(systemName: model.enhance ? "sparkles" : "mic.fill").font(.system(size: 9, weight: .bold))
-                    Text("fn").font(.system(size: 10, weight: .semibold, design: .rounded))
+                    Text(model.hotkeyLabel).font(.system(size: 10, weight: .semibold, design: .rounded))
+                        .lineLimit(1).minimumScaleFactor(0.6)
                 }
                 .foregroundStyle(model.enhance ? AnyShapeStyle(LinearGradient(colors: accent, startPoint: .leading, endPoint: .trailing)) : AnyShapeStyle(Color.white.opacity(0.7)))
             } else {

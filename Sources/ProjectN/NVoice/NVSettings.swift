@@ -30,7 +30,7 @@ enum AIProvider: String, CaseIterable, Identifiable {
 enum HotkeyMode: String, CaseIterable, Identifiable {
     case hold, toggle
     var id: String { rawValue }
-    var label: String { self == .hold ? "Hold fn to talk" : "Tap fn to start / stop" }
+    var label: String { self == .hold ? "Hold to talk" : "Tap to start / stop" }
 }
 
 enum WidgetPosition: String, CaseIterable, Identifiable {
@@ -56,6 +56,7 @@ final class NVoiceSettings: ObservableObject {
     @Published var enhanceEnabled: Bool { didSet { d.set(enhanceEnabled, forKey: "enhanceEnabled") } }
     @Published var enhancePrompt: String { didSet { d.set(enhancePrompt, forKey: "enhancePrompt") } }
     @Published var hotkeyMode: HotkeyMode { didSet { d.set(hotkeyMode.rawValue, forKey: "hotkeyMode") } }
+    @Published var hotkey: DictationHotkey { didSet { d.set(try? JSONEncoder().encode(hotkey), forKey: "hotkey") } }
     @Published var playSounds: Bool { didSet { d.set(playSounds, forKey: "playSounds") } }
     @Published var showWidget: Bool { didSet { d.set(showWidget, forKey: "showWidget") } }
     @Published var widgetPosition: WidgetPosition { didSet { d.set(widgetPosition.rawValue, forKey: "widgetPosition") } }
@@ -82,6 +83,7 @@ final class NVoiceSettings: ObservableObject {
         enhanceEnabled = d.object(forKey: "enhanceEnabled") as? Bool ?? false
         enhancePrompt = d.string(forKey: "enhancePrompt") ?? defaultEnhancePrompt
         hotkeyMode = HotkeyMode(rawValue: d.string(forKey: "hotkeyMode") ?? "") ?? .hold
+        hotkey = DictationHotkey.decoded(from: d.data(forKey: "hotkey"))
         playSounds = d.object(forKey: "playSounds") as? Bool ?? true
         showWidget = d.object(forKey: "showWidget") as? Bool ?? true
         widgetPosition = WidgetPosition(rawValue: d.string(forKey: "widgetPosition") ?? "") ?? .bottom
