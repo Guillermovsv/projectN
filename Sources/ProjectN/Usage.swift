@@ -57,19 +57,31 @@ final class UsageModel: ObservableObject {
                 Self.readCodex(settings: settings)
             }.value
             let claudeResult = await c
-            self.codex = x
-            switch claudeResult {
-            case .success(let u): self.claude = u
-            case .failure(let e):
-                // Keep the last good numbers; just note the problem.
-                self.claude.error = e.message
-                if self.claude.updated == nil { self.claude.updated = nil }
-            }
-            switch await k {
-            case .success(let u): self.cursor = u
-            case .failure(let e): self.cursor.error = e.message
-            }
+            let cursorResult = await k
+            // A failed or empty read never wipes the meter: keep the last good numbers and just note the problem.
+            self.codex = Self.merge(self.codex, x.windows.isEmpty ? .failure(UsageError(message: x.error ?? "No rate-limit data yet")) : .success(x))
+            self.claude = Self.merge(self.claude, claudeResult)
+            self.cursor = Self.merge(self.cursor, cursorResult)
             self.refreshing = false
+        }
+    }
+
+    /// New data replaces the old; a failure (or a read with no windows) keeps the previous windows, with the error noted.
+    /// Kept windows whose reset time has passed drop to 0%, since that snapshot no longer applies.
+    nonisolated static func merge(_ old: ToolUsage, _ result: Result<ToolUsage, UsageError>, now: Date = Date()) -> ToolUsage {
+        switch result {
+        case .success(let u) where !u.windows.isEmpty:
+            return u
+        case .success(let u):
+            return merge(old, .failure(UsageError(message: u.error ?? "No usage data")), now: now)
+        case .failure(let e):
+            var kept = old
+            kept.windows = old.windows.map { w in
+                guard let r = w.resetsAt, r <= now else { return w }
+                return Window(label: w.label, percent: 0, resetsAt: nil)
+            }
+            kept.error = e.message
+            return kept
         }
     }
 
@@ -211,50 +223,67 @@ final class UsageModel: ObservableObject {
 
     nonisolated private static func readCodex(settings: AppSettings) -> ToolUsage {
         let root = SessionDiscovery.codexHome(settings).appendingPathComponent("sessions")
-        guard let file = newestRollout(in: root) else { return ToolUsage(error: "No Codex sessions yet") }
-        guard let limits = lastRateLimits(in: file) else { return ToolUsage(error: "No rate-limit data yet") }
+        let files = recentRollouts(in: root)
+        guard !files.isEmpty else { return ToolUsage(error: "No Codex sessions yet") }
+        // Codex also writes rate_limits records with no numbers ("limit_id": "premium", primary/secondary null),
+        // and a session that just started may have none: walk back to the newest record that has them.
+        for file in files.prefix(12) {
+            guard let limits = lastRateLimits(in: file) else { continue }
+            let windows = codexWindows(limits)
+            guard !windows.isEmpty else { continue }
+            let modified = (try? file.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? Date()
+            return ToolUsage(windows: windows, updated: modified, error: nil)
+        }
+        return ToolUsage(error: "No rate-limit data yet")
+    }
+
+    /// The windows of one `rate_limits` record (empty when it carries no numbers).
+    nonisolated static func codexWindows(_ limits: [String: Any], now: Date = Date()) -> [Window] {
+        let reached = (limits["rate_limit_reached_type"] as? String)?.lowercased() ?? ""
         var windows: [Window] = []
         for key in ["primary", "secondary"] {
             guard let w = limits[key] as? [String: Any], let used = (w["used_percent"] as? NSNumber)?.doubleValue else { continue }
             let minutes = (w["window_minutes"] as? NSNumber)?.intValue ?? 0
             let resets = (w["resets_at"] as? NSNumber).map { Date(timeIntervalSince1970: $0.doubleValue) }
+            var pct = reached.contains(key) ? max(used, 100) : used
             // A snapshot from before the window reset no longer applies.
-            let pct = (resets.map { $0 < Date() } ?? false) ? 0 : used
+            if let resets, resets <= now { pct = 0 }
             let label = minutes == 300 ? "5h" : (minutes == 10080 ? "Week" : (minutes >= 1440 ? "\(minutes / 1440)d" : "\(minutes / 60)h"))
-            windows.append(Window(label: label, percent: pct, resetsAt: resets))
+            windows.append(Window(label: label, percent: pct, resetsAt: resets.flatMap { $0 > now ? $0 : nil }))
         }
-        let modified = (try? file.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? Date()
-        return ToolUsage(windows: windows, updated: modified, error: windows.isEmpty ? "No rate-limit data yet" : nil)
+        return windows
     }
 
-    nonisolated private static func newestRollout(in root: URL) -> URL? {
+    /// Rollout files of the last 8 days, newest first.
+    nonisolated private static func recentRollouts(in root: URL) -> [URL] {
         let fm = FileManager.default
         let cal = Calendar.current
-        var best: (URL, Date)?
+        var found: [(URL, Date)] = []
         for back in 0..<8 {
             guard let day = cal.date(byAdding: .day, value: -back, to: Date()) else { continue }
             let c = cal.dateComponents([.year, .month, .day], from: day)
             let dir = root.appendingPathComponent(String(format: "%04d/%02d/%02d", c.year!, c.month!, c.day!))
             guard let files = try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.contentModificationDateKey]) else { continue }
             for f in files where f.pathExtension == "jsonl" {
-                let m = (try? f.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
-                if best == nil || m > best!.1 { best = (f, m) }
+                found.append((f, (try? f.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast))
             }
-            if best != nil && back >= 1 { break }
         }
-        return best?.0
+        return found.sorted { $0.1 > $1.1 }.map(\.0)
     }
 
+    /// The newest `rate_limits` record in the file's tail that has numbers.
     nonisolated private static func lastRateLimits(in url: URL) -> [String: Any]? {
         guard let h = try? FileHandle(forReadingFrom: url) else { return nil }
         defer { try? h.close() }
         let size = (try? h.seekToEnd()) ?? 0
-        let chunk: UInt64 = 512 * 1024
+        let chunk: UInt64 = 1024 * 1024
         try? h.seek(toOffset: size > chunk ? size - chunk : 0)
-        guard let data = try? h.readToEnd(), let text = String(data: data, encoding: .utf8) else { return nil }
-        for line in text.split(separator: "\n").reversed() where line.contains("\"rate_limits\"") {
-            guard let obj = try? JSONSerialization.jsonObject(with: Data(line.utf8)) else { continue }
-            if let found = find("rate_limits", in: obj) { return found }
+        guard let data = try? h.readToEnd() else { return nil }
+        let text = String(decoding: data, as: UTF8.self)
+        for line in text.split(separator: "\n").reversed() where line.contains("\"used_percent\"") {
+            guard let obj = try? JSONSerialization.jsonObject(with: Data(line.utf8)),
+                  let found = find("rate_limits", in: obj), !codexWindows(found, now: .distantPast).isEmpty else { continue }
+            return found
         }
         return nil
     }
@@ -276,30 +305,53 @@ func usageColor(_ percent: Double) -> Color {
     percent >= 90 ? .red : (percent >= 70 ? .orange : .primary)
 }
 
-/// Compact meter for the top bar: the active pane's agent (Claude or Codex), showing whichever window
-/// (5h or weekly) is highest. Switches when you focus a pane of the other type.
+/// Compact meters for the top bar: one per agent (Claude, Codex, Cursor) with a pane in the current space,
+/// each showing whichever window (5h, weekly…) is highest. At the limit it shows 100% and when it resets.
+/// Nothing is shown when the space has no agent panes.
 struct UsageMeters: View {
+    let tools: [Tool]
+
+    var body: some View {
+        HStack(spacing: 6) {
+            ForEach(tools) { UsageMeter(tool: $0, others: tools) }
+        }
+        .animation(.easeInOut(duration: 0.2), value: tools)
+    }
+}
+
+struct UsageMeter: View {
     @EnvironmentObject var usage: UsageModel
     let tool: Tool
+    var others: [Tool] = []
     @State private var showDetails = false
 
     var body: some View {
         Button { showDetails.toggle() } label: {
-            meter(tool, usage.usage(for: tool))
+            meter(usage.usage(for: tool))
                 .padding(.horizontal, 8)
                 .frame(height: 26)
                 .background(RoundedRectangle(cornerRadius: 7).fill(Color.primary.opacity(0.06)))
                 .contentShape(Rectangle())
-                .animation(.easeInOut(duration: 0.2), value: tool)
         }
         .buttonStyle(.plain)
         .hoverHighlight(cornerRadius: 7, inset: 0)
-        .help("\(tool.label) plan usage — the higher of the 5-hour and weekly windows. Click for details.")
-        .popover(isPresented: $showDetails, arrowEdge: .bottom) { UsageDetails(tool: tool).environmentObject(usage) }
+        .help(helpText(usage.usage(for: tool)))
+        .popover(isPresented: $showDetails, arrowEdge: .bottom) {
+            UsageDetails(tool: tool, others: others).environmentObject(usage)
+        }
+    }
+
+    private func helpText(_ u: UsageModel.ToolUsage) -> String {
+        var t = "\(tool.label) plan usage — the highest of its windows. Click for details."
+        if let w = u.highest, w.percent >= 100, let r = w.resetsAt {
+            t = "\(tool.label): limit reached — resets \(r.formatted(.relative(presentation: .named))) (\(r.formatted(date: .omitted, time: .shortened))). Click for details."
+        }
+        if let e = u.error { t += "\n\(e)" }
+        return t
     }
 
     @ViewBuilder
-    private func meter(_ tool: Tool, _ u: UsageModel.ToolUsage) -> some View {
+    private func meter(_ u: UsageModel.ToolUsage) -> some View {
         HStack(spacing: 6) {
             Image(systemName: tool.symbol)
                 .font(.system(size: 11, weight: .semibold))
@@ -310,18 +362,39 @@ struct UsageMeters: View {
             if let w = u.highest {
                 UsageBar(percent: w.percent)
                     .frame(width: 56, height: 5)
-                Text("\(Int(w.percent.rounded()))%")
+                Text(usagePercentText(w.percent))
                     .font(.caption.monospacedDigit().weight(.semibold))
                     .foregroundStyle(usageColor(w.percent))
-                Text(["Week": "wk", "Month": "mo", "On-demand": "extra"][w.label] ?? w.label)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
+                if w.percent >= 100, let r = w.resetsAt {
+                    // At the limit, say when it comes back instead of the window name.
+                    Label(resetShort(r), systemImage: "clock.arrow.circlepath")
+                        .labelStyle(.titleAndIcon)
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                } else {
+                    Text(["Week": "wk", "Month": "mo", "On-demand": "extra"][w.label] ?? w.label)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
             } else {
                 Text("—").font(.caption).foregroundStyle(.tertiary)
             }
         }
-        .opacity(u.error != nil && u.highest != nil ? 0.6 : 1)
+        .opacity(u.error != nil && u.highest != nil ? 0.75 : 1)
     }
+
+    /// "3:45 PM" today, "Fri 3:45 PM" within a week, otherwise "Nov 20".
+    private func resetShort(_ r: Date) -> String {
+        let cal = Calendar.current
+        if cal.isDateInToday(r) { return r.formatted(date: .omitted, time: .shortened) }
+        if r.timeIntervalSinceNow < 6 * 86400 { return r.formatted(.dateTime.weekday(.abbreviated).hour().minute()) }
+        return r.formatted(.dateTime.month(.abbreviated).day())
+    }
+}
+
+/// Usage is shown capped at 100%.
+func usagePercentText(_ percent: Double) -> String {
+    "\(Int(min(100, max(0, percent)).rounded()))%"
 }
 
 /// Next to the usage meter: live agent-harness panes (Agentes) and the Claude/Codex/Cursor/Gemini sessions
@@ -375,6 +448,8 @@ struct UsageBar: View {
 struct UsageDetails: View {
     @EnvironmentObject var usage: UsageModel
     var tool: Tool = .claude
+    /// The other agents visible in the space, listed below for comparison.
+    var others: [Tool] = []
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -388,8 +463,7 @@ struct UsageDetails: View {
                 .help("Refresh now")
             }
             section(tool, usage.usage(for: tool))
-            // The other agents you use, for comparison (only those with data).
-            ForEach(Tool.allCases.filter { $0.hasUsageMeter && $0 != tool && !usage.usage(for: $0).windows.isEmpty }) { other in
+            ForEach(others.filter { $0 != tool }) { other in
                 Divider()
                 section(other, usage.usage(for: other))
             }
@@ -410,19 +484,24 @@ struct UsageDetails: View {
                     HStack {
                         Text(["5h": "5-hour window", "Week": "Weekly", "Month": "Monthly", "On-demand": "On-demand spend"][w.label] ?? w.label).font(.callout)
                         Spacer()
-                        Text("\(Int(w.percent.rounded()))%").font(.callout.monospacedDigit().weight(.semibold))
+                        Text(usagePercentText(w.percent)).font(.callout.monospacedDigit().weight(.semibold))
                             .foregroundStyle(usageColor(w.percent))
                     }
                     UsageBar(percent: w.percent).frame(height: 6)
                     if let r = w.resetsAt {
-                        Text("Resets \(r.formatted(.relative(presentation: .named))) · \(r.formatted(date: .abbreviated, time: .shortened))")
+                        Text("\(w.percent >= 100 ? "Limit reached · resets" : "Resets") \(r.formatted(.relative(presentation: .named))) · \(r.formatted(date: .abbreviated, time: .shortened))")
                             .font(.caption2).foregroundStyle(.secondary)
                     }
                 }
             }
+            if u.windows.isEmpty {
+                Text("No usage data yet").font(.caption).foregroundStyle(.secondary)
+            }
             if let e = u.error {
-                Label(e, systemImage: "exclamationmark.triangle").font(.caption).foregroundStyle(.orange)
-            } else if let d = u.updated {
+                Label(u.windows.isEmpty ? e : "\(e) — showing the last known numbers", systemImage: "exclamationmark.triangle")
+                    .font(.caption).foregroundStyle(.orange)
+            }
+            if let d = u.updated {
                 Text("Updated \(d.formatted(.relative(presentation: .named)))").font(.caption2).foregroundStyle(.tertiary)
             }
         }

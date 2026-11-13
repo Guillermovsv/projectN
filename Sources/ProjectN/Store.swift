@@ -594,7 +594,6 @@ final class Store: ObservableObject {
 
     func focusPane(_ id: UUID, in wid: UUID) {
         guard let (s, p) = pane(id, in: wid) else { return }
-        if p.tool.hasUsageMeter { UserDefaults.standard.set(p.tool.rawValue, forKey: "lastAgentTool") }
         guard s.focusedPaneID != id else { return }
         updateSpace(s.id, in: wid) { $0.focusedPaneID = id }
     }
@@ -807,13 +806,12 @@ final class Store: ObservableObject {
         do { try doc.write(to: url, atomically: true, encoding: .utf8); return url } catch { return nil }
     }
 
-    /// The agent type whose usage the top bar shows: the focused pane's, else the last agent you focused.
-    var activeAgentTool: Tool {
-        if let s = selectedSpace, let p = s.panes.first(where: { $0.id == s.focusedPaneID }) ?? s.panes.first, p.tool.hasUsageMeter {
-            return p.tool
-        }
-        if let s = selectedSpace, let p = s.panes.last(where: { $0.tool.hasUsageMeter }), s.focusedPaneID == nil { return p.tool }
-        return Tool(rawValue: UserDefaults.standard.string(forKey: "lastAgentTool") ?? "") ?? .claude
+    /// The agents whose usage the top bar shows: one per Claude/Codex/Cursor pane open in the selected space.
+    /// Empty when the space has none (or no space is selected).
+    var visibleAgentTools: [Tool] {
+        guard let s = selectedSpace else { return [] }
+        let present = Set(s.panes.map(\.tool))
+        return Tool.allCases.filter { $0.hasUsageMeter && present.contains($0) }
     }
 
     func paneTitle(_ p: Pane) -> String {

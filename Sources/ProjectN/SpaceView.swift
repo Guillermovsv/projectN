@@ -64,7 +64,7 @@ struct SpaceView: View {
                 .background(Capsule().fill(Color.primary.opacity(0.07)))
             Spacer()
 
-            UsageMeters(tool: store.activeAgentTool)
+            UsageMeters(tools: store.visibleAgentTools)
 
             ActiveCounts()
             AddPaneMenu(workspace: w, space: s)
