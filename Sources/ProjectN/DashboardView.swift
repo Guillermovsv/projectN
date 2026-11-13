@@ -18,6 +18,7 @@ struct DashboardView: View {
                 Text("Overview").font(.headline)
                 Spacer()
                 UsageMeters(tool: store.activeAgentTool)
+                ActiveCounts()
                 Button { showNewWorkspace = true } label: { Label("New Workspace", systemImage: "plus") }
                     .controlSize(.small)
             }

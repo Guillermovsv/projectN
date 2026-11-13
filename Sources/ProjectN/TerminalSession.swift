@@ -32,6 +32,8 @@ final class TerminalSession: NSObject, ObservableObject, LocalProcessTerminalVie
     private let lastOutputLock = OSAllocatedUnfairLock(initialState: Date())
     var lastOutputAt: Date { lastOutputLock.withLock { $0 } }
     private var cachedScreen: [String]?
+    /// Latest output time the cached screen is known to include (taken when its read was dispatched).
+    private var cachedScreenOutputAt = Date.distantPast
     private var screenReadInFlight = false
     private let screenQueue = DispatchQueue(label: "dev.projectn.screen", qos: .utility)
     private var terminated = false
@@ -45,6 +47,7 @@ final class TerminalSession: NSObject, ObservableObject, LocalProcessTerminalVie
             let dirty = outputDirty.withLock { d -> Bool in let v = d; d = false; return v }
             if dirty {
                 screenReadInFlight = true
+                let outputAt = lastOutputAt
                 let reader = TerminalScreenReader(view: view)
                 let scanRows = Self.scanRows
                 screenQueue.async { [weak self] in
@@ -52,6 +55,7 @@ final class TerminalSession: NSObject, ObservableObject, LocalProcessTerminalVie
                     DispatchQueue.main.async { [weak self] in
                         guard let self else { return }
                         self.cachedScreen = screen
+                        self.cachedScreenOutputAt = outputAt
                         self.screenReadInFlight = false
                         self.considerAutoAnswer(screen)
                     }
@@ -106,6 +110,27 @@ final class TerminalSession: NSObject, ObservableObject, LocalProcessTerminalVie
     private var pendingFingerprint: String?
     private var pendingSince = Date.distantPast
     private var answeredFingerprint: String?
+    /// When the last key of the previous answer went out.
+    private var answeredAt = Date.distantPast
+
+    /// Whether the prompt on screen is the one already answered. Consecutive prompts often look identical (two
+    /// edits to the same file, the same command twice, Codex's repeated "Allow" for one tool), and the frame
+    /// between them is usually too short for a scan to see. So a matching prompt counts as new once the screen
+    /// shows output the agent drew after receiving the answer (it always redraws when it takes one).
+    private func isAlreadyAnswered(_ fingerprint: String) -> Bool {
+        guard fingerprint == answeredFingerprint else { return false }
+        let redrawn = cachedScreenOutputAt > answeredAt.addingTimeInterval(0.2)
+            && Date().timeIntervalSince(answeredAt) >= 1.0
+        if redrawn { answeredFingerprint = nil }
+        return !redrawn
+    }
+
+    private func recordAnswer(_ d: AutoResponder.Decision) {
+        answeredFingerprint = d.fingerprint
+        answeredAt = Date().addingTimeInterval(0.06 * Double(max(0, d.keys.count - 1)))
+        lastAutoAnswer = (d.label, Date())
+        sendKeys(d.keys)
+    }
 
     let startedAt = Date()
     static var background: NSColor { AppTheme.current.termBackground }
@@ -152,6 +177,50 @@ final class TerminalSession: NSObject, ObservableObject, LocalProcessTerminalVie
     }
 
     var isRunning: Bool { status == .running }
+
+    /// A command (not the idle shell) holds the terminal's foreground: a build, a server, a script…
+    var isRunningCommand: Bool {
+        guard isRunning, !terminated, let process = view.process, process.shellPid > 0 else { return false }
+        let fg = tcgetpgrp(process.childfd)
+        return fg > 0 && fg != process.shellPid
+    }
+
+    /// AI CLIs we recognize when they're started by hand inside a plain terminal pane.
+    static let aiCLINames: Set<String> = ["claude", "codex", "cursor-agent", "gemini"]
+
+    /// The AI CLI (claude, codex, cursor-agent, gemini) holding this terminal's foreground, if any.
+    /// Looks at argv, not just the process name, because npm-installed CLIs run as `node …/gemini`.
+    var foregroundAICLI: String? {
+        guard isRunning, !terminated, let process = view.process, process.shellPid > 0 else { return nil }
+        let fg = tcgetpgrp(process.childfd)
+        guard fg > 0, fg != process.shellPid else { return nil }
+        for arg in Self.arguments(of: fg).prefix(3) {
+            let name = (arg as NSString).lastPathComponent
+            if Self.aiCLINames.contains(name) { return name }
+        }
+        return nil
+    }
+
+    /// argv of a process (via KERN_PROCARGS2); empty if it can't be read.
+    private static func arguments(of pid: pid_t) -> [String] {
+        var mib: [Int32] = [CTL_KERN, KERN_PROCARGS2, pid]
+        var size = 0
+        guard sysctl(&mib, 3, nil, &size, nil, 0) == 0, size > MemoryLayout<Int32>.size else { return [] }
+        var buf = [UInt8](repeating: 0, count: size)
+        guard sysctl(&mib, 3, &buf, &size, nil, 0) == 0 else { return [] }
+        let argc = buf.withUnsafeBytes { Int($0.load(as: Int32.self)) }
+        var i = MemoryLayout<Int32>.size
+        while i < size, buf[i] != 0 { i += 1 }      // executable path
+        while i < size, buf[i] == 0 { i += 1 }      // padding
+        var args: [String] = []
+        while i < size, args.count < argc {
+            let start = i
+            while i < size, buf[i] != 0 { i += 1 }
+            args.append(String(decoding: buf[start..<i], as: UTF8.self))
+            i += 1
+        }
+        return args
+    }
 
     /// Plain text of the normal screen buffer (scrollback + screen), trimmed to the last `maxLines`.
     func scrollbackText(maxLines: Int = 3000, kind: Terminal.BufferKind = .normal) -> String {
@@ -206,7 +275,7 @@ final class TerminalSession: NSObject, ObservableObject, LocalProcessTerminalVie
         }
         let now = Date()
         // Already answered this prompt: never answer it twice (it may just be left over in the scrollback).
-        if decision.fingerprint == answeredFingerprint { return }
+        if isAlreadyAnswered(decision.fingerprint) { return }
         // Require the same prompt on two consecutive scans so we never act on a half-drawn frame.
         if decision.fingerprint != pendingFingerprint {
             pendingFingerprint = decision.fingerprint
@@ -215,11 +284,9 @@ final class TerminalSession: NSObject, ObservableObject, LocalProcessTerminalVie
         }
         guard now.timeIntervalSince(pendingSince) >= 0.3 else { return }
 
-        answeredFingerprint = decision.fingerprint
         pendingFingerprint = nil
         autoAnswerCount += 1
-        lastAutoAnswer = (decision.label, now)
-        sendKeys(decision.keys)
+        recordAnswer(decision)
     }
 
     /// Agent panes: answers the CLI's own permission prompt with "Yes", but only when that prompt shows one of
@@ -228,15 +295,13 @@ final class TerminalSession: NSObject, ObservableObject, LocalProcessTerminalVie
     func confirmApprovedPrompt(_ approved: [String]) -> String? {
         guard isRunning, !terminated, let screen = screenTail(requireCurrent: true),
               AutoResponder.pendingPrompt(screen: screen) != nil,
-              let d = AutoResponder.decide(screen: screen), d.fingerprint != answeredFingerprint,
+              let d = AutoResponder.decide(screen: screen), !isAlreadyAnswered(d.fingerprint),
               AutoResponder.approves(d.label) else { return nil }
         let squash = { (s: String) in String(s.unicodeScalars.filter { !CharacterSet.whitespacesAndNewlines.contains($0) && !"│┃║╭╮╰╯─━".unicodeScalars.contains($0) }.map(Character.init)) }
         let text = squash(screen.joined())
         guard approved.contains(where: { a in let n = squash(a); return n.count >= 2 && text.contains(String(n.prefix(50))) }) else { return nil }
-        answeredFingerprint = d.fingerprint
         autoAnswerCount += 1
-        lastAutoAnswer = (d.label, Date())
-        sendKeys(d.keys)
+        recordAnswer(d)
         return d.label
     }
 
@@ -247,9 +312,7 @@ final class TerminalSession: NSObject, ObservableObject, LocalProcessTerminalVie
         guard isRunning, !terminated, let screen = screenTail(), AutoResponder.pendingPrompt(screen: screen) != nil else { return false }
         if approve {
             guard let d = AutoResponder.decide(screen: screen), AutoResponder.approves(d.label) else { return false }
-            answeredFingerprint = d.fingerprint
-            lastAutoAnswer = (d.label, Date())
-            sendKeys(d.keys)
+            recordAnswer(d)
         } else {
             lastAutoAnswer = ("No", Date())
             sendKeys(["\u{1b}"])

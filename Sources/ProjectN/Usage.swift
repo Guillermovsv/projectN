@@ -324,6 +324,39 @@ struct UsageMeters: View {
     }
 }
 
+/// Next to the usage meter: live agent-harness panes (Agentes) and the Claude/Codex/Cursor/Gemini sessions
+/// you opened yourself (Terminales). Green while at least one of them is working.
+struct ActiveCounts: View {
+    @EnvironmentObject var store: Store
+
+    var body: some View {
+        let c = store.workingCounts
+        HStack(spacing: 10) {
+            item("person.2.fill", c.agents, working: c.agentsWorking,
+                 tip: "Agentes: \(c.agents) \(c.agents == 1 ? "sesión abierta" : "sesiones abiertas") · \(c.agentsWorking) trabajando")
+            item(Tool.terminal.symbol, c.terminals, working: c.terminalsWorking,
+                 tip: "Terminales: \(c.terminals) \(c.terminals == 1 ? "sesión" : "sesiones") de Claude, Codex, Cursor o Gemini (sin contar agentes) · \(c.terminalsWorking) trabajando")
+        }
+        .padding(.horizontal, 8)
+        .frame(height: 26)
+        .background(RoundedRectangle(cornerRadius: 7).fill(Color.primary.opacity(0.06)))
+        .animation(.easeInOut(duration: 0.2), value: c)
+    }
+
+    private func item(_ symbol: String, _ n: Int, working: Int, tip: String) -> some View {
+        HStack(spacing: 4) {
+            Image(systemName: symbol).font(.system(size: 11, weight: .semibold))
+            Text("\(n)").font(.caption.monospacedDigit().weight(.semibold))
+                .contentTransition(.numericText())
+        }
+        .foregroundStyle(working > 0 ? Color.green : (n > 0 ? Color.primary : Color.secondary))
+        .padding(.horizontal, 2)
+        .frame(height: 26)
+        .contentShape(Rectangle())
+        .help(tip)
+    }
+}
+
 struct UsageBar: View {
     let percent: Double
 

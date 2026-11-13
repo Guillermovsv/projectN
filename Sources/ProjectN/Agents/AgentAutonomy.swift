@@ -394,10 +394,13 @@ extension AgentHarness {
                         "projects": p.allProjects ? "all" : (store?.state.projects.filter { p.mayAccess($0.id) }.map(\.name).joined(separator: ", ") ?? ""),
                         "mcp_servers_in_this_project": servers.sorted(), "cli_tools": p.cliTools, "can_delegate": p.canDelegate,
                         "busy": tasks.contains { $0.agentID == p.id && $0.status.isActive },
+                        // Without these a coordinator read "busy" as "taken" and sent dev work to another role.
+                        "max_parallel_tasks": max(1, p.concurrencyLimit),
+                        "free_slots": max(0, max(1, p.concurrencyLimit) - activeCount(agent: p.id)),
                         "working_on": tasks.filter { $0.agentID == p.id && ($0.status.isActive || $0.status == .queued) }.map(liveStatus)]
             }
             reply(Self.json(["agents": list,
-                             "note": "working_on shows each agent's live tasks; `blocked_on_user` means it is stopped until the user answers (tell the user)."]), false)
+                             "note": "working_on shows each agent's live tasks; `blocked_on_user` means it is stopped until the user answers (tell the user). An agent runs up to max_parallel_tasks tasks at once (in different projects; edits in the same project take turns): for several pieces of work for one role, delegate each to that same agent instead of an agent with another role."]), false)
 
         case "delegate_task":
             guard needDelegate() else { return }

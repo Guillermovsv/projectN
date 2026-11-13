@@ -20,6 +20,15 @@ final class Store: ObservableObject {
     /// Panes waiting on a prompt. Only this set is published app-wide (working/idle changes are
     /// observed per pane), so the whole window no longer redraws on every activity flicker.
     @Published private(set) var needsInputIDs: Set<UUID> = []
+    /// How many Claude/Codex/Cursor panes are mid-turn and how many terminals are running a command.
+    /// Published only when a count changes.
+    @Published private(set) var workingCounts = WorkingCounts()
+    /// Top-bar counters. `agents`: live agent-harness panes. `terminals`: live Claude/Codex/Cursor/Gemini sessions
+    /// you opened yourself (agent panes not included). The `…Working` fields are the subset busy right now.
+    struct WorkingCounts: Equatable {
+        var agents = 0, agentsWorking = 0
+        var terminals = 0, terminalsWorking = 0
+    }
     /// Space ID → the pane currently expanded to fill that space (not persisted).
     @Published var maximizedPanes: [UUID: UUID] = [:]
 
@@ -79,12 +88,28 @@ final class Store: ObservableObject {
     private func refreshActivity() {
         var waiting = Set<UUID>()
         var alert = false
+        var counts = WorkingCounts()
         for ws in state.workspaces {
             for sp in ws.spaces {
-                for p in sp.panes where p.tool != .terminal {
+                for p in sp.panes {
                     guard let rt = runtimes[p.id] else { continue }
+                    if p.tool == .terminal {
+                        // A shell pane counts only while a CLI like `gemini` or `claude` runs in it.
+                        if rt.foregroundAICLI != nil { counts.terminals += 1; counts.terminalsWorking += 1 }
+                        continue
+                    }
                     let before = rt.activity
                     let changed = rt.refreshActivity()
+                    if rt.isRunning {
+                        let working = rt.activity == .working
+                        if p.isAgentPane {
+                            counts.agents += 1
+                            if working { counts.agentsWorking += 1 }
+                        } else {
+                            counts.terminals += 1
+                            if working { counts.terminalsWorking += 1 }
+                        }
+                    }
                     if rt.needsInput { waiting.insert(p.id) }
                     guard changed else { continue }
                     switch (before, rt.activity) {
@@ -99,6 +124,7 @@ final class Store: ObservableObject {
             }
         }
         if waiting != needsInputIDs { needsInputIDs = waiting }
+        if counts != workingCounts { workingCounts = counts }
         if alert { NotificationSound.play(settings) }
     }
 

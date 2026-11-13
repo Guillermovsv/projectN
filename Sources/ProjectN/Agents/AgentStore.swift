@@ -348,6 +348,10 @@ enum PromptComposer {
               it fits your role or no agent fits.
             - When the user says someone else should do it ("pídele al developer…", "ask the SEO…", "que lo haga…"),
               delegate it with `delegate_task` — never hand the work back to the user.
+            - Match the role the user names: "the dev" means the developer agent, never an agent with another role.
+              One agent runs several tasks at once (`max_parallel_tasks` in `list_agents`), so "two devs" / several
+              tasks for one role are several `delegate_task` calls to that same agent (one per task). Only if no agent
+              has that role, say so and pick the closest one.
             - The other agent doesn't see your conversation. In `context` give it everything it needs: the goal in
               the user's terms, where the inputs live (e.g. the Notion task database / pages with links and IDs, site
               URLs, files), what is already known or decided, constraints, and who to ask. Never just "check the
@@ -385,16 +389,17 @@ enum PromptComposer {
     }
 
     static func firstMessage(task: AgentTask, profile: AgentProfile, project: Project, context: ContextLoader.Bundle,
-                             includeInstructions: Bool, recap: [AgentTask] = [], projects: [Project] = [],
+                             includeInstructions: Bool, capabilities: Capabilities = .none,
+                             recap: [AgentTask] = [], projects: [Project] = [],
                              boundary: String = String(UUID().uuidString.prefix(8))) -> String {
         if project.id == Store.coordinationProjectID {
             return coordinatorFirstMessage(task: task, profile: profile, project: project, includeInstructions: includeInstructions,
-                                           recap: recap, projects: projects)
+                                           capabilities: capabilities, recap: recap, projects: projects)
         }
         var s = ""
         if includeInstructions {
             // Runtimes without a system-prompt flag (Codex) get the profile here, clearly separated.
-            s += "## Agent profile (trusted)\n" + systemPrompt(profile: profile, project: project) + "\n\n"
+            s += "## Agent profile (trusted)\n" + systemPrompt(profile: profile, project: project, capabilities: capabilities) + "\n\n"
         }
         s += "## Request\n"
         s += "From: \(task.origin.promptLabel)\n"
@@ -438,10 +443,10 @@ enum PromptComposer {
     /// A coordinator's first message: the request plus a compact directory of the projects it coordinates
     /// (no project's files: it reads what it needs, or asks `project_info`).
     static func coordinatorFirstMessage(task: AgentTask, profile: AgentProfile, project: Project, includeInstructions: Bool,
-                                        recap: [AgentTask], projects: [Project]) -> String {
+                                        capabilities: Capabilities = .none, recap: [AgentTask], projects: [Project]) -> String {
         var s = ""
         if includeInstructions {
-            s += "## Agent profile (trusted)\n" + systemPrompt(profile: profile, project: project) + "\n\n"
+            s += "## Agent profile (trusted)\n" + systemPrompt(profile: profile, project: project, capabilities: capabilities) + "\n\n"
         }
         s += "## Request\nFrom: \(task.origin.promptLabel)\n\n"
         s += task.instruction.trimmingCharacters(in: .whitespacesAndNewlines) + "\n\n"

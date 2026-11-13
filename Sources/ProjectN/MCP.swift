@@ -152,6 +152,18 @@ enum MCPConfig {
         return out
     }
 
+    /// ProjectN's own server (`pn-agent mcp`) for a Codex session. Codex starts stdio servers with a minimal
+    /// environment, so the bridge port / task token are forwarded by name (`env_vars`): the token never goes on
+    /// the command line. The tool timeout covers `ask` / `wait_for_tasks` (Codex's default is 60 s).
+    static func codexProjectNOverrides(helper: String, toolTimeoutSeconds: Int) -> [String] {
+        let key = "mcp_servers.projectn"
+        let vars = ["PROJECTN_AGENT_PORT", "PROJECTN_AGENT_TOKEN", "PROJECTN_AGENT_TASK"]
+        return ["-c", "\(key).command=\(tomlString(helper))",
+                "-c", "\(key).args=[\(tomlString("mcp"))]",
+                "-c", "\(key).env_vars=[\(vars.map(tomlString).joined(separator: ","))]",
+                "-c", "\(key).tool_timeout_sec=\(max(120, toolTimeoutSeconds))"]
+    }
+
     private static func tomlKey(_ k: String) -> String {
         let bare = k.allSatisfy { $0.isLetter || $0.isNumber || $0 == "_" || $0 == "-" } && k.allSatisfy(\.isASCII)
         return bare && !k.isEmpty ? k : tomlString(k)

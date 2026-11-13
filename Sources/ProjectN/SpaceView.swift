@@ -65,6 +65,8 @@ struct SpaceView: View {
             Spacer()
 
             UsageMeters(tool: store.activeAgentTool)
+
+            ActiveCounts()
             AddPaneMenu(workspace: w, space: s)
         }
     }

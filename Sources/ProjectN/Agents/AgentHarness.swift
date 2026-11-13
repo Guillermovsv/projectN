@@ -42,6 +42,8 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
     var lastNoticeAt: [UUID: Date] = [:]
     /// When ProjectN's hook last allowed a tool call for each task (its latest decision was "allow").
     var lastHookAllowed: [UUID: Date] = [:]
+    /// The Codex prompt ProjectN last answered by itself, per task (a prompt that stays up after that goes to you).
+    var codexAutoAnswered: [UUID: (text: String, at: Date)] = [:]
     /// When each pending request was last reminded about.
     var remindedAt: [UUID: Date] = [:]
     /// When a message was last typed into each task's session.
@@ -337,7 +339,7 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
 
     // MARK: Scheduling
 
-    private func activeCount(agent: UUID) -> Int { tasks.filter { $0.agentID == agent && $0.status.isActive }.count }
+    func activeCount(agent: UUID) -> Int { tasks.filter { $0.agentID == agent && $0.status.isActive }.count }
 
     /// Another agent that edits on its own is active in the project. Only "Read & write" agents lock each other
     /// out (those that ask first have every edit approved), and never inside one delegation chain: a coordinator
@@ -413,6 +415,9 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
         }
         let resumeFrom = t.resumedFromTaskID.flatMap(task)
         if let prev = resumeFrom, continueInPlace(&t, after: prev) { return }
+        let helper = AgentBridge.helperPath
+        // ProjectN's tools (ask, delegate_task, …) reach both runtimes through `pn-agent mcp`.
+        let tools: PromptComposer.Capabilities = helper == nil ? .none : depthAllowsDelegation(t, profile) ? .delegate : .ask
         let prompt: String
         let notes = AgentStore.projectNotes(project.id)
         let digest = AgentStore.notesDigest(notes)
@@ -425,7 +430,7 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
             let ctx = coordinating ? ContextLoader.Bundle() : ContextLoader.load(projectPath: project.path, sources: profile.contextSources)
             t.notes += ctx.notes
             prompt = PromptComposer.firstMessage(task: t, profile: profile, project: project, context: ctx,
-                                                 includeInstructions: profile.runtime != .claudeCode,
+                                                 includeInstructions: profile.runtime != .claudeCode, capabilities: tools,
                                                  recap: t.skipRecap == true || profile.sessionPolicy != .perProject ? [] : recentConversation(for: t),
                                                  projects: coordinating ? coordinatedProjects(profile) : [])
             // One terminal per agent + project: earlier sessions of this pair whose work is done are closed.
@@ -433,11 +438,8 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
         }
         // The bridge must be listening before a session that relies on it starts.
         guard bridge.port != nil || AgentBridge.helperPath == nil else { return }
-        let helper = AgentBridge.helperPath
         var args: [String] = []
         if profile.runtime == .claudeCode {
-            let tools = helper != nil && depthAllowsDelegation(t, profile) ? PromptComposer.Capabilities.delegate
-                      : helper != nil ? .ask : PromptComposer.Capabilities.none
             args += ["--append-system-prompt", PromptComposer.systemPrompt(profile: profile, project: project, capabilities: tools)]
             if project.id == Store.coordinationProjectID {
                 // Reads the projects it coordinates without Claude Code asking for each folder.
@@ -455,7 +457,13 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
                 args += ["--settings", hooks]
             }
         } else {
-            args += MCPConfig.codexOverrides(MCPConfig.load().filter { profile.mcpServers.contains($0.name) })
+            args += MCPConfig.codexOverrides(MCPConfig.load().filter { profile.mcpServers.contains($0.name) && $0.name != "projectn" })
+            // Without this Codex never sees delegate_task / list_agents / ask, so a Codex coordinator can't delegate.
+            if let helper { args += MCPConfig.codexProjectNOverrides(helper: helper, toolTimeoutSeconds: profile.timeoutMinutes * 60) }
+            // Auto mode / High: network inside the sandbox (curl, APIs, localhost) without asking each time.
+            if profile.autoMode || profile.autonomy == .high {
+                args += ["-c", "sandbox_workspace_write.network_access=true"]
+            }
         }
         issueToken(for: t.id)
         let hookEnforced = profile.runtime == .claudeCode && helper != nil
@@ -507,7 +515,12 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
         let lastUsed = prev.finishedAt ?? Date()
         guard Date().timeIntervalSince(lastUsed) < Double(max(1, policy.sessionIdleHours) * 3600) else { return nil }
         // A long conversation is re-read on every step: past the limit, start fresh (the new session gets a recap).
-        if let size = sessionContextTokens(prev), size >= policy.maxSessionContextK * 1000 {
+        // Not while the session is warm (its terminal still open, used within the idle-close window): a follow-up
+        // there is the same piece of work, and the CLI compacts its own context. Rotating it lost continuity —
+        // a follow-up a minute later landed in a new terminal with no memory of what it had just done.
+        let warm = prev.paneID.flatMap { store?.runtimes[$0] }?.isRunning == true
+            && Date().timeIntervalSince(lastUsed) < Double(policy.idleCloseMinutes * 60)
+        if !warm, let size = sessionContextTokens(prev), size >= policy.maxSessionContextK * 1000 {
             AuditLog.record("session.rotated", ["agent": prev.agentName, "project": prev.projectName,
                                                 "session": prev.sessionID ?? "", "context_tokens": String(size)])
             return nil
@@ -628,7 +641,10 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
                         // Just answered: the screen still shows the prompt until the CLI redraws. Not a new one.
                     } else if let seen = promptSeen[t.id], seen.text == q {
                         // Only a prompt that stays up is reported (half-drawn frames and instant redraws aren't).
-                        if Date().timeIntervalSince(seen.at) >= 3 { noteApproval(t.id, question: q) }
+                        let up = Date().timeIntervalSince(seen.at)
+                        if up >= 1.5, let profile, decideCodexPrompt(t, profile: profile, runtime: rt, question: q) {
+                            promptSeen.removeValue(forKey: t.id)
+                        } else if up >= 3 { noteApproval(t.id, question: q) }
                     } else {
                         promptSeen[t.id] = (q, Date())
                     }
@@ -642,6 +658,39 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
                 flushInbox(t.id)
             }
             readTranscript(task(t.id) ?? t)
+        }
+    }
+
+    /// Codex has no hook: its terminal prompt is judged here with the same policy as Claude's tool calls
+    /// (autonomy / Auto mode). Allowed → answered "Allow" / "Yes" (once, never "always"); not allowed for this agent →
+    /// refused. Returns false when the user decides (deleting, admin/system changes, secrets, or Auto mode off).
+    private func decideCodexPrompt(_ t: AgentTask, profile: AgentProfile, runtime rt: TerminalSession, question q: String) -> Bool {
+        guard t.runtime == .codexCLI, let project = store?.project(t.projectID) else { return false }
+        // Answered by ProjectN a moment ago and still up: the answer didn't take, so you decide.
+        if let last = codexAutoAnswered[t.id], last.text == q, Date().timeIntervalSince(last.at) < 30 { return false }
+        let screen = rt.scrollbackText(maxLines: 40).components(separatedBy: "\n")
+        let ask = CodexPromptPolicy.parse(screen: screen, question: q)
+        let ctx = ApprovalPolicy.Context(permission: profile.permission, projectPath: project.path, cliTools: profile.cliTools,
+                                         cwd: project.path, autonomy: profile.autonomy, autoMode: profile.autoMode)
+        let tier = CodexPromptPolicy.decide(ask, ctx)
+        let call = CodexPromptPolicy.describe(ask)
+        switch tier {
+        case .allow:
+            guard rt.answerPendingPrompt(approve: true) else { return false }
+            codexAutoAnswered[t.id] = (q, Date())
+            AuditLog.record("prompt.auto_approved", ["task": t.id.uuidString, "agent": t.agentName, "call": call,
+                                                     "why": profile.autoMode ? "Auto mode" : "autonomy \(profile.autonomy.label)",
+                                                     "prompt": ApprovalPolicy.clip(q)])
+            if t.status == .needsApproval { update(t.id) { $0.status = .running } }
+            return true
+        case .deny(let why):
+            guard rt.answerPendingPrompt(approve: false) else { return false }
+            codexAutoAnswered[t.id] = (q, Date())
+            AuditLog.record("prompt.auto_denied", ["task": t.id.uuidString, "agent": t.agentName, "call": call, "reason": why])
+            queueForSession(t.id, "ProjectN refused that: \(why)")
+            return true
+        case .orchestrator, .user:
+            return false
         }
     }
 
