@@ -29,6 +29,7 @@ struct ProjectNApp: App {
     @StateObject private var store = Store()
     @StateObject private var panel = RightPanelModel()
     @StateObject private var usage = UsageModel()
+    @StateObject private var updates = UpdateModel()
     @StateObject private var nav = NavigationModel()
     @StateObject private var agents = AgentHarness()
     @StateObject private var slack = SlackConnector()
@@ -39,6 +40,7 @@ struct ProjectNApp: App {
                 .environmentObject(store)
                 .environmentObject(panel)
                 .environmentObject(usage)
+                .environmentObject(updates)
                 .environmentObject(nav)
                 .environmentObject(agents)
                 .environmentObject(slack)
@@ -57,6 +59,7 @@ struct ProjectNApp: App {
                     agents.attach(store)
                     slack.attach(store: store, harness: agents)
                     usage.start(store: store)
+                    updates.start()
                     NVoiceController.shared.onOpenSettings = { [weak nav, weak panel] in
                         guard let nav, let panel else { return }
                         nav.openSettings(.voice, panel: panel)

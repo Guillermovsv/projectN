@@ -76,7 +76,11 @@ struct TopBar<Content: View>: View {
     @ViewBuilder var content: () -> Content
 
     var body: some View {
-        HStack(spacing: 10) { content() }
+        HStack(spacing: 10) {
+            content()
+            // Top-right in every view: new versions of ProjectN from GitHub.
+            UpdatesButton()
+        }
             .padding(.leading, leadingInset ? Chrome.trafficLightsWidth : 16)
             .padding(.trailing, 12)
             .frame(height: Chrome.topBarHeight)

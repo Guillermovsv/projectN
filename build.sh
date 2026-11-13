@@ -11,6 +11,9 @@ BUILD_NUMBER="$(git rev-list --count HEAD 2>/dev/null || echo 1)"
 COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 if [ -n "$(git status --porcelain 2>/dev/null)" ]; then COMMIT="$COMMIT+dirty"; fi
 BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+# GitHub repo the in-app updater checks for new commits on main.
+REPO_URL="$(git config --get remote.origin.url 2>/dev/null || echo https://github.com/Guillermovsv/projectN.git)"
+REPO_URL="$(printf '%s' "$REPO_URL" | sed -E 's#://[^@/]+@#://#')"   # never stamp credentials into the app
 swift build -c release
 BIN="$(swift build -c release --show-bin-path)/ProjectN"
 
@@ -46,6 +49,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleVersion</key><string>$BUILD_NUMBER</string>
   <key>ProjectNGitCommit</key><string>$COMMIT</string>
   <key>ProjectNBuildDate</key><string>$BUILD_DATE</string>
+  <key>ProjectNRepoURL</key><string>$REPO_URL</string>
   <key>LSMinimumSystemVersion</key><string>26.0</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>NSPrincipalClass</key><string>NSApplication</string>
