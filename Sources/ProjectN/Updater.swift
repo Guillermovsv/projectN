@@ -47,6 +47,8 @@ final class UpdateModel: ObservableObject {
     struct Commit: Identifiable, Hashable {
         let sha: String
         let title: String
+        /// The rest of the commit message (trailers like Co-Authored-By removed); may be empty.
+        var body: String = ""
         let author: String
         let date: Date?
         let url: URL?
@@ -85,7 +87,7 @@ final class UpdateModel: ObservableObject {
     let localCommit: String?
     private var timer: Timer?
 
-    static let checkInterval: TimeInterval = 30 * 60
+    static let checkInterval: TimeInterval = 12 * 60 * 60
     static var dir: URL { AppHome.root.appendingPathComponent("updates") }
     static var sourceDir: URL { dir.appendingPathComponent("source") }
     static var stagedApp: URL { dir.appendingPathComponent("ProjectN.app") }
@@ -186,11 +188,38 @@ final class UpdateModel: ObservableObject {
         let message = inner?["message"] as? String ?? ""
         let author = inner?["author"] as? [String: Any]
         let date = (author?["date"] as? String).flatMap { ISO8601DateFormatter().date(from: $0) }
+        let (title, body) = splitMessage(message)
         return Commit(sha: sha,
-                      title: message.split(separator: "\n", omittingEmptySubsequences: true).first.map(String.init) ?? "",
+                      title: title,
+                      body: body,
                       author: author?["name"] as? String ?? "",
                       date: date,
                       url: (c["html_url"] as? String).flatMap(URL.init(string:)))
+    }
+
+    /// First line → title; the rest → body, without git trailers (Co-Authored-By:, Signed-off-by:, …).
+    nonisolated static func splitMessage(_ message: String) -> (title: String, body: String) {
+        let lines = message.replacingOccurrences(of: "\r\n", with: "\n").components(separatedBy: "\n")
+        guard let first = lines.firstIndex(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty }) else { return ("", "") }
+        let trailers = ["co-authored-by:", "signed-off-by:", "reviewed-by:", "change-id:"]
+        let rest = lines[(first + 1)...].filter { line in
+            let l = line.lowercased()
+            return !trailers.contains { l.hasPrefix($0) }
+        }
+        let body = rest.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        return (lines[first].trimmingCharacters(in: .whitespaces), body)
+    }
+
+    /// One sentence describing what the pending update brings.
+    nonisolated static func summary(of commits: [Commit]) -> String {
+        let titles = commits.map(\.title).filter { !$0.isEmpty }
+        func clean(_ t: String) -> String { t.hasSuffix(".") ? String(t.dropLast()) : t }
+        switch titles.count {
+        case 0: return ""
+        case 1: return clean(titles[0]) + "."
+        case 2: return "\(clean(titles[0])); y \(clean(titles[1]))."
+        default: return "\(clean(titles[0])); \(clean(titles[1])); y \(titles.count - 2) \(titles.count - 2 == 1 ? "cambio más" : "cambios más")."
+        }
     }
 
     nonisolated private static func getJSON(_ url: String) async -> Result<Any, UpdateError> {
@@ -456,6 +485,7 @@ struct UpdatesPanel: View {
     @EnvironmentObject var updates: UpdateModel
     @State private var confirmRestart = false
     @State private var showLog = false
+    @State private var showDetails = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -565,32 +595,60 @@ struct UpdatesPanel: View {
         }
     }
 
+    /// A one-sentence summary of the update; "Ver más" expands every change with its full description.
     @ViewBuilder
     private var commitList: some View {
         if !updates.pending.isEmpty {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 8) {
-                    ForEach(updates.pending) { c in
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(c.title).font(.callout).lineLimit(2)
-                            HStack(spacing: 4) {
-                                Text(c.short).monospaced()
-                                if !c.author.isEmpty { Text("· \(c.author)") }
-                                if let d = c.date { Text("· \(d.formatted(.relative(presentation: .named)))") }
-                            }
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 8) {
+                Text(UpdateModel.summary(of: updates.pending))
+                    .font(.callout)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+                if showDetails {
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 12) {
+                            ForEach(updates.pending) { c in commitRow(c) }
                         }
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .contentShape(Rectangle())
-                        .onTapGesture { if let u = c.url { NSWorkspace.shared.open(u) } }
-                        .help("Abrir el commit en GitHub")
+                        .padding(.vertical, 2)
                     }
+                    .frame(maxHeight: 340)
+                    .fixedSize(horizontal: false, vertical: true)
+                }
+                Button {
+                    withAnimation(.easeInOut(duration: 0.15)) { showDetails.toggle() }
+                } label: {
+                    Label(showDetails ? "Ver menos" : "Ver más (\(updates.pending.count) \(updates.pending.count == 1 ? "cambio" : "cambios"))",
+                          systemImage: showDetails ? "chevron.up" : "chevron.down")
+                        .font(.caption)
+                }
+                .buttonStyle(.link)
+            }
+        }
+    }
+
+    private func commitRow(_ c: UpdateModel.Commit) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(c.title).font(.callout.weight(.medium))
+                .fixedSize(horizontal: false, vertical: true)
+            if !c.body.isEmpty {
+                Text(c.body)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+            }
+            HStack(spacing: 4) {
+                Text(c.short).monospaced()
+                if !c.author.isEmpty { Text("· \(c.author)") }
+                if let d = c.date { Text("· \(d.formatted(.relative(presentation: .named)))") }
+                if let u = c.url {
+                    Button("Ver en GitHub") { NSWorkspace.shared.open(u) }.buttonStyle(.link)
                 }
             }
-            .frame(maxHeight: 200)
-            .fixedSize(horizontal: false, vertical: true)
+            .font(.caption2)
+            .foregroundStyle(.tertiary)
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private var logView: some View {
@@ -614,7 +672,7 @@ struct UpdatesPanel: View {
         HStack(spacing: 4) {
             Button(updates.repo.slug) { NSWorkspace.shared.open(updates.repo.webURL) }
                 .buttonStyle(.link)
-            Text("· cada 30 min")
+            Text("· cada 12 h")
             if let d = updates.lastChecked { Text("· revisado \(d.formatted(.relative(presentation: .named)))") }
         }
         .font(.caption2)

@@ -29,6 +29,20 @@ struct UpdaterTests {
         #expect(UpdateModel.parseCompare(["status": "behind", "commits": []]).commits.isEmpty)
     }
 
+    @Test func splitsMessageAndDropsTrailers() {
+        let (title, body) = UpdateModel.splitMessage("Title here\n\nWhat changed.\nMore.\n\nCo-Authored-By: X <x@y>")
+        #expect(title == "Title here")
+        #expect(body == "What changed.\nMore.")
+        #expect(UpdateModel.splitMessage("Only").body == "")
+    }
+
+    @Test func summarySentence() {
+        func c(_ t: String) -> UpdateModel.Commit { .init(sha: t, title: t, author: "", date: nil, url: nil) }
+        #expect(UpdateModel.summary(of: [c("Fix A")]) == "Fix A.")
+        #expect(UpdateModel.summary(of: [c("A"), c("B")]) == "A; y B.")
+        #expect(UpdateModel.summary(of: [c("A"), c("B"), c("C"), c("D")]) == "A; B; y 2 cambios más.")
+    }
+
     @Test func shellQuoting() {
         #expect(UpdateModel.shellQuote("/a b/it's") == "'/a b/it'\\''s'")
     }
