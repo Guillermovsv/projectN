@@ -6,6 +6,7 @@ import Foundation
 ///     state.json      projects, workspaces, spaces, panes (+ their Claude/Codex session ids)
 ///     scrollback/     saved terminal output, restored on relaunch
 ///     settings.json   app settings
+///     secrets.json    API keys + integration tokens (0600; replaces the Keychain, which re-asked after every update)
 ///     mcp.json        MCP servers ({"mcpServers": {...}}) shared by Claude & Codex sessions
 ///     mcp/            npm prefix where MCP server packages get installed
 ///     bin/            your own scripts; added to PATH in every session

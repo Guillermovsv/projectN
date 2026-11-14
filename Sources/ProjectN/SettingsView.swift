@@ -265,7 +265,7 @@ struct AccountsSettingsView: View {
     private var apiKeys: some View {
         VStack(alignment: .leading, spacing: 10) {
             Text("API keys & tokens").font(.title3.bold())
-            Text("Stored in your macOS Keychain and added to the environment of every pane started from ProjectN.")
+            Text("Stored in ~/.projectn/secrets.json (readable only by you) and added to the environment of every pane started from ProjectN.")
                 .font(.caption).foregroundStyle(.secondary)
             if store.settings.apiKeyNames.isEmpty {
                 Text("No keys yet.").font(.callout).foregroundStyle(.tertiary)

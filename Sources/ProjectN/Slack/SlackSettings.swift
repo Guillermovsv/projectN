@@ -1,39 +1,19 @@
 import Foundation
 import Security
 
-/// Integration credentials in the macOS Keychain (service "ProjectN Integrations").
+/// Integration credentials (in ~/.projectn/secrets.json under "ProjectN Integrations", see `SecretStore`).
 /// Kept apart from `Secrets` on purpose: those are exported into every pane's environment; these never are.
 enum IntegrationSecrets {
     private static let service = "ProjectN Integrations"
     static let slackAppToken = "slack.appToken"
     static let slackBotToken = "slack.botToken"
 
-    static func get(_ account: String) -> String? {
-        let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service,
-                                kSecAttrAccount as String: account, kSecReturnData as String: true,
-                                kSecMatchLimit as String: kSecMatchLimitOne]
-        var out: CFTypeRef?
-        guard SecItemCopyMatching(q as CFDictionary, &out) == errSecSuccess, let d = out as? Data else { return nil }
-        return String(data: d, encoding: .utf8)
-    }
+    static func get(_ account: String) -> String? { SecretStore.get(service: service, account: account) }
 
     @discardableResult
-    static func set(_ account: String, value: String) -> Bool {
-        let base: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service,
-                                   kSecAttrAccount as String: account]
-        SecItemDelete(base as CFDictionary)
-        guard !value.isEmpty else { return true }
-        var add = base
-        add[kSecValueData as String] = Data(value.utf8)
-        add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
-        return SecItemAdd(add as CFDictionary, nil) == errSecSuccess
-    }
+    static func set(_ account: String, value: String) -> Bool { SecretStore.set(service: service, account: account, value: value) }
 
-    static func delete(_ account: String) {
-        let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service,
-                                kSecAttrAccount as String: account]
-        SecItemDelete(q as CFDictionary)
-    }
+    static func delete(_ account: String) { SecretStore.delete(service: service, account: account) }
 }
 
 /// ~/.projectn/integrations.json — no credentials in here.

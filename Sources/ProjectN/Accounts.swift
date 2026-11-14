@@ -2,32 +2,16 @@ import Foundation
 import Security
 import SwiftUI
 
-/// API keys / tokens stored in the macOS Keychain (service "ProjectN API Keys") and exported to sessions.
+/// API keys / tokens (in ~/.projectn/secrets.json under "ProjectN API Keys", see `SecretStore`), exported to sessions.
 enum Secrets {
     private static let service = "ProjectN API Keys"
 
-    static func get(_ name: String) -> String? {
-        let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service,
-                                kSecAttrAccount as String: name, kSecReturnData as String: true, kSecMatchLimit as String: kSecMatchLimitOne]
-        var out: CFTypeRef?
-        guard SecItemCopyMatching(q as CFDictionary, &out) == errSecSuccess, let d = out as? Data else { return nil }
-        return String(data: d, encoding: .utf8)
-    }
+    static func get(_ name: String) -> String? { SecretStore.get(service: service, account: name) }
 
     @discardableResult
-    static func set(_ name: String, value: String) -> Bool {
-        let base: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service, kSecAttrAccount as String: name]
-        SecItemDelete(base as CFDictionary)
-        var add = base
-        add[kSecValueData as String] = Data(value.utf8)
-        add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
-        return SecItemAdd(add as CFDictionary, nil) == errSecSuccess
-    }
+    static func set(_ name: String, value: String) -> Bool { SecretStore.set(service: service, account: name, value: value) }
 
-    static func delete(_ name: String) {
-        let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service, kSecAttrAccount as String: name]
-        SecItemDelete(q as CFDictionary)
-    }
+    static func delete(_ name: String) { SecretStore.delete(service: service, account: name) }
 
     /// NAME=value pairs for every stored key (added to each session's environment).
     static func environment(names: [String]) -> [String: String] {

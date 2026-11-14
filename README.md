@@ -136,7 +136,7 @@ Open from **Settings** at the bottom of the sidebar (or ⌘,) — it opens insid
 
 - **Appearance** — themes: Midnight, Daylight, Nord, Dracula, Solarized Dark. Each sets light/dark, accent, surfaces and the terminal palette (applies instantly to running terminals). Terminal font size.
 - **Accounts** — sign-in status for Claude Code (`claude auth status`), Codex (`codex login status`), GitHub CLI (`gh auth status`) and Gemini CLI. *Sign In / Switch Account / Sign Out* run the CLI's own flow in a small built-in terminal.
-- **API keys & tokens** — e.g. `OPENAI_API_KEY`, `GEMINI_API_KEY`, `GITHUB_TOKEN`: stored in the macOS Keychain and added to every pane's environment. (Note: an `ANTHROPIC_API_KEY` makes Claude Code bill that key instead of your subscription.)
+- **API keys & tokens** — e.g. `OPENAI_API_KEY`, `GEMINI_API_KEY`, `GITHUB_TOKEN`: stored in `~/.projectn/secrets.json` (readable only by your user) and added to every pane's environment. (Note: an `ANTHROPIC_API_KEY` makes Claude Code bill that key instead of your subscription.)
 - **Voice (NVoice)** — the NVoice dictation app, built in (see below).
 - **Agents** and **Integrations (Slack)** — see [Agents & Slack](#agents--slack).
 - **MCP Servers** and **Tools** as before.
@@ -187,7 +187,7 @@ Every tool call of a Claude Code agent passes ProjectN's approval hook (`pn-agen
 - If Claude Code still shows its own prompt for a command ProjectN already approved, ProjectN confirms it (only that command).
 - Unanswered approvals expire as "no" (default 60 min). Read-only agents can't change files at all.
 - **New projects**: "Project Manager, crea el proyecto *Landing García* y …" in Slack creates the folder (with a README) in your projects folder, adds it to ProjectN and runs the task in it — you asked, so no extra confirmation. Agents that can delegate have `create_project`, which always asks you first. Folders are only created inside the projects folder (default: where most of your projects live; Settings → Agents → Autonomy), never overwritten.
-- **Per-agent MCP servers, CLI tools and API keys**: each profile picks servers from Settings → MCP Servers (only those are loaded — `--strict-mcp-config`), commands it may run without asking, and which Keychain API keys are in its environment.
+- **Per-agent MCP servers, CLI tools and API keys**: each profile picks servers from Settings → MCP Servers (only those are loaded — `--strict-mcp-config`), commands it may run without asking, and which stored API keys are in its environment.
 - Codex agents get their MCP servers but not the hook or delegation tools; they rely on Codex's sandbox and prompt in their pane.
 
 ### Slack (Settings → Integrations)
@@ -196,7 +196,7 @@ Uses **Socket Mode** (an outbound connection from your Mac, no public server). I
 
 1. api.slack.com/apps → *Create New App → From a manifest* → paste the manifest from Settings → Integrations → *How to create and connect the Slack app* (Copy button).
 2. *Basic Information → App-Level Tokens*: create one with scope `connections:write` → **App Token** (`xapp-…`).
-3. *Interactivity & Shortcuts* is on (in the manifest; needed for the approval buttons). *Install App* → copy the *Bot User OAuth Token* → **Bot Token** (`xoxb-…`). Both are stored in the macOS Keychain (service "ProjectN Integrations"), never in files or pane environments.
+3. *Interactivity & Shortcuts* is on (in the manifest; needed for the approval buttons). *Install App* → copy the *Bot User OAuth Token* → **Bot Token** (`xoxb-…`). Both are stored in `~/.projectn/secrets.json` (readable only by your user), never in pane environments.
 4. Add your Slack member ID to **Authorized users** (nobody is authorized while it's empty). For channels, `/invite @ProjectN` and add the channel ID to **Authorized channels**. DMs can be turned on/off.
 5. Press **Check Connection** (verifies both tokens, scopes and Socket Mode), turn on **Enable Slack**, then DM the bot or mention it:
    `@ProjectN Project Manager, revisa el proyecto seleccionado, consulta su README y dime qué tareas pendientes identificas`
@@ -231,7 +231,8 @@ While ProjectN is open, **hold fn anywhere, talk, release** — the text is past
   settings.json  app settings
   agents.json    agent profiles (no credentials)
   agents/        task history, audit log, model list cache, handled Slack events
-  integrations.json  Slack settings (tokens are in the Keychain)
+  integrations.json  Slack settings (tokens are in secrets.json)
+  secrets.json   API keys and Slack tokens (file mode 0600, only your user can read it)
   mcp.json       MCP servers for every Claude & Codex session started here
   mcp/           npm prefix for installed MCP server packages (node_modules/.bin is on PATH)
   bin/           your own scripts, on PATH in every session

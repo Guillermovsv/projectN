@@ -6,7 +6,7 @@ import Foundation
 ///   ~/.projectn/agents/tasks.json      task history (last 500)
 ///   ~/.projectn/agents/audit.log       one JSON line per action/error (never contains tokens)
 ///   ~/.projectn/agents/claude-models.json  cached live model list
-///   ~/.projectn/integrations.json      Slack settings (tokens live in the Keychain, not here)
+///   ~/.projectn/integrations.json      Slack settings (tokens live in secrets.json, not here)
 ///   ~/.projectn/agents/slack-seen.json Slack events already handled (dedupe across restarts)
 enum AgentStore {
     static var dir: URL { AppHome.root.appendingPathComponent("agents") }

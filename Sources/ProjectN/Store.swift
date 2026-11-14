@@ -48,7 +48,7 @@ final class Store: ObservableObject {
     struct AgentLaunchContext {
         /// Added to the environment (bridge port + task token, MCP tool timeout…).
         var env: [String: String] = [:]
-        /// Only these Keychain API keys are exported (not every key like ordinary panes).
+        /// Only these stored API keys are exported (not every key like ordinary panes).
         var apiKeyNames: [String] = []
     }
     var agentLaunchContext: ((Pane) -> AgentLaunchContext)?

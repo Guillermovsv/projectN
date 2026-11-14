@@ -121,7 +121,7 @@ enum Launcher {
         env["PROJECTN_WORKSPACE"] = workspaceName
         env["PROJECTN_PROJECT"] = project.name
         env["PWD"] = project.path
-        // API keys / tokens from Settings → Accounts & Connections (stored in the Keychain).
+        // API keys / tokens from Settings → Accounts & Connections (stored in ~/.projectn/secrets.json).
         for (k, v) in Secrets.environment(names: settings.apiKeyNames) { env[k] = v }
         if settings.isolateClaudeConfig {
             try? FileManager.default.createDirectory(at: AppHome.claudeConfigDir, withIntermediateDirectories: true)

@@ -210,7 +210,7 @@ struct AppSettings: Codable, Equatable {
     var notificationSound: Bool = true
     /// Name of a macOS system sound (/System/Library/Sounds).
     var notificationSoundName: String = "Glass"
-    /// Names of API keys (values live in the Keychain) passed to every session as environment variables.
+    /// Names of API keys (values live in ~/.projectn/secrets.json) passed to every session as environment variables.
     var apiKeyNames: [String] = []
     /// Defaults applied to new panes.
     var claudeDefaults = LaunchOptions()

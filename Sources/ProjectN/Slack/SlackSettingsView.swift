@@ -31,7 +31,7 @@ struct SlackSettingsView: View {
 
             statusRow
 
-            GroupBox("Credentials (stored in the macOS Keychain)") {
+            GroupBox("Credentials (stored privately in ~/.projectn/secrets.json)") {
                 VStack(alignment: .leading, spacing: 8) {
                     tokenField("App Token", placeholder: "xapp-…  (App-Level Token, scope connections:write)", text: $appToken)
                     tokenField("Bot Token", placeholder: "xoxb-…  (Bot User OAuth Token)", text: $botToken)
