@@ -7,9 +7,12 @@ import os
 private struct TerminalScreenReader: @unchecked Sendable {
     let view: LocalProcessTerminalView
 
+    /// The bottom `count` rows of the *live* screen. Not the viewport: when the user scrolls up into history,
+    /// the viewport shows old output — an already-answered prompt would read as a new one (a false
+    /// "needs input" sound, an auto answer sent to the wrong frame) and the real prompt would be missed.
     func tail(_ count: Int) -> [String] {
-        let rows = view.terminalDimensions.rows
-        return rows > 0 ? view.visibleRowsText(max(0, rows - count)..<rows) : []
+        guard let snap = view.terminalContentSnapshot(region: .history(maximumScrollbackRows: -1)) else { return [] }
+        return snap.rows.suffix(count).map(\.text)
     }
 }
 

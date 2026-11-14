@@ -330,11 +330,11 @@ final class NVoiceController: NSObject, ObservableObject {
             // fn + another key (fn+arrows, fn+F-keys…) is a shortcut, not a dictation.
             guard let self, self.transcriber.isRecording,
                   Date().timeIntervalSince(self.recordingStart ?? .distantPast) < 1.0 || self.settings.hotkeyMode == .hold else { return }
-            self.cancelDictation()
+            self.cancelDictation("another key pressed with the shortcut")
         }
         hotkey.onEscape = { [weak self] in
             guard let self, self.transcriber.isRecording else { return }
-            self.cancelDictation()
+            self.cancelDictation("Esc")
         }
     }
 
@@ -377,7 +377,9 @@ final class NVoiceController: NSObject, ObservableObject {
         AudioDucker.restore()
     }
 
-    private func cancelDictation() {
+    private func cancelDictation(_ reason: String = "cancelled") {
+        Diagnostics.log(String(format: "dictation cancelled (%@) after %.1f s", reason,
+                               Date().timeIntervalSince(recordingStart ?? Date())))
         restoreOtherAudio()
         transcriber.cancel()
         Sound.play("Funk")
@@ -398,6 +400,9 @@ final class NVoiceController: NSObject, ObservableObject {
         let enhance = enhanceThisTime
         let app = targetApp
         let profileID = profiles.activeID
+        let released = Date()
+        Diagnostics.log(String(format: "hotkey up — recorded %.1f s, target %@",
+                               released.timeIntervalSince(recordingStart ?? released), app?.localizedName ?? "?"))
 
         Task { @MainActor in
             defer { self.busy = false }
@@ -418,8 +423,11 @@ final class NVoiceController: NSObject, ObservableObject {
                 // leave it on the clipboard and say so.
                 let canPaste = HotkeyMonitor.hasAccessibility(prompt: false)
                 if canPaste {
-                    app?.activate()
-                    try? await Task.sleep(for: .milliseconds(60))
+                    let inFront = await TextInserter.bringToFront(app)
+                    let front = NSWorkspace.shared.frontmostApplication?.localizedName ?? "?"
+                    Diagnostics.log(String(format: "pasting %d chars into %@ (target %@%@) — %.1f s after release",
+                                           final.count, front, app?.localizedName ?? "?",
+                                           inFront ? "" : ", NOT frontmost", Date().timeIntervalSince(released)))
                     TextInserter.insert(final, restoreClipboard: settings.restoreClipboard)
                 } else {
                     NSPasteboard.general.clearContents()
@@ -522,6 +530,10 @@ final class NVoiceController: NSObject, ObservableObject {
         fix.target = self
         fix.isEnabled = !metrics.records.isEmpty
         menu.addItem(fix)
+        let copyLast = NSMenuItem(title: "Copy last dictation", action: #selector(copyLastDictation), keyEquivalent: "c")
+        copyLast.target = self
+        copyLast.isEnabled = !metrics.records.isEmpty
+        menu.addItem(copyLast)
         menu.addItem(.separator())
 
         // Person
@@ -651,6 +663,13 @@ final class NVoiceController: NSObject, ObservableObject {
         guard let v = sender.representedObject as? String else { return }
         settings.microphone = v
         updateMicTitle()
+    }
+
+    /// Recovery when a paste didn't land: the transcript is always in the history.
+    @objc func copyLastDictation() {
+        guard let record = metrics.records.first else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(record.text, forType: .string)
     }
 
     @objc func correctLast() {
