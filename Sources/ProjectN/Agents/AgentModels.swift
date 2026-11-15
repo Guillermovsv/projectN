@@ -246,8 +246,10 @@ struct AgentProfile: Codable, Identifiable, Hashable {
     }
 
     /// Whether this agent gets that Claude Code MCP server (or Claude in Chrome).
+    /// Codex agents get the same servers (translated); only Claude in Chrome is Claude Code–only.
     func usesClaudeMCP(_ name: String) -> Bool {
-        runtime == .claudeCode && useClaudeMCP && !claudeMCPDisabled.contains(name)
+        if name == ClaudeMCPEntry.chromeName && runtime != .claudeCode { return false }
+        return useClaudeMCP && !claudeMCPDisabled.contains(name)
     }
 
     /// The Project Manager's instructions on installs before autonomous agents (replaced once if unchanged).

@@ -491,7 +491,8 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
                 args += ["--settings", hooks]
             }
         } else {
-            args += MCPConfig.codexOverrides(MCPConfig.load().filter { profile.mcpServers.contains($0.name) && $0.name != "projectn" })
+            // Same servers a Claude agent gets (Claude Code's + the checked library ones), translated for Codex.
+            args += MCPConfig.codexOverrides(raw: agentMCPServers(task: t, profile: profile)).args
             // Without this Codex never sees delegate_task / list_agents / ask, so a Codex coordinator can't delegate.
             if let helper { args += MCPConfig.codexProjectNOverrides(helper: helper, toolTimeoutSeconds: profile.timeoutMinutes * 60) }
             // Auto mode / High: network inside the sandbox (curl, APIs, localhost) without asking each time.

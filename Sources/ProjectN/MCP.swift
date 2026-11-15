@@ -152,6 +152,49 @@ enum MCPConfig {
         return out
     }
 
+    /// Raw `mcpServers` entries (Claude Code format) → Codex `-c` overrides. Unlike `codexOverrides(_:)` this keeps
+    /// `headers` (most remote servers authenticate with them): each value goes in an env var named by
+    /// `env_http_headers`, so tokens stay off the command line. Returns those env vars for the pane.
+    static func codexOverrides(raw: [String: Any]) -> (args: [String], env: [String: String]) {
+        var args: [String] = []
+        var env: [String: String] = [:]
+        for (name, value) in raw.sorted(by: { $0.key < $1.key }) {
+            guard let dict = value as? [String: Any] else { continue }
+            let s = parse(name, dict)
+            let key = "mcp_servers.\(tomlKey(name))"
+            if s.isRemote {
+                guard !s.url.isEmpty else { continue }
+                args += ["-c", "\(key).url=\(tomlString(s.url))"]
+                let headers = (dict["headers"] as? [String: Any] ?? [:]).compactMapValues { $0 as? String }
+                if !headers.isEmpty {
+                    let prefix = "PROJECTN_MCP_" + envSafe(name)
+                    var table: [String] = []
+                    for (i, h) in headers.sorted(by: { $0.key < $1.key }).enumerated() {
+                        let v = "\(prefix)_H\(i)"
+                        env[v] = h.value
+                        table.append("\(tomlString(h.key))=\(tomlString(v))")
+                    }
+                    args += ["-c", "\(key).env_http_headers={\(table.joined(separator: ","))}"]
+                }
+            } else {
+                guard !s.command.isEmpty else { continue }
+                args += ["-c", "\(key).command=\(tomlString(s.command))"]
+                args += ["-c", "\(key).args=[\(s.args.map(tomlString).joined(separator: ","))]"]
+                if let cwd = dict["cwd"] as? String { args += ["-c", "\(key).cwd=\(tomlString(cwd))"] }
+            }
+            if !s.env.isEmpty {
+                let table = s.env.sorted { $0.key < $1.key }
+                    .map { "\(tomlKey($0.key))=\(tomlString($0.value))" }.joined(separator: ",")
+                args += ["-c", "\(key).env={\(table)}"]
+            }
+        }
+        return (args, env)
+    }
+
+    private static func envSafe(_ s: String) -> String {
+        String(s.uppercased().unicodeScalars.map { ($0.isASCII && (CharacterSet.alphanumerics.contains($0))) ? Character($0) : "_" })
+    }
+
     /// ProjectN's own server (`pn-agent mcp`) for a Codex session. Codex starts stdio servers with a minimal
     /// environment, so the bridge port / task token are forwarded by name (`env_vars`): the token never goes on
     /// the command line. The tool timeout covers `ask` / `wait_for_tasks` (Codex's default is 60 s).

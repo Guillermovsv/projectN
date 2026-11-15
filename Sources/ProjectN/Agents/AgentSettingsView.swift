@@ -416,12 +416,18 @@ struct AgentEditor: View {
         claudeMCP = AgentHarness.claudeMCPCatalog(projects: projects)
     }
 
+    /// Codex agents get these too (translated); Claude in Chrome only works in Claude Code.
+    private var shownClaudeMCP: [ClaudeMCPEntry] {
+        draft.runtime == .claudeCode ? claudeMCP : claudeMCP.filter { $0.name != ClaudeMCPEntry.chromeName }
+    }
+
     @ViewBuilder private var integrationsTab: some View {
-        if draft.runtime == .claudeCode {
+        do {
+            let claudeMCP = shownClaudeMCP
             Section {
                 Toggle("Use Claude Code's MCP servers", isOn: $draft.useClaudeMCP)
                 if draft.useClaudeMCP {
-                    if claudeMCP.count <= 1 {
+                    if !claudeMCP.contains(where: { $0.name != ClaudeMCPEntry.chromeName }) {
                         Text("No MCP servers set up in Claude Code for this agent's projects.").font(.caption).foregroundStyle(.secondary)
                     }
                     ForEach(claudeMCP) { m in
@@ -477,7 +483,7 @@ struct AgentEditor: View {
             }
             Button { importingMCP = true } label: { Label("Add from JSON…", systemImage: "curlybraces") }
         } header: { Text("MCP servers") } footer: {
-            Text("The checked servers (plus ProjectN's own\(draft.useClaudeMCP && draft.runtime == .claudeCode ? " and the Claude Code ones turned on above" : "")) are loaded for this agent. Tools that read run freely; tools that delete or publish ask you.")
+            Text("The checked servers (plus ProjectN's own\(draft.useClaudeMCP ? " and the Claude Code ones turned on above" : "")) are loaded for this agent. Tools that read run freely; tools that delete or publish ask you.")
                 .font(.caption).foregroundStyle(.secondary)
         }
         Section {

@@ -34,17 +34,29 @@ extension AgentHarness {
         ctx.env["PROJECTN_AGENT_TASK"] = tid.uuidString
         // Questions and waits can take long: don't let Claude Code give up on ProjectN's tools early.
         ctx.env["MCP_TOOL_TIMEOUT"] = String(max(60, (profile(t.agentID)?.timeoutMinutes ?? 30) * 60) * 1000)
+        // Codex: HTTP header values (auth tokens) reach its MCP servers through the environment, not argv.
+        if let p = profile(t.agentID), p.runtime != .claudeCode {
+            for (k, v) in MCPConfig.codexOverrides(raw: agentMCPServers(task: t, profile: p)).env { ctx.env[k] = v }
+        }
         return ctx
+    }
+
+    /// The MCP servers an agent gets in a project, whatever its runtime: Claude Code's (yours, then the
+    /// project's ~/.claude.json entry and .mcp.json) that it hasn't turned off, then the ones checked from
+    /// ProjectN's library. ProjectN's own server is added separately per runtime.
+    func agentMCPServers(task: AgentTask, profile: AgentProfile) -> [String: Any] {
+        var servers: [String: Any] = [:]
+        if profile.useClaudeMCP, let project = store?.project(task.projectID) {
+            for (k, v) in Self.claudeCodeMCPServers(projectPath: project.path) where profile.usesClaudeMCP(k) { servers[k] = v }
+        }
+        for (k, v) in (MCPConfig.loadRaw()["mcpServers"] as? [String: Any] ?? [:]) where profile.mcpServers.contains(k) { servers[k] = v }
+        servers.removeValue(forKey: "projectn")
+        return servers
     }
 
     /// ~/.projectn/agents/run/<task>.json — ProjectN's server + the profile's servers, 0600.
     func writeMCPConfig(task: AgentTask, profile: AgentProfile, helper: String?) -> URL? {
-        var servers: [String: Any] = [:]
-        // Claude Code's own servers (yours, then the project's), so agents can use what you use.
-        if profile.useClaudeMCP, profile.runtime == .claudeCode, let project = store?.project(task.projectID) {
-            for (k, v) in Self.claudeCodeMCPServers(projectPath: project.path) where profile.usesClaudeMCP(k) { servers[k] = v }
-        }
-        for (k, v) in (MCPConfig.loadRaw()["mcpServers"] as? [String: Any] ?? [:]) where profile.mcpServers.contains(k) { servers[k] = v }
+        var servers = agentMCPServers(task: task, profile: profile)
         if let helper { servers["projectn"] = ["command": helper, "args": ["mcp"]] }
         AgentStore.bootstrap()
         let url = AgentStore.runDir.appendingPathComponent("\(task.id.uuidString).mcp.json")

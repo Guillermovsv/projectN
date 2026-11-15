@@ -477,3 +477,26 @@ struct AgentHarnessTests {
         #expect(!panes.contains { $0.agentTaskID == finished[0] })
     }
 }
+
+@Test func codexGetsClaudeStyleServersWithHeadersOffArgv() {
+    let raw: [String: Any] = [
+        "site-elementor": ["type": "http", "url": "https://example.com/mcp", "headers": ["Authorization": "Bearer secret"]],
+        "seo-core": ["command": "npx", "args": ["-y", "seo"], "env": ["KEY": "v"]],
+    ]
+    let out = MCPConfig.codexOverrides(raw: raw)
+    let joined = out.args.joined(separator: " ")
+    #expect(joined.contains("mcp_servers.site-elementor.url=\"https://example.com/mcp\""))
+    #expect(joined.contains("mcp_servers.site-elementor.env_http_headers={\"Authorization\"=\"PROJECTN_MCP_SITE_ELEMENTOR_H0\"}"))
+    #expect(!joined.contains("secret"))
+    #expect(out.env["PROJECTN_MCP_SITE_ELEMENTOR_H0"] == "Bearer secret")
+    #expect(joined.contains("mcp_servers.seo-core.command=\"npx\""))
+}
+
+@Test func codexAgentsInheritClaudeMCPButNotChrome() {
+    var p = AgentProfile(name: "x", role: "x", model: "gpt-5", instructions: "")
+    p.runtime = .codexCLI
+    #expect(p.usesClaudeMCP("notion"))
+    #expect(!p.usesClaudeMCP(ClaudeMCPEntry.chromeName))
+    p.claudeMCPDisabled = ["notion"]
+    #expect(!p.usesClaudeMCP("notion"))
+}
