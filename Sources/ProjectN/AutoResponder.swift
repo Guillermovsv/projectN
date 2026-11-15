@@ -64,11 +64,25 @@ enum AutoResponder {
         let first = menu.block.first!.line
         // A real question ("…?") above the options wins: Codex prints the tool's parameters (e.g. "post_id: 798")
         // or the command between its question and the menu. Otherwise the closest non-empty line with letters.
-        let above = window[max(0, first - 12)..<first].reversed()
-        let question = above.first { $0.hasSuffix("?") && $0.rangeOfCharacter(from: .letters) != nil }
-            ?? window[max(0, first - 4)..<first].reversed()
-            .first { !$0.isEmpty && $0.rangeOfCharacter(from: .letters) != nil }
-        return question ?? "Choose an option"
+        let above = Array(window[max(0, first - 12)..<first].enumerated().map { (max(0, first - 12) + $0.offset, $0.element) }.reversed())
+        let hit = above.first { $0.1.hasSuffix("?") && $0.1.rangeOfCharacter(from: .letters) != nil }
+            ?? above.prefix(4).first { !$0.1.isEmpty && $0.1.rangeOfCharacter(from: .letters) != nil }
+        guard let (line, text) = hit else { return "Choose an option" }
+        return unwrapped(text, at: line, in: window)
+    }
+
+    /// A long question wraps on screen ("Allow the violet-caribou-…-elementor MCP server to run tool
+    /// "elementor-manage-" / "elements"?"): a line that doesn't start a sentence continues the one above.
+    static func unwrapped(_ text: String, at line: Int, in window: [String]) -> String {
+        var out = text
+        var i = line
+        while i > 0, line - i < 4, let c = out.first, !c.isUppercase, !c.isNumber {
+            let prev = window[i - 1]
+            guard !prev.isEmpty, prev.rangeOfCharacter(from: .letters) != nil, !prev.hasSuffix("?") else { break }
+            out = (prev.hasSuffix("-") || prev.hasSuffix("_") || prev.hasSuffix("/") ? prev : prev + " ") + out
+            i -= 1
+        }
+        return out
     }
 
     /// Plain-text heuristics for "the agent is busy" (Claude: "esc to interrupt", Codex: "Esc to interrupt").

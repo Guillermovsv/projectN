@@ -23,6 +23,8 @@ enum TranscriptReader {
         var size: UInt64 = 0
         /// User prompts (not tool results) seen: tells whether a message typed in has reached the transcript yet.
         var prompts = 0
+        /// Short updates the agent wrote while working (Codex `phase: commentary`), oldest first.
+        var progress: [String] = []
     }
 
     static func claudeTranscript(sessionID: String, settings: AppSettings) -> URL? {
@@ -184,6 +186,9 @@ enum TranscriptReader {
                 let parts = (p["content"] as? [[String: Any]]) ?? []
                 let text = parts.compactMap { $0["text"] as? String }.joined(separator: "\n")
                 if !text.isEmpty { lastAssistant = text }
+                // "Voy a…", "Ya tengo…": what it tells you between steps (the final answer is phase final_answer).
+                let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                if p["phase"] as? String == "commentary", !trimmed.isEmpty { snap.progress.append(trimmed) }
             }
         }
         return snap

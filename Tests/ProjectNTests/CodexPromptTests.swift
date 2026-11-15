@@ -26,6 +26,29 @@ import Testing
         #expect(d.map { AutoResponder.approves($0.label) } == true)
     }
 
+    @Test func joinsAQuestionWrappedOverSeveralLines() {
+        let screen = [
+            "  Field 1/1",
+            "  Allow the violet-caribou-704111-hostingersite-com-elementor MCP server to run tool \"elementor-manage-",
+            "  elements\"?",
+            "  post_id: 44",
+            "  › 1. Allow                   Run the tool and continue",
+            "    2. Allow for this session  Run the tool and remember this choice for this session",
+            "    4. Cancel                  Cancel this tool call",
+            "  enter to submit | esc to cancel",
+        ]
+        let q = AutoResponder.pendingPrompt(screen: screen)
+        #expect(q == "Allow the violet-caribou-704111-hostingersite-com-elementor MCP server to run tool \"elementor-manage-elements\"?")
+        #expect(CodexPromptPolicy.parse(screen: screen, question: q ?? "")
+                == .mcp(server: "violet-caribou-704111-hostingersite-com-elementor", tool: "elementor-manage-elements"))
+        // Wrapped at a space.
+        var two = screen
+        two[1] = "  Allow the violet-caribou-704111-hostingersite-com-elementor MCP"
+        two[2] = "  server to run tool \"elementor-create-page\"?"
+        #expect(AutoResponder.pendingPrompt(screen: two)
+                == "Allow the violet-caribou-704111-hostingersite-com-elementor MCP server to run tool \"elementor-create-page\"?")
+    }
+
     @Test func reportsTheQuestionNotAParameter() {
         #expect(AutoResponder.pendingPrompt(screen: mcpApproval)?.hasPrefix("Allow the demo MCP server to run tool") == true)
     }

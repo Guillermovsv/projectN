@@ -43,6 +43,8 @@ struct SlackSettings: Codable, Equatable {
     var notifyOnStart = true
     var notifyApprovals = true
     var notifyErrors = true
+    /// Post the short updates an agent writes while it works (so a long task doesn't look stuck).
+    var notifyProgress = true
     /// Tell unauthorised users they aren't allowed (otherwise ignore them silently).
     var replyToUnauthorized = true
     /// Replies in a thread under your message (off = straight into the channel / DM).
@@ -60,6 +62,7 @@ struct SlackSettings: Codable, Equatable {
         notifyOnStart = (try? c.decode(Bool.self, forKey: .notifyOnStart)) ?? d.notifyOnStart
         notifyApprovals = (try? c.decode(Bool.self, forKey: .notifyApprovals)) ?? d.notifyApprovals
         notifyErrors = (try? c.decode(Bool.self, forKey: .notifyErrors)) ?? d.notifyErrors
+        notifyProgress = (try? c.decode(Bool.self, forKey: .notifyProgress)) ?? d.notifyProgress
         replyToUnauthorized = (try? c.decode(Bool.self, forKey: .replyToUnauthorized)) ?? d.replyToUnauthorized
         replyInThreads = (try? c.decode(Bool.self, forKey: .replyInThreads)) ?? d.replyInThreads
     }

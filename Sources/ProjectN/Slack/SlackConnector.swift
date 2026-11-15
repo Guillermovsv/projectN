@@ -521,6 +521,9 @@ final class SlackConnector: ObservableObject {
             requestReminder(r, minutes: minutes, task: t, channel: channel, thread: thread, bot: bot)
         case .stalled(let s):
             post(channel, thread, Self.stallText(s, agent: t.agentName), bot: bot, as: t.agentID)
+        case .progress(let text):
+            guard settings.notifyProgress else { return }
+            post(channel, thread, Self.progressText(text, agent: t.agentName, delegated: delegated), bot: bot, as: t.agentID)
         }
     }
 
@@ -554,6 +557,13 @@ final class SlackConnector: ObservableObject {
         case .resumed:
             return "✓ *\(agent)* volvió a avanzar."
         }
+    }
+
+    /// "💬 *Agent*: Voy a…" — short, so it reads as a status line next to the real answers.
+    static func progressText(_ text: String, agent: String, delegated: Bool) -> String {
+        let flat = SlackRouter.toSlack(text).replacingOccurrences(of: "\n", with: " ")
+        let short = flat.count > 300 ? String(flat.prefix(300)) + "…" : flat
+        return "\(delegated ? "↳ " : "")💬 *\(agent)*: \(short)"
     }
 
     static func firstLine(_ s: String) -> String {

@@ -17,6 +17,8 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
         case requestReminder(AgentRequest, Int)
         /// The task stopped making progress (or picked up again after a warning).
         case stalled(Stall)
+        /// A short update the agent wrote while working ("Voy a…", "Ya tengo…"): it isn't stuck, it's busy.
+        case progress(String)
     }
 
     /// What the stall watch did about a task that went quiet.
@@ -59,6 +61,8 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
     var lastHookAllowed: [UUID: Date] = [:]
     /// The Codex prompt ProjectN last answered by itself, per task (a prompt that stays up after that goes to you).
     var codexAutoAnswered: [UUID: (text: String, at: Date)] = [:]
+    /// Progress updates already passed on, per task (count of the transcript's updates since the task began).
+    var progressRelayed: [UUID: Int] = [:]
     /// When each pending request was last reminded about.
     var remindedAt: [UUID: Date] = [:]
     /// When a message was last typed into each task's session.
@@ -844,6 +848,7 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
     private func apply(snapshot: TranscriptReader.Snapshot?, exitCode: String?, to id: UUID) {
         guard let t = task(id), t.status.isActive else { return }
         if let u = snapshot?.usage { update(id) { $0.usage = u } }
+        if let s = snapshot { relayProgress(t, s) }
         if let s = snapshot { promptsSeen[id] = s.prompts }
         // The turn ProjectN just interrupted (stall watch) ends as "finished": the session continues with the nudge.
         if let s = snapshot, s.finished, let until = recoveringUntil[id], Date() < until { return }
@@ -881,6 +886,17 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
         }
     }
 
+    /// Passes on the updates the agent wrote since the last read. Several at once → only the latest (no flood);
+    /// none once the turn is over (its final answer follows).
+    private func relayProgress(_ t: AgentTask, _ s: TranscriptReader.Snapshot) {
+        let seen = progressRelayed[t.id] ?? 0
+        guard s.progress.count > seen else { return }
+        progressRelayed[t.id] = s.progress.count
+        guard !s.finished, let latest = s.progress.last else { return }
+        noteProgress(t.id)
+        emit(t, .progress(latest))
+    }
+
     private func finish(_ id: UUID, status: AgentTaskStatus, error: String? = nil) {
         guard let t = task(id), !t.status.isFinished else { return }
         update(id) {
@@ -903,6 +919,7 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
         stallRecoveries.removeValue(forKey: id)
         transcriptSize.removeValue(forKey: id)
         recoveringUntil.removeValue(forKey: id)
+        progressRelayed.removeValue(forKey: id)
         // Requests addressed to this task as a coordinator go to the user now that it stopped listening.
         for r in requests where r.isPending && r.route == .orchestrator(id) { escalateRequest(r.id, note: "the coordinator finished its turn") }
         guard let done = task(id) else { return }

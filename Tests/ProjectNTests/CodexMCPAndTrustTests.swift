@@ -57,4 +57,27 @@ struct CodexMCPAndTrustTests {
         #expect(!ClaudeTrust.accept(path: "/a", file: file))
         #expect(try String(contentsOf: file, encoding: .utf8) == "{not json")
     }
+
+    @Test func codexCommentaryIsProgressNotTheAnswer() {
+        func msg(_ phase: String, _ text: String) -> String {
+            #"{"type":"response_item","payload":{"type":"message","role":"assistant","phase":"\#(phase)","content":[{"type":"output_text","text":"\#(text)"}]}}"#
+        }
+        let started = #"{"type":"event_msg","payload":{"type":"task_started"}}"#
+        let working = [started, msg("commentary", "Voy a revisar el sitio."), msg("commentary", "Ya tengo dos borradores.")]
+        let w = TranscriptReader.parseCodex(Data(working.joined(separator: "\n").utf8))
+        #expect(w.progress == ["Voy a revisar el sitio.", "Ya tengo dos borradores."])
+        #expect(!w.finished)
+        let done = working + [msg("final_answer", "Listo."),
+                              #"{"type":"event_msg","payload":{"type":"task_complete","last_agent_message":"Listo."}}"#]
+        let d = TranscriptReader.parseCodex(Data(done.joined(separator: "\n").utf8))
+        #expect(d.finished && d.result == "Listo.")
+        #expect(d.progress.count == 2)
+    }
+
+    @MainActor @Test func progressTextIsOneShortLine() {
+        let t = SlackConnector.progressText("Voy a **crear** la página.\nLuego la reviso.", agent: "PM", delegated: false)
+        #expect(t == "💬 *PM*: Voy a *crear* la página. Luego la reviso.")
+        let long = SlackConnector.progressText(String(repeating: "a", count: 500), agent: "Dev", delegated: true)
+        #expect(long.hasPrefix("↳ 💬 *Dev*: ") && long.hasSuffix("…") && long.count < 330)
+    }
 }
