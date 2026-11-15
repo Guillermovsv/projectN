@@ -36,10 +36,14 @@ enum Enhancer {
         return fm.isExecutableFile(atPath: path) ? path : nil
     }
 
-    static func enhance(_ text: String, settings s: NVoiceSettings) async throws -> String {
+    static func enhance(_ text: String, settings s: NVoiceSettings, terms: [String] = []) async throws -> String {
         let provider = s.provider
         let model = s.effectiveModel
-        let system = s.enhancePrompt
+        var system = s.enhancePrompt
+        if !terms.isEmpty {
+            system += "\n\nThe speaker's personal dictionary. Keep these exactly as written (spelling and capitalization), never \"correct\" them: "
+                + terms.joined(separator: ", ")
+        }
         let override = provider == .claude ? s.claudePath : s.codexPath
         return try await Task.detached(priority: .userInitiated) {
             guard let bin = locate(provider, override: override) else { throw EnhancerError.cliNotFound(provider.binaryName) }

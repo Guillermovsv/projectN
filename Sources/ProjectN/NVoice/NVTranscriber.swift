@@ -213,7 +213,8 @@ final class Transcriber {
                 // Personal dictionary: bias recognition toward this speaker's names and jargon.
                 let context = AnalysisContext()
                 context.contextualStrings[.general] = contextualStrings
-                try? await analyzer.setContext(context)
+                do { try await analyzer.setContext(context) }
+                catch { Diagnostics.log("dictionary hints rejected by speech engine (\(localeID)): \(error.localizedDescription)") }
             }
             try await analyzer.prepareToAnalyze(in: format)
             let (stream, cont) = AsyncStream<AnalyzerInput>.makeStream()

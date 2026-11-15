@@ -415,7 +415,7 @@ final class NVoiceController: NSObject, ObservableObject {
                 var final = raw
                 if enhance {
                     setPhase(.enhancing)
-                    do { final = try await Enhancer.enhance(raw, settings: settings) }
+                    do { final = try await Enhancer.enhance(raw, settings: settings, terms: profiles.active.dictionary) }
                     catch { show(error: error.localizedDescription); /* fall back to the raw transcript */ }
                 }
 

@@ -131,9 +131,9 @@ final class ProfileStore: ObservableObject {
             let replaced = Self.replaceWholeWords(rule.heard, with: rule.replacement, in: out)
             if replaced != out { used.append(rule.id); out = replaced }
         }
-        for term in active.dictionary {
-            out = Self.replaceWholeWords(term, with: term, in: out)
-        }
+        // Dictionary terms: fixes capitalization and catches sound-alike misspellings
+        // ("4B marketing" → "4vmarketing") that the speech engine produced despite the hint.
+        out = DictionaryMatcher.apply(terms: active.dictionary, to: out)
         if !used.isEmpty {
             update { p in for i in p.rules.indices where used.contains(p.rules[i].id) { p.rules[i].uses += 1 } }
         }
