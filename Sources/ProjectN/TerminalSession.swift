@@ -323,6 +323,12 @@ final class TerminalSession: NSObject, ObservableObject, LocalProcessTerminalVie
         return true
     }
 
+    /// Interrupts the agent's current turn (Escape, as you would), e.g. a turn that hung.
+    func interrupt() {
+        lastAutoAnswer = ("Esc", Date())
+        sendKeys(["\u{1b}"])
+    }
+
     /// Sends key presses one at a time with a short gap; TUIs (Ink, ratatui) handle that more reliably than one burst.
     private func sendKeys(_ keys: [String]) {
         for (i, k) in keys.enumerated() {

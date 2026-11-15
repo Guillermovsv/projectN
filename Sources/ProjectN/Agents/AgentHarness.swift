@@ -15,6 +15,21 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
         case requestResolved(AgentRequest)
         /// A request has waited on you for a while: nudge again (minutes waiting).
         case requestReminder(AgentRequest, Int)
+        /// The task stopped making progress (or picked up again after a warning).
+        case stalled(Stall)
+    }
+
+    /// What the stall watch did about a task that went quiet.
+    struct Stall: Equatable {
+        enum Kind: Equatable { case warning, restarted, resumed }
+        var kind: Kind
+        /// Minutes without progress.
+        var minutes: Int
+        /// The last thing it was seen doing, and when ("" when unknown).
+        var lastStep: String
+        var lastStepAt: Date?
+        /// Minutes until the next step of the watch (interrupting it / stopping it).
+        var nextInMinutes: Int
     }
 
     @Published private(set) var profiles: [AgentProfile]
@@ -52,6 +67,25 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
     /// counts (a message was typed in but the CLI hasn't written it yet).
     var promptsSeen: [UUID: Int] = [:]
     var promptsExpected: [UUID: (count: Int, at: Date)] = [:]
+
+    // Stall watch: a session can hang without a prompt or an error (e.g. Codex lost a batch of MCP calls and never
+    // continued its turn). Nothing on screen asks for anything, so without this the task sat silent until its timeout.
+    /// Last sign of progress per task (its transcript grew, a tool call went through) and what it was.
+    var lastProgress: [UUID: (at: Date, what: String)] = [:]
+    /// How far the watch went: 1 = you were warned, 2 = ProjectN interrupted it and asked it to continue.
+    var stallStage: [UUID: (stage: Int, at: Date)] = [:]
+    /// Interruptions per task (a second stall stops the task instead of interrupting it again).
+    var stallRecoveries: [UUID: Int] = [:]
+    /// Transcript size at the last read, per task.
+    var transcriptSize: [UUID: UInt64] = [:]
+    /// Right after ProjectN interrupts a stuck turn, that aborted turn isn't the end of the task.
+    var recoveringUntil: [UUID: Date] = [:]
+    /// No progress for this long → you're told. Then it's interrupted and asked to continue; then it's stopped.
+    var stallWarnAfter: TimeInterval = 5 * 60
+    var stallRecoverAfter: TimeInterval = 12 * 60
+    var stallGiveUpAfter: TimeInterval = 5 * 60
+    /// A message from you to a session that's been quiet this long gets an immediate status reply.
+    var stallWarnOnMessageAfter: TimeInterval = 2 * 60
 
     private(set) weak var store: Store?
     let catalog: ModelCatalog
@@ -655,6 +689,7 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
                     promptGone(t.id)
                     if t.status == .starting, rt.isRunning { update(t.id) { $0.status = .running } }
                 }
+                checkStall(t.id, runtime: rt, paneID: paneID)
                 flushInbox(t.id)
             }
             readTranscript(task(t.id) ?? t)
@@ -678,6 +713,7 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
         case .allow:
             guard rt.answerPendingPrompt(approve: true) else { return false }
             codexAutoAnswered[t.id] = (q, Date())
+            noteProgress(t.id, call)
             AuditLog.record("prompt.auto_approved", ["task": t.id.uuidString, "agent": t.agentName, "call": call,
                                                      "why": profile.autoMode ? "Auto mode" : "autonomy \(profile.autonomy.label)",
                                                      "prompt": ApprovalPolicy.clip(q)])
@@ -768,15 +804,23 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
             let exitCode = exitURL.flatMap { try? String(contentsOf: $0, encoding: .utf8) }?
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             var snap: TranscriptReader.Snapshot?
+            var size: UInt64?
             if let sid = t.sessionID {
                 let url = t.runtime == .claudeCode
                     ? TranscriptReader.claudeTranscript(sessionID: sid, settings: settings)
                     : TranscriptReader.codexTranscript(sessionID: sid, settings: settings)
-                if let url { snap = TranscriptReader.read(runtime: t.runtime, url: url, offset: t.transcriptOffset) }
+                if let url {
+                    snap = TranscriptReader.read(runtime: t.runtime, url: url, offset: t.transcriptOffset)
+                    size = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? NSNumber)?.uint64Value
+                }
             }
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
                 self.readsInFlight.remove(id)
+                if let size, self.task(id)?.status.isActive == true, self.transcriptSize[id] != size {
+                    self.transcriptSize[id] = size
+                    self.noteProgress(id)
+                }
                 self.apply(snapshot: snap, exitCode: exitCode, to: id)
             }
         }
@@ -792,6 +836,8 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
         guard let t = task(id), t.status.isActive else { return }
         if let u = snapshot?.usage { update(id) { $0.usage = u } }
         if let s = snapshot { promptsSeen[id] = s.prompts }
+        // The turn ProjectN just interrupted (stall watch) ends as "finished": the session continues with the nudge.
+        if let s = snapshot, s.finished, let until = recoveringUntil[id], Date() < until { return }
         if let s = snapshot, s.finished, let e = promptsExpected[id] {
             // The typed message hasn't reached the transcript yet: the "finished" turn is the previous one.
             if s.prompts < e.count && Date().timeIntervalSince(e.at) < 90 { return }
@@ -843,6 +889,11 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
         promptsExpected.removeValue(forKey: id)
         promptsSeen.removeValue(forKey: id)
         lastTyped.removeValue(forKey: id)
+        lastProgress.removeValue(forKey: id)
+        stallStage.removeValue(forKey: id)
+        stallRecoveries.removeValue(forKey: id)
+        transcriptSize.removeValue(forKey: id)
+        recoveringUntil.removeValue(forKey: id)
         // Requests addressed to this task as a coordinator go to the user now that it stopped listening.
         for r in requests where r.isPending && r.route == .orchestrator(id) { escalateRequest(r.id, note: "the coordinator finished its turn") }
         guard let done = task(id) else { return }
@@ -880,6 +931,108 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
         guard let t = task(id) else { return }
         queueForSession(id, PromptComposer.newMessage(text))
         AuditLog.record("task.message_queued", ["task": id.uuidString, "agent": t.agentName, "text": ApprovalPolicy.clip(text)])
+        // You're asking a session that has gone quiet: say so now instead of leaving the question unanswered.
+        if stallStage[id] == nil, t.status == .running, let paneID = t.paneID, let rt = store?.runtimes[paneID],
+           !isBlocked(t, runtime: rt), quietSince(t).map({ Date().timeIntervalSince($0) >= stallWarnOnMessageAfter }) == true {
+            warnStalled(t)
+        }
+    }
+
+    // MARK: Stall watch
+
+    /// Something happened in the task's session (transcript grew, a tool call went through).
+    func noteProgress(_ id: UUID, _ what: String? = nil) {
+        let now = Date()
+        lastProgress[id] = (now, what ?? lastProgress[id]?.what ?? "")
+        guard let s = stallStage[id] else { return }
+        // Right after an interruption the nudge itself lands in the transcript: that isn't the agent moving yet.
+        if s.stage == 2, now.timeIntervalSince(s.at) < 20 { return }
+        stallStage.removeValue(forKey: id)
+        guard s.stage == 1, let t = task(id), t.status.isActive else { return }
+        AuditLog.record("task.stall_resumed", ["task": id.uuidString, "agent": t.agentName])
+        emit(t, .stalled(Stall(kind: .resumed, minutes: Int(now.timeIntervalSince(s.at) / 60), lastStep: "", lastStepAt: nil, nextInMinutes: 0)))
+    }
+
+    /// Waiting on you (a prompt, an approval, a question) or on its agents (`wait_for_tasks`): quiet on purpose.
+    private func isBlocked(_ t: AgentTask, runtime rt: TerminalSession) -> Bool {
+        t.status != .running || rt.needsInput
+            || requests.contains { $0.taskID == t.id && $0.isPending }
+            || orchestratorWaiters[t.id]?.isEmpty == false
+    }
+
+    private func quietSince(_ t: AgentTask) -> Date? {
+        guard let started = t.startedAt else { return nil }
+        var since = max(started, lastProgress[t.id]?.at ?? started)
+        if let s = stallStage[t.id], s.stage == 2 { since = max(since, s.at) }
+        return since
+    }
+
+    private func checkStall(_ id: UUID, runtime rt: TerminalSession, paneID: UUID, now: Date = Date()) {
+        guard let t = task(id), t.status.isActive else { return }
+        if isBlocked(t, runtime: rt) {
+            // Time spent waiting on you doesn't count as being stuck.
+            lastProgress[id] = (now, lastProgress[id]?.what ?? "")
+            return
+        }
+        guard let since = quietSince(t) else { return }
+        let idle = now.timeIntervalSince(since)
+        switch stallStage[id]?.stage ?? 0 {
+        case 0 where idle >= stallRecoverAfter, 1 where idle >= stallRecoverAfter:
+            if (stallRecoveries[id] ?? 0) >= 1 { giveUpStalled(t, paneID: paneID, idle: idle) } else { recoverStalled(t, runtime: rt, idle: idle) }
+        case 0 where idle >= stallWarnAfter:
+            warnStalled(t)
+        case 2 where idle >= stallGiveUpAfter:
+            giveUpStalled(t, paneID: paneID, idle: idle)
+        default:
+            break
+        }
+    }
+
+    private func stallInfo(_ t: AgentTask, kind: Stall.Kind, idle: TimeInterval, next: TimeInterval) -> Stall {
+        let last = lastProgress[t.id]
+        return Stall(kind: kind, minutes: max(1, Int(idle / 60)), lastStep: last?.what ?? "",
+                     lastStepAt: last?.at ?? t.startedAt, nextInMinutes: max(1, Int((next / 60).rounded(.up))))
+    }
+
+    private func warnStalled(_ t: AgentTask, now: Date = Date()) {
+        let idle = quietSince(t).map { now.timeIntervalSince($0) } ?? 0
+        stallStage[t.id] = (1, now)
+        AuditLog.record("task.stalled", ["task": t.id.uuidString, "agent": t.agentName, "minutes": String(Int(idle / 60)),
+                                          "last": lastProgress[t.id]?.what ?? ""])
+        emit(t, .stalled(stallInfo(t, kind: .warning, idle: idle, next: max(60, stallRecoverAfter - idle))))
+    }
+
+    /// Interrupts the stuck turn (Esc) and asks the agent to check what got done and continue.
+    private func recoverStalled(_ t: AgentTask, runtime rt: TerminalSession, idle: TimeInterval, now: Date = Date()) {
+        let info = stallInfo(t, kind: .restarted, idle: idle, next: stallGiveUpAfter)
+        stallStage[t.id] = (2, now)
+        stallRecoveries[t.id, default: 0] += 1
+        recoveringUntil[t.id] = now.addingTimeInterval(45)
+        rt.interrupt()
+        AuditLog.record("task.stall_interrupted", ["task": t.id.uuidString, "agent": t.agentName, "minutes": String(Int(idle / 60))])
+        emit(t, .stalled(info))
+        let id = t.id, minutes = info.minutes
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+            guard let self, self.task(id)?.status.isActive == true else { return }
+            self.queueForSession(id, PromptComposer.stallNudge(minutes: minutes))
+        }
+    }
+
+    private func giveUpStalled(_ t: AgentTask, paneID: UUID, idle: TimeInterval) {
+        let last = lastProgress[t.id]
+        let step = (last?.what).flatMap { $0.isEmpty ? nil : $0 }
+        let when = (last?.at ?? t.startedAt).map { " a las " + Self.clock($0) } ?? ""
+        AuditLog.record("task.stall_stopped", ["task": t.id.uuidString, "agent": t.agentName, "minutes": String(Int(idle / 60))])
+        store?.killRuntime(paneID)
+        finish(t.id, status: .failed, error: "Se trabó: \(max(1, Int(idle / 60))) min sin avanzar"
+               + (step.map { " (última actividad: \($0)\(when))" } ?? "")
+               + ". ProjectN lo detuvo para que no siga esperando en silencio — vuelve a enviar la instrucción.")
+    }
+
+    static func clock(_ d: Date) -> String {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm"
+        return f.string(from: d)
     }
 
     func queueForSession(_ id: UUID, _ message: String) {

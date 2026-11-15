@@ -159,6 +159,7 @@ extension AgentHarness {
             }
             rememberApproved(t.id, input: input, summary: summary)
             lastHookAllowed[t.id] = Date()
+            noteProgress(t.id, tool == "Bash" ? ApprovalPolicy.clip(summary) : tool)
             reply(["decision": "allow", "reason": "Allowed by ProjectN policy (routine work in the project)."])
         case .deny(let why):
             lastHookAllowed.removeValue(forKey: t.id)
@@ -320,6 +321,7 @@ extension AgentHarness {
             return delegator
         }
         AuditLog.record("tool.projectn", ["task": t.id.uuidString, "agent": t.agentName, "tool": name])
+        noteProgress(t.id, name)
         switch name {
         case "ask":
             // Non-blocking: Claude Code moves MCP calls that run over 2 minutes to the background and the agent then

@@ -366,6 +366,38 @@ struct AgentHarnessTests {
         try await waitUntil { env.posts.texts(thread: "700.2").contains { $0.contains("Timed out") } }
     }
 
+    /// A session that hangs without asking anything (Codex lost a batch of MCP calls): you're told, it's
+    /// interrupted and nudged once, then stopped with a clear reason — never silent until the timeout.
+    @Test func stuckSessionIsReportedInterruptedThenStopped() async throws {
+        let env = try await makeEnv()
+        defer { env.store.terminateAll() }
+        env.harness.stallWarnAfter = 1
+        env.harness.stallRecoverAfter = 3
+        env.harness.stallGiveUpAfter = 2
+        mention("Project Manager, revisa Demo SLOW", ts: "710.1", env: env)
+        let t = try #require(env.harness.tasks.last)
+        try await waitUntil(10) { env.posts.texts(thread: "710.1").contains { $0.contains("min sin avanzar*") } }
+        try await waitUntil(10) { env.posts.texts(thread: "710.1").contains { $0.contains("🔄 *Project Manager* seguía trabado") } }
+        try await waitUntil(15) { env.harness.task(t.id)?.status == .failed }
+        #expect(env.harness.task(t.id)?.error?.hasPrefix("Se trabó") == true)
+        #expect(env.store.runtimes[t.paneID!] == nil)
+        try await waitUntil { env.posts.texts(thread: "710.1").contains { $0.contains("❌ *Project Manager*") && $0.contains("Se trabó") } }
+    }
+
+    /// "Dame un update" to a session that's been quiet a while gets an immediate answer from ProjectN.
+    @Test func messageToQuietSessionGetsImmediateStatus() async throws {
+        let env = try await makeEnv()
+        defer { env.store.terminateAll() }
+        env.harness.stallWarnOnMessageAfter = 1
+        mention("Project Manager, revisa Demo SLOW", ts: "720.1", env: env)
+        let t = try #require(env.harness.tasks.last)
+        try await waitUntil(10) { env.harness.task(t.id)?.status == .running }
+        try await Task.sleep(nanoseconds: 1_500_000_000)
+        env.harness.deliverMessage("Dame un update", to: t.id)
+        try await waitUntil(5) { env.posts.texts(thread: "720.1").contains { $0.contains("min sin avanzar*") } }
+        #expect(env.harness.task(t.id)?.status.isActive == true)   // only a warning: nothing is stopped
+    }
+
     @Test func restartMarksRunningTasksInterruptedAndReportsThem() async throws {
         let env = try await makeEnv()
         defer { env.store.terminateAll() }

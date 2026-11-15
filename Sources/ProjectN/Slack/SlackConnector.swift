@@ -519,6 +519,8 @@ final class SlackConnector: ObservableObject {
             requestResolved(r, channel: channel, thread: thread, bot: bot)
         case .requestReminder(let r, let minutes):
             requestReminder(r, minutes: minutes, task: t, channel: channel, thread: thread, bot: bot)
+        case .stalled(let s):
+            post(channel, thread, Self.stallText(s, agent: t.agentName), bot: bot, as: t.agentID)
         }
     }
 
@@ -533,6 +535,24 @@ final class SlackConnector: ObservableObject {
         return harness.pendingUserRequests().filter { r in
             guard let t = harness.task(r.taskID), t.origin.slackChannel == channel else { return false }
             return !settings.replyInThreads || t.origin.slackThreadTS == thread
+        }
+    }
+
+    /// Always posted (not behind a notification setting): a silent stuck agent is exactly what you must hear about.
+    static func stallText(_ s: AgentHarness.Stall, agent: String) -> String {
+        let last = s.lastStep.isEmpty ? "" : "última actividad: `\(ApprovalPolicy.clip(s.lastStep))`"
+        let at = s.lastStepAt.map { "a las \(AgentHarness.clock($0))" } ?? ""
+        let lastPart = [last, at].filter { !$0.isEmpty }.joined(separator: " ")
+        let detail = lastPart.isEmpty ? "" : " (\(lastPart))"
+        switch s.kind {
+        case .warning:
+            return "⚠️ *\(agent)* lleva *\(s.minutes) min sin avanzar*\(detail) y no está esperando nada de ti — parece trabado. "
+                + "Si sigue así, en \(s.nextInMinutes) min lo interrumpo y le pido que revise y continúe; si tampoco responde, lo detengo y te aviso."
+        case .restarted:
+            return "🔄 *\(agent)* seguía trabado (\(s.minutes) min sin avanzar\(detail)): lo interrumpí y le pedí que revise qué se hizo y continúe. "
+                + "Si en \(s.nextInMinutes) min no avanza, lo detengo y te aviso."
+        case .resumed:
+            return "✓ *\(agent)* volvió a avanzar."
         }
     }
 

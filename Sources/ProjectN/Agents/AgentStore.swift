@@ -371,6 +371,9 @@ enum PromptComposer {
               redone, changes the goal) are a new `delegate_task` to the same agent and project, never `message_task`:
               it runs right after the current task in the same session, with its own result and time limit. If the
               current work is now pointless, `cancel_task` it first.
+            - Call ProjectN's tools one at a time: one `delegate_task` per call, waiting for its reply before the next.
+              Never batch several in one script / `Promise.all` or run them in parallel — batched calls can hang the
+              session with nothing done.
             - `wait_for_tasks` only for work that will finish within a minute or two: each call re-reads your whole
               conversation, so don't poll long tasks with it.
             - If the work needs a project that doesn't exist yet, `create_project` makes one; then delegate into it
@@ -491,6 +494,18 @@ enum PromptComposer {
     }
 
     /// A message typed into a session that is already working on something.
+    /// Typed in after the stall watch interrupted a turn that stopped making progress.
+    static func stallNudge(minutes: Int) -> String {
+        """
+        ## ProjectN: your last step got stuck
+
+        Nothing happened for \(minutes) min after your last step, so ProjectN interrupted it. Tool calls that were in \
+        flight may not have run: check first (e.g. `list_agents` / `get_task`, or the files) instead of assuming, \
+        don't duplicate work that did go through, then continue the task. Make tool calls one at a time — never \
+        several at once in one script or in parallel.
+        """
+    }
+
     static func newMessage(_ text: String) -> String {
         text.hasPrefix("## ") ? text : "## New message from the user (sent while you were working)\n\n" + text
     }
