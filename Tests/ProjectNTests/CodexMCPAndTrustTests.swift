@@ -1,0 +1,60 @@
+import Foundation
+import Testing
+@testable import ProjectN
+
+/// Codex agents only get the MCP servers their settings allow; Claude Code agents don't stop at "trust this folder?".
+struct CodexMCPAndTrustTests {
+    @Test func parsesCodexConfigServers() {
+        let toml = """
+        model = "gpt-6"
+        [mcp_servers.seo-core]
+        command = "npx"
+        [mcp_servers.seo-core.env]
+        KEY = "x"
+        [mcp_servers.violet-caribou-elementor]
+        url = "https://violet.example/mcp"
+        [mcp_servers.violet-caribou-elementor.tools.elementor-create-page]
+        approval_mode = "approve"
+        [mcp_servers."odd name"]
+        command = "x"
+        [mcp_servers.projectn]
+        command = "pn-agent"
+        [projects."/tmp"]
+        trust_level = "trusted"
+        """
+        let s = MCPConfig.parseCodexServers(toml)
+        #expect(Set(s.keys) == ["seo-core", "violet-caribou-elementor", "odd name"])
+        #expect(s["seo-core"] == "npx")
+        #expect(s["violet-caribou-elementor"] == "HTTP  https://violet.example/mcp")
+    }
+
+    @Test func disablesServersByName() {
+        #expect(MCPConfig.codexDisableOverrides(["a-b", "odd name"])
+                == ["-c", "mcp_servers.a-b.enabled=false", "-c", "mcp_servers.\"odd name\".enabled=false"])
+    }
+
+    @Test func trustAcceptKeepsOtherKeys() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("trust-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let file = dir.appendingPathComponent(".claude.json")
+        try Data(#"{"oauthAccount":{"id":1},"projects":{"/a":{"hasTrustDialogAccepted":false,"x":2}}}"#.utf8).write(to: file)
+        #expect(ClaudeTrust.accept(path: "/a", file: file))
+        #expect(ClaudeTrust.accept(path: "/b/c/", file: file))
+        #expect(!ClaudeTrust.accept(path: "/a", file: file))   // already trusted: untouched
+        let json = try #require(try JSONSerialization.jsonObject(with: Data(contentsOf: file)) as? [String: Any])
+        #expect((json["oauthAccount"] as? [String: Any])?["id"] as? Int == 1)
+        let projects = try #require(json["projects"] as? [String: [String: Any]])
+        #expect(projects["/a"]?["hasTrustDialogAccepted"] as? Bool == true)
+        #expect(projects["/a"]?["x"] as? Int == 2)
+        #expect(projects["/b/c"]?["hasTrustDialogAccepted"] as? Bool == true)
+    }
+
+    @Test func unreadableConfigIsNeverOverwritten() throws {
+        let file = FileManager.default.temporaryDirectory.appendingPathComponent("bad-\(UUID().uuidString).json")
+        try Data("{not json".utf8).write(to: file)
+        defer { try? FileManager.default.removeItem(at: file) }
+        #expect(!ClaudeTrust.accept(path: "/a", file: file))
+        #expect(try String(contentsOf: file, encoding: .utf8) == "{not json")
+    }
+}

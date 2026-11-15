@@ -207,6 +207,54 @@ enum MCPConfig {
                 "-c", "\(key).tool_timeout_sec=\(max(120, toolTimeoutSeconds))"]
     }
 
+    /// MCP servers in Codex's own config.toml (name → one-line summary). Codex loads every one of them in every
+    /// session unless turned off, whatever servers ProjectN adds with `-c`.
+    static func codexConfigServers(codexHome: URL) -> [String: String] {
+        guard let toml = try? String(contentsOf: codexHome.appendingPathComponent("config.toml"), encoding: .utf8) else { return [:] }
+        return parseCodexServers(toml)
+    }
+
+    static func parseCodexServers(_ toml: String) -> [String: String] {
+        var out: [String: String] = [:]
+        var current: String?
+        for raw in toml.split(separator: "\n", omittingEmptySubsequences: false) {
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            if line.hasPrefix("[") {
+                current = nil
+                guard line.hasPrefix("[mcp_servers."), !line.hasPrefix("[[") else { continue }
+                var rest = Substring(line.dropFirst("[mcp_servers.".count))
+                let name: String
+                if rest.hasPrefix("\"") {
+                    rest = rest.dropFirst()
+                    guard let end = rest.firstIndex(of: "\"") else { continue }
+                    name = String(rest[..<end])
+                    rest = rest[rest.index(after: end)...]
+                } else {
+                    guard let end = rest.firstIndex(where: { $0 == "." || $0 == "]" }) else { continue }
+                    name = String(rest[..<end])
+                    rest = rest[end...]
+                }
+                guard !name.isEmpty else { continue }
+                if out[name] == nil { out[name] = "" }
+                if rest.hasPrefix("]") { current = name }   // the server's own table, not .env / .tools.*
+            } else if let cur = current, out[cur]?.isEmpty == true {
+                for key in ["url", "command"] where line.hasPrefix(key) {
+                    let after = line.dropFirst(key.count).trimmingCharacters(in: .whitespaces)
+                    guard after.hasPrefix("=") else { continue }
+                    let v = after.dropFirst().trimmingCharacters(in: .whitespaces).trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
+                    out[cur] = key == "url" ? "HTTP  \(v)" : v
+                }
+            }
+        }
+        out.removeValue(forKey: "projectn")
+        return out
+    }
+
+    /// `-c mcp_servers.<name>.enabled=false` for each name: Codex starts without those servers.
+    static func codexDisableOverrides(_ names: [String]) -> [String] {
+        names.flatMap { ["-c", "mcp_servers.\(tomlKey($0)).enabled=false"] }
+    }
+
     private static func tomlKey(_ k: String) -> String {
         let bare = k.allSatisfy { $0.isLetter || $0.isNumber || $0 == "_" || $0 == "-" } && k.allSatisfy(\.isASCII)
         return bare && !k.isEmpty ? k : tomlString(k)

@@ -474,6 +474,8 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
         guard bridge.port != nil || AgentBridge.helperPath == nil else { return }
         var args: [String] = []
         if profile.runtime == .claudeCode {
+            // Otherwise a folder Claude Code hasn't opened before stops the session at its "trust this folder?" screen.
+            ClaudeTrust.accept(path: project.path, settings: store.settings)
             args += ["--append-system-prompt", PromptComposer.systemPrompt(profile: profile, project: project, capabilities: tools)]
             if project.id == Store.coordinationProjectID {
                 // Reads the projects it coordinates without Claude Code asking for each folder.
@@ -492,7 +494,10 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
             }
         } else {
             // Same servers a Claude agent gets (Claude Code's + the checked library ones), translated for Codex.
-            args += MCPConfig.codexOverrides(raw: agentMCPServers(task: t, profile: profile)).args
+            let granted = agentMCPServers(task: t, profile: profile)
+            args += MCPConfig.codexOverrides(raw: granted).args
+            // …and none of Codex's own config.toml servers the agent isn't given (Codex would load them all).
+            args += codexMCPOverrides(granted: granted, profile: profile)
             // Without this Codex never sees delegate_task / list_agents / ask, so a Codex coordinator can't delegate.
             if let helper { args += MCPConfig.codexProjectNOverrides(helper: helper, toolTimeoutSeconds: profile.timeoutMinutes * 60) }
             // Auto mode / High: network inside the sandbox (curl, APIs, localhost) without asking each time.
@@ -784,6 +789,9 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
     /// The terminal prompt went away (answered there, or by ProjectN): forget it, so the next one is reported.
     private func promptGone(_ id: UUID) {
         promptSeen.removeValue(forKey: id)
+        // The prompt ProjectN answered went away, so the answer took: the same text showing up again is the next
+        // call (a second `delegate_task`…), judged again — not a failed answer handed to you.
+        codexAutoAnswered.removeValue(forKey: id)
         if task(id)?.lastApprovalNotice != nil, task(id)?.lastApprovalNotice?.hasPrefix("plan:") == false {
             update(id) { $0.lastApprovalNotice = nil }
         }

@@ -54,6 +54,20 @@ extension AgentHarness {
         return servers
     }
 
+    /// Servers of Codex's own config.toml (name → summary), in the Codex home sessions use.
+    func codexOwnMCPServers() -> [String: String] {
+        guard let store else { return [:] }
+        return MCPConfig.codexConfigServers(codexHome: SessionDiscovery.codexHome(store.settings))
+    }
+
+    /// Codex loads all of its config.toml servers unless told otherwise: the ones this agent isn't given are turned
+    /// off, so it only has what its settings allow (same on/off list as the Claude Code servers). An agent that
+    /// shouldn't touch a site can't, and a coordinator delegates that work instead of doing it.
+    func codexMCPOverrides(granted: [String: Any], profile: AgentProfile) -> [String] {
+        let off = codexOwnMCPServers().keys.filter { granted[$0] == nil && !profile.usesClaudeMCP($0) }
+        return MCPConfig.codexDisableOverrides(off.sorted())
+    }
+
     /// ~/.projectn/agents/run/<task>.json — ProjectN's server + the profile's servers, 0600.
     func writeMCPConfig(task: AgentTask, profile: AgentProfile, helper: String?) -> URL? {
         var servers = agentMCPServers(task: task, profile: profile)
@@ -101,7 +115,8 @@ extension AgentHarness {
 
     /// Claude Code's MCP servers an agent working in these projects could get, with where each comes from
     /// (shown in the agent editor so each one can be turned off). Claude in Chrome comes first.
-    nonisolated static func claudeMCPCatalog(projects: [(name: String, path: String)], home: String = NSHomeDirectory()) -> [ClaudeMCPEntry] {
+    nonisolated static func claudeMCPCatalog(projects: [(name: String, path: String)], codex: [String: String] = [:],
+                                             home: String = NSHomeDirectory()) -> [ClaudeMCPEntry] {
         let json = claudeJSON(home: home)
         var entries: [String: ClaudeMCPEntry] = [:]
         for (k, v) in userClaudeMCPServers(json) {
@@ -115,6 +130,10 @@ extension AgentHarness {
                     entries[k]!.scope.append(p.name)
                 }
             }
+        }
+        // Codex's own servers (config.toml): only Codex agents get them.
+        for (k, summary) in codex where entries[k] == nil {
+            entries[k] = ClaudeMCPEntry(name: k, summary: summary, scope: [], codexOnly: true)
         }
         entries.removeValue(forKey: "projectn")
         let chrome = ClaudeMCPEntry(name: ClaudeMCPEntry.chromeName, summary: "Claude Code's browser integration (screenshots are heavy on tokens)", scope: [])
@@ -401,8 +420,11 @@ extension AgentHarness {
             guard needDelegate() else { return }
             let projectPath = store?.project(t.projectID)?.path ?? ""
             let inherited = Array(Self.claudeCodeMCPServers(projectPath: projectPath).keys)
+            let codexOwn = Array(codexOwnMCPServers().keys)
             let list = availableAgents().filter { $0.id != profile.id }.map { p -> [String: Any] in
-                let servers = Set(p.mcpServers + inherited.filter(p.usesClaudeMCP))
+                // A Codex agent also has the servers of Codex's own config it isn't turned off for.
+                let servers = Set(p.mcpServers + inherited.filter(p.usesClaudeMCP)
+                                  + (p.runtime == .codexCLI ? codexOwn.filter(p.usesClaudeMCP) : []))
                 return ["name": p.name, "role": p.role, "runtime": p.runtime.label, "model": p.model, "access": p.permission.label,
                         "autonomy": p.autoMode ? "Auto mode" : p.autonomy.label,
                         "projects": p.allProjects ? "all" : (store?.state.projects.filter { p.mayAccess($0.id) }.map(\.name).joined(separator: ", ") ?? ""),
@@ -717,7 +739,52 @@ struct ClaudeMCPEntry: Identifiable, Hashable {
     var summary: String
     /// Projects it belongs to; empty = yours, in every project.
     var scope: [String]
+    /// Set up only in Codex (~/.codex/config.toml): Codex agents only.
+    var codexOnly = false
     var scopeLabel: String {
-        name == Self.chromeName ? "Claude Code" : scope.isEmpty ? "All projects" : scope.joined(separator: ", ")
+        name == Self.chromeName ? "Claude Code" : codexOnly ? "Codex" : scope.isEmpty ? "All projects" : scope.joined(separator: ", ")
+    }
+}
+
+/// Claude Code asks "Is this a project you trust?" the first time it opens a folder. An agent's session can't
+/// answer it (nobody watches the terminal; the stall watch's Esc quits Claude Code), so ProjectN accepts it for
+/// the agent's project folder before launch, as you would by hand — the folder is one you added to ProjectN.
+enum ClaudeTrust {
+    /// The `.claude.json` Claude Code reads for this settings' config dir.
+    static func configFile(_ settings: AppSettings) -> URL {
+        if settings.isolateClaudeConfig { return AppHome.claudeConfigDir.appendingPathComponent(".claude.json") }
+        if let dir = ProcessInfo.processInfo.environment["CLAUDE_CONFIG_DIR"], !dir.isEmpty {
+            return URL(fileURLWithPath: (dir as NSString).expandingTildeInPath).appendingPathComponent(".claude.json")
+        }
+        return FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude.json")
+    }
+
+    /// Marks `path` trusted. Returns true when it changed the file.
+    @discardableResult
+    static func accept(path: String, settings: AppSettings) -> Bool {
+        accept(path: path, file: configFile(settings))
+    }
+
+    @discardableResult
+    static func accept(path: String, file: URL) -> Bool {
+        let key = (path as NSString).standardizingPath
+        var json: [String: Any] = [:]
+        if let data = try? Data(contentsOf: file) {
+            // Never overwrite a file we can't read back (Claude Code keeps your login state there).
+            guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return false }
+            json = obj
+        }
+        var projects = json["projects"] as? [String: Any] ?? [:]
+        var entry = projects[key] as? [String: Any] ?? [:]
+        if entry["hasTrustDialogAccepted"] as? Bool == true { return false }
+        entry["hasTrustDialogAccepted"] = true
+        projects[key] = entry
+        json["projects"] = projects
+        guard let out = try? JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .withoutEscapingSlashes]) else { return false }
+        let perms = (try? FileManager.default.attributesOfItem(atPath: file.path)[.posixPermissions]) as? NSNumber
+        do { try out.write(to: file, options: .atomic) } catch { return false }
+        try? FileManager.default.setAttributes([.posixPermissions: perms ?? 0o600], ofItemAtPath: file.path)
+        AuditLog.record("claude.folder_trusted", ["path": key])
+        return true
     }
 }

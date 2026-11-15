@@ -413,19 +413,19 @@ struct AgentEditor: View {
 
     private func loadClaudeMCP() {
         let projects = store.state.projects.filter { draft.mayAccess($0.id) }.map { (name: $0.name, path: $0.path) }
-        claudeMCP = AgentHarness.claudeMCPCatalog(projects: projects)
+        claudeMCP = AgentHarness.claudeMCPCatalog(projects: projects, codex: agents.codexOwnMCPServers())
     }
 
     /// Codex agents get these too (translated); Claude in Chrome only works in Claude Code.
     private var shownClaudeMCP: [ClaudeMCPEntry] {
-        draft.runtime == .claudeCode ? claudeMCP : claudeMCP.filter { $0.name != ClaudeMCPEntry.chromeName }
+        draft.runtime == .claudeCode ? claudeMCP.filter { !$0.codexOnly } : claudeMCP.filter { $0.name != ClaudeMCPEntry.chromeName }
     }
 
     @ViewBuilder private var integrationsTab: some View {
         do {
             let claudeMCP = shownClaudeMCP
             Section {
-                Toggle("Use Claude Code's MCP servers", isOn: $draft.useClaudeMCP)
+                Toggle(draft.runtime == .codexCLI ? "Use Claude Code's and Codex's MCP servers" : "Use Claude Code's MCP servers", isOn: $draft.useClaudeMCP)
                 if draft.useClaudeMCP {
                     if !claudeMCP.contains(where: { $0.name != ClaudeMCPEntry.chromeName }) {
                         Text("No MCP servers set up in Claude Code for this agent's projects.").font(.caption).foregroundStyle(.secondary)
@@ -450,7 +450,7 @@ struct AgentEditor: View {
                 }
             } header: {
                 HStack {
-                    Text("Claude Code MCP servers")
+                    Text(draft.runtime == .codexCLI ? "Claude Code & Codex MCP servers" : "Claude Code MCP servers")
                     Spacer()
                     if draft.useClaudeMCP, claudeMCP.count > 1 {
                         Button("All on") { draft.claudeMCPDisabled.removeAll { n in claudeMCP.contains { $0.name == n } } }.font(.caption)
@@ -460,7 +460,7 @@ struct AgentEditor: View {
                     }
                 }
             } footer: {
-                Text("From Claude Code: yours (~/.claude.json, every project) and each project's (~/.claude.json, .mcp.json). Every server adds its tools to each step of the session: turn off the ones this agent doesn't need to save tokens.")
+                Text("From Claude Code: yours (~/.claude.json, every project) and each project's (~/.claude.json, .mcp.json)\(draft.runtime == .codexCLI ? "; for Codex agents also Codex's own (~/.codex/config.toml) — the unchecked ones are turned off" : ""). Every server adds its tools to each step of the session: turn off the ones this agent doesn't need to save tokens.")
                     .font(.caption).foregroundStyle(.secondary)
             }
             .onAppear(perform: loadClaudeMCP)

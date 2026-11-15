@@ -346,6 +346,10 @@ enum PromptComposer {
             - `list_agents` shows the agents you can use. Hand work to the right specialist with `delegate_task`:
               one clear, self-contained instruction per task, with what “done” means. Do work yourself only when
               it fits your role or no agent fits.
+            - Hands-on work goes to the agent whose role does it: building or changing websites (WordPress /
+              Elementor pages), code and deployments go to the developer agent. Pick the agent that has the MCP
+              servers the work needs (`mcp_servers_in_this_project` in `list_agents`) and name the server in
+              `context`. A tool you lack is a reason to delegate, not to tell the user it can't be done.
             - When the user says someone else should do it ("pídele al developer…", "ask the SEO…", "que lo haga…"),
               delegate it with `delegate_task` — never hand the work back to the user.
             - Match the role the user names: "the dev" means the developer agent, never an agent with another role.
