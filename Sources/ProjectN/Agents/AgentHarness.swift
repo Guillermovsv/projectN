@@ -1095,7 +1095,10 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
         guard let pid = done.origin.parentTaskID, let parent = task(pid) else { return }
         // Same account, same limit: waking the coordinator would only fail again (the user is told directly).
         if done.usageLimit == true, parent.runtime == done.runtime, !parent.status.isActive { return }
-        let message = PromptComposer.delegatedResult(done)
+        let shownInSlack = done.status == .completed && done.origin.slackChannel != nil && done.origin.slackThreadTS != nil
+            && !(done.result ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && { let slack = IntegrationSettings.load().slack; return slack.enabled && slack.postDelegatedResults }()
+        let message = PromptComposer.delegatedResult(done, userSawIt: shownInSlack)
         if parent.status.isActive {
             if orchestratorWaiters[pid]?.isEmpty == false { return }
             queueForSession(pid, message)

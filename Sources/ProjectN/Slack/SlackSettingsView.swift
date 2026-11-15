@@ -90,6 +90,7 @@ struct SlackSettingsView: View {
                         .font(.caption).foregroundStyle(.secondary)
                     Toggle("Post when a task is queued or starts", isOn: $slack.settings.notifyOnStart)
                     Toggle("Post the agent's progress updates while it works", isOn: $slack.settings.notifyProgress)
+                    Toggle("Post each delegated agent's full answer", isOn: $slack.settings.postDelegatedResults)
                     Toggle("Post approval requests and proposed plans", isOn: $slack.settings.notifyApprovals)
                     Toggle("Post errors, timeouts and cancellations", isOn: $slack.settings.notifyErrors)
                     Toggle("Reply in threads", isOn: $slack.settings.replyInThreads)

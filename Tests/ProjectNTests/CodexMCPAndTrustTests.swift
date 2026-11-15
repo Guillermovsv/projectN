@@ -80,4 +80,21 @@ struct CodexMCPAndTrustTests {
         let long = SlackConnector.progressText(String(repeating: "a", count: 500), agent: "Dev", delegated: true)
         #expect(long.hasPrefix("↳ 💬 *Dev*: ") && long.hasSuffix("…") && long.count < 330)
     }
+
+    /// A Codex coordinator retells a delegated result in a few lines, dropping links and pending items: the agent's
+    /// own answer goes to Slack whole, and the coordinator is told not to repeat it (or, if not shown, to keep it all).
+    @MainActor @Test func delegatedAnswerReachesSlackWhole() {
+        var t = AgentTask(agentID: UUID(), agentName: "Desarrollador", projectID: UUID(), projectName: "Solar Devs",
+                          instruction: "Quita los eyebrows", origin: TaskOrigin(kind: .agent, delegatedBy: "Project Manager"),
+                          runtime: .codexCLI, model: "gpt-5", effort: nil, permission: .readOnly)
+        t.result = "**Hecho.**\n\n- [Preview](https://example.com/?p=44)\n- **Pendiente:** QA visual."
+        let text = SlackConnector.delegatedResultText(t)
+        #expect(text.hasPrefix("↳ ✓ *Desarrollador* (Solar Devs):"))
+        #expect(text.contains("<https://example.com/?p=44|Preview>") && text.contains("*Pendiente:* QA visual."))
+
+        let seen = PromptComposer.delegatedResult(t, userSawIt: true)
+        #expect(seen.contains("already received this answer in full") && seen.contains("QA visual"))
+        let unseen = PromptComposer.delegatedResult(t)
+        #expect(unseen.contains("keep every link, file path"))
+    }
 }

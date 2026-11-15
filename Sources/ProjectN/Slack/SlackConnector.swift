@@ -505,7 +505,11 @@ final class SlackConnector: ObservableObject {
             postLong(channel, thread, "📝 *\(t.agentName)* propone este plan (espera tu aprobación en ProjectN):\n\n" + SlackRouter.toSlack(plan), bot: bot, as: t.agentID)
         case .finished:
             if delegated {
-                if settings.notifyOnStart || t.usageLimit == true || (t.status != .completed && settings.notifyErrors) {
+                let answer = (t.result ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                if t.status == .completed, settings.postDelegatedResults, !answer.isEmpty {
+                    // The coordinator's reply is its own summary: the agent's answer itself, links and all, goes here.
+                    postLong(channel, thread, Self.delegatedResultText(t), bot: bot, as: t.agentID)
+                } else if settings.notifyOnStart || t.usageLimit == true || (t.status != .completed && settings.notifyErrors) {
                     let icon = t.status == .completed ? "✓" : t.usageLimit == true ? "⏳" : "✗"
                     post(channel, thread, "↳ \(icon) *\(t.agentName)* — \(t.status.label)\(t.error.map { ": \(Self.firstLine($0))" } ?? "")", bot: bot, as: t.agentID)
                 }
@@ -564,6 +568,13 @@ final class SlackConnector: ObservableObject {
         let flat = SlackRouter.toSlack(text).replacingOccurrences(of: "\n", with: " ")
         let short = flat.count > 300 ? String(flat.prefix(300)) + "…" : flat
         return "\(delegated ? "↳ " : "")💬 *\(agent)*: \(short)"
+    }
+
+    /// "↳ ✓ *Agent* (Project):" followed by the whole answer.
+    static func delegatedResultText(_ t: AgentTask) -> String {
+        var s = "↳ ✓ *\(t.agentName)* (\(t.projectName)):\n\n" + SlackRouter.toSlack(t.result ?? "")
+        if let e = t.error { s += "\n⚠️ \(e)" }
+        return s
     }
 
     static func firstLine(_ s: String) -> String {

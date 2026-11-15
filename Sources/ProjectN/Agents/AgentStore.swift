@@ -521,12 +521,22 @@ enum PromptComposer {
         return "## No answer to your question (\(r.decidedBy ?? "expired"))\n\nContinue with the safest reasonable assumption and say which one you made."
     }
 
-    static func delegatedResult(_ c: AgentTask) -> String {
+    /// `userSawIt`: the full answer was already posted where the user reads (Slack), so the coordinator shouldn't
+    /// retell it — only what it means. Otherwise its reply is all the user gets: nothing may be lost in a summary.
+    static func delegatedResult(_ c: AgentTask, userSawIt: Bool = false) -> String {
         var s = "## Result of a task you delegated — \(c.agentName) · \(c.projectName) · \(c.status.label)\n"
         s += "Task: " + oneLine(c.instruction, 300) + "\n\n"
         if let r = c.result, !r.isEmpty { s += r.count > 8000 ? String(r.prefix(8000)) + "\n[…truncated]" : r }
         if let e = c.error { s += "\nError: \(e)" }
-        s += "\n\nReview it and tell the user the outcome (combine it with other results still pending if any)."
+        if userSawIt {
+            s += "\n\nThe user has already received this answer in full (posted to Slack as it is). Don't repeat it: reply "
+                + "briefly with what matters on top of it — your review, problems you see, what's still pending (combine it "
+                + "with other results still pending if any) and the next step."
+        } else {
+            s += "\n\nReview it and tell the user the outcome (combine it with other results still pending if any). Your "
+                + "reply is all the user sees of it: keep every link, file path, figure, pending item and limitation it "
+                + "reports — don't shorten it into a summary that drops them."
+        }
         return s
     }
 

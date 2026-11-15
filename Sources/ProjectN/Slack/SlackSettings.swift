@@ -45,6 +45,8 @@ struct SlackSettings: Codable, Equatable {
     var notifyErrors = true
     /// Post the short updates an agent writes while it works (so a long task doesn't look stuck).
     var notifyProgress = true
+    /// Post a delegated agent's full answer when it finishes (the coordinator's own reply only summarises it).
+    var postDelegatedResults = true
     /// Tell unauthorised users they aren't allowed (otherwise ignore them silently).
     var replyToUnauthorized = true
     /// Replies in a thread under your message (off = straight into the channel / DM).
@@ -63,6 +65,7 @@ struct SlackSettings: Codable, Equatable {
         notifyApprovals = (try? c.decode(Bool.self, forKey: .notifyApprovals)) ?? d.notifyApprovals
         notifyErrors = (try? c.decode(Bool.self, forKey: .notifyErrors)) ?? d.notifyErrors
         notifyProgress = (try? c.decode(Bool.self, forKey: .notifyProgress)) ?? d.notifyProgress
+        postDelegatedResults = (try? c.decode(Bool.self, forKey: .postDelegatedResults)) ?? d.postDelegatedResults
         replyToUnauthorized = (try? c.decode(Bool.self, forKey: .replyToUnauthorized)) ?? d.replyToUnauthorized
         replyInThreads = (try? c.decode(Bool.self, forKey: .replyInThreads)) ?? d.replyInThreads
     }
