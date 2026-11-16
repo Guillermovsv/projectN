@@ -17,6 +17,8 @@ enum AssistantAI {
         var effort: String?
         var prompt: String?
         var pane: String?
+        var space: String?
+        var workspace: String?
     }
 
     struct Plan: Equatable {
@@ -44,7 +46,9 @@ enum AssistantAI {
            (use exact names from the snapshot):
         ACTION {"do":"open_project","project":"<name>"}
         ACTION {"do":"new_space","project":"<name, optional>"}
-        ACTION {"do":"goto_space","n":<1-based number in the current workspace>}
+        ACTION {"do":"open_workspace","workspace":"<workspace name>"}
+        ACTION {"do":"goto_space","n":<1-based number in the current workspace>}   (or "space":"<space name>" instead of n)
+        ACTION {"do":"agents_view"}
         ACTION {"do":"new_pane","tool":"claude|codex|cursor|terminal","project":"<name, optional>","count":<1-16, optional>,"model":"<optional>","effort":"<optional>","prompt":"<first message, optional>"}
         ACTION {"do":"send_to_pane","pane":"<pane name from the snapshot, or last (the pane you opened last), or all (every pane you opened last)>","prompt":"<message to type into it>"}
         ACTION {"do":"show_panel","tab":"files|activity|browser"}
@@ -63,6 +67,9 @@ enum AssistantAI {
         send_to_pane with its name. When the user asks for panes/terminals by name ("five Claudes", "a Codex that…") use
         new_pane/send_to_pane, not ask_agent; use ask_agent when they name an agent or don't ask for a pane.
         For work on code (fix, build, review, write…), use ask_agent with the best-suited agent and a well-written instruction.
+        The request comes from speech recognition, so names are often slightly off ("cloud" or "code" for Claude,
+        "solar debs" for Solar Devs, "aire dinamica" for Airedinamica, "doctor Sergio" for dr-sergio): map them to the closest
+        name in the snapshot. "This space" / "here" means the current space, where new panes open anyway.
         If something is ambiguous, ask and add no actions.
         """
     }
@@ -87,6 +94,9 @@ enum AssistantAI {
             out.append("Workspace \(w.name)\(w.id == current ? " [open]" : ""):\n" + spaces.joined(separator: "\n"))
         }
         if store.selectedWorkspace == nil { out.append("The user is on the overview (no workspace open).") }
+        if let agents = store.state.workspaces.first(where: \.agentHost) {
+            out.append("Agents view (where agents' own panes run): \(agents.spaces.flatMap(\.panes).count) panes.")
+        }
         let claude = LaunchCatalog.claudeModels.filter { !$0.older }.map(\.label).joined(separator: ", ")
         out.append("Claude models: \(claude) (efforts: \(LaunchCatalog.claudeEfforts.joined(separator: ", ")))")
         let codex = LaunchCatalog.codexModels(settings: store.settings).map(\.slug)
@@ -139,7 +149,8 @@ enum AssistantAI {
                       instruction: a["instruction"] as? String, tool: (a["tool"] as? String)?.lowercased(),
                       tab: (a["tab"] as? String)?.lowercased(), n: int(a["n"]), count: int(a["count"]),
                       model: a["model"] as? String, effort: (a["effort"] as? String)?.lowercased(),
-                      prompt: a["prompt"] as? String, pane: a["pane"] as? String)
+                      prompt: a["prompt"] as? String, pane: a["pane"] as? String,
+                      space: a["space"] as? String, workspace: a["workspace"] as? String)
     }
 
     private static func int(_ v: Any?) -> Int? {

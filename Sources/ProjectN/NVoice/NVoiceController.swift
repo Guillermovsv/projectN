@@ -356,7 +356,8 @@ final class NVoiceController: NSObject, ObservableObject {
     }
 
     /// Starts recording for the Assistant panel. Levels go to `onLevel` instead of the dictation overlay.
-    func assistantStart(onLevel: @escaping (Float) -> Void) async throws {
+    /// `vocabulary`: names the Assistant expects to hear (projects, spaces, panes, agents, tools), as speech hints.
+    func assistantStart(vocabulary: [String] = [], onLevel: @escaping (Float) -> Void) async throws {
         guard !transcriber.isRecording, !busy else { throw TranscriberError.micUnavailable("dictation is in use") }
         if !assistantPrepared {
             // Dictation may be off: permissions, mic choice and speech models aren't set up yet.
@@ -366,8 +367,11 @@ final class NVoiceController: NSObject, ObservableObject {
             assistantPrepared = true
         }
         transcriber.onLevel = onLevel
+        // Speech engines take a limited list of hints: the Assistant's names first, then the personal dictionary.
+        var hints: [String] = []
+        for h in vocabulary + profiles.contextualStrings where !h.isEmpty && !hints.contains(h) { hints.append(h) }
         do {
-            try transcriber.start(localeIDs: profiles.activeLocaleIDs, contextualStrings: profiles.contextualStrings)
+            try transcriber.start(localeIDs: profiles.activeLocaleIDs, contextualStrings: Array(hints.prefix(100)))
         } catch {
             restoreOverlayLevels()
             throw error

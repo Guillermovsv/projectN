@@ -218,7 +218,7 @@ final class AssistantController: NSObject, ObservableObject {
         micOp { [weak self] in
             guard let self, gen == self.listenGen else { return }
             do {
-                try await NVoiceController.shared.assistantStart { [weak self] l in self?.heard(level: l, gen: gen) }
+                try await NVoiceController.shared.assistantStart(vocabulary: self.vocabulary()) { [weak self] l in self?.heard(level: l, gen: gen) }
                 self.micOpen = true
             } catch {
                 Diagnostics.log("assistant: mic didn't start — \(error.localizedDescription)")
@@ -232,6 +232,20 @@ final class AssistantController: NSObject, ObservableObject {
             guard gen == self.listenGen, self.isListening else { self.closeMic(); return }
             self.watchForAudio(gen)
         }
+    }
+
+    /// What you're likely to name, so speech recognition gets it right: "Claude" instead of "cloud",
+    /// "Solar Devs" instead of "solar debs".
+    func vocabulary() -> [String] {
+        var out = ["Claude", "Claude Code", "Codex", "Cursor", "Opus", "Sonnet", "Haiku", "Fable", "terminal", "ProjectN"]
+        guard let store else { return out }
+        out += store.state.projects.map(\.name)
+        out += store.state.workspaces.filter { !$0.agentHost }.map(\.name)
+        out += (store.selectedWorkspace?.spaces ?? []).map(\.name).filter { !$0.hasPrefix("Space ") }
+        out += (harness?.profiles ?? []).filter(\.enabled).map(\.name)
+        out += paneList().map(\.title)
+        var seen = Set<String>()
+        return out.filter { !$0.isEmpty && seen.insert($0.folded).inserted }
     }
 
     /// Runs mic operations strictly in order (see `micQueue`).
@@ -415,6 +429,7 @@ final class AssistantController: NSObject, ObservableObject {
         let ctx = AssistantCommands.Context(
             projects: store.state.projects,
             workspaces: store.state.workspaces.filter { !$0.agentHost }.map { ($0.id, $0.name) },
+            spaces: store.selectedWorkspace?.spaces.map { ($0.id, $0.name) } ?? [],
             agents: harness.profiles,
             panes: paneList(),
             lastOpened: lastOpened,
@@ -467,6 +482,15 @@ final class AssistantController: NSObject, ObservableObject {
                 reply(L("Primero abre un proyecto.", "Open a project first."), lang); return
             }
             reply(L("Nuevo espacio: \(s.name).", "New space: \(s.name)."), lang)
+        case .selectSpace(let id, let name):
+            showWorkspaces()
+            guard let w = store.selectedWorkspace else { return }
+            store.selectSpace(id, in: w.id)
+            reply(L("Espacio \(name).", "Space \(name)."), lang)
+        case .agentsView:
+            if let nav, nav.settingsOpen, let panel { nav.closeSettings(panel: panel) }
+            nav?.switchMode(.agents)
+            reply(L("Vista de agentes.", "Agents view."), lang)
         case .nextSpace, .previousSpace:
             showWorkspaces()
             store.cycleSpace(intent == .nextSpace ? 1 : -1)
@@ -741,7 +765,19 @@ final class AssistantController: NSObject, ObservableObject {
         switch a.kind {
         case "open_project": intent = project.map { .openProject($0) }
         case "new_space": intent = .newSpace(project)
-        case "goto_space": intent = a.n.map { .gotoSpace($0) }
+        case "goto_space":
+            if let n = a.n { intent = .gotoSpace(n) }
+            else if let name = a.space, let w = store.selectedWorkspace,
+                    let id = AssistantCommands.bestNames(in: AssistantCommands.normalize(name), w.spaces.map { (key: $0.id, names: [$0.name]) }).first,
+                    let sp = w.spaces.first(where: { $0.id == id }) { intent = .selectSpace(id: sp.id, name: sp.name) }
+            else { intent = nil }
+        case "open_workspace":
+            let ws = store.state.workspaces.filter { !$0.agentHost }
+            intent = (a.workspace ?? a.project).flatMap { n in
+                AssistantCommands.bestNames(in: AssistantCommands.normalize(n), ws.map { (key: $0.id, names: [$0.name]) }).first
+            }.flatMap { id in ws.first { $0.id == id } }.map { .openWorkspace(id: $0.id, name: $0.name) }
+                ?? project.map { .openProject($0) }
+        case "agents_view": intent = .agentsView
         case "new_pane":
             intent = Tool(rawValue: a.tool ?? "claude").map { tool in
                 var r = PaneRequest(tool: tool, project: project, count: max(1, min(PaneRequest.maxCount, a.count ?? 1)),

@@ -291,3 +291,55 @@ struct AssistantRealtimeTests {
         #expect(AssistantCommands.parse("that's all", ctx) == .endConversation)
     }
 }
+
+/// The phrases from a real session's log (speech recognition included) that the Assistant didn't understand.
+@MainActor
+struct AssistantHeardTests {
+    init() { _ = TestHome.url }
+    let names = ["SEO Core App", "NUEVO 4vmarketing", "NVoice", "Client Finder", "dr-sergio", "Florina", "projectN",
+                 "HR-System", "Ralero", "Airedinamica", "Hotel system", "Canal de Youtube", "Solar Devs"]
+    var projects: [Project] { names.map { Project(name: $0, path: "/tmp/\($0)") } }
+    let crm = (id: UUID(), name: "CRM 4VMarketing")
+    let videos = (id: UUID(), name: "Videos")
+
+    func parse(_ s: String) -> AssistantIntent {
+        AssistantCommands.parse(s, .init(projects: projects, workspaces: [crm], spaces: [(UUID(), "Space 1"), videos]))
+    }
+    func opens(_ s: String, _ name: String) -> Bool {
+        if case .openProject(let p) = parse(s) { return p.name == name }
+        return false
+    }
+
+    @Test func projectsSaidLoosely() {
+        #expect(opens("Change to SEO app", "SEO Core App"))
+        #expect(opens("Change to solar debs", "Solar Devs"))
+        #expect(opens("Change to solar devs", "Solar Devs"))
+        #expect(opens("Change to Nvoice", "NVoice"))
+        #expect(opens("Abre aire dinámica?", "Airedinamica"))
+        #expect(opens("Abre el proyecto aire dinámica", "Airedinamica"))
+        #expect(opens("Abre el proyecto doctor-Sergio", "dr-sergio"))
+        #expect(opens("Hotel system", "Hotel system"))
+        #expect(opens("Cambia el proyecto Florina", "Florina"))
+        #expect(opens("switch to HR system", "HR-System"))
+        #expect(opens("go to the blog project", "") == false)
+    }
+
+    @Test func workspacesSpacesAndAgents() {
+        #expect(parse("cambia a CRM") == .openWorkspace(id: crm.id, name: crm.name))
+        #expect(parse("ve a Videos") == .selectSpace(id: videos.id, name: videos.name))
+        #expect(parse("Abre el proyecto Agents?") == .agentsView)
+        #expect(parse("Which two agents view") == .agentsView)
+    }
+
+    @Test func claudeMisheard() {
+        #expect(parse("Launch tree cloud agents") == .newPane(PaneRequest(tool: .claude, count: 3)))
+        #expect(parse("Open three clouds in this space") == .newPane(PaneRequest(tool: .claude, count: 3)))
+        #expect(parse("Lounge three code terminals in this space") == .newPane(PaneRequest(tool: .claude, count: 3)))
+        #expect(parse("Lancha Cloud Code agent") == .newPane(PaneRequest(tool: .claude)))
+        #expect(parse("Open three codes in this page") == .newPane(PaneRequest(tool: .codex, count: 3)))
+        #expect(parse("abre tres terminales en este espacio") == .newPane(PaneRequest(tool: .terminal, count: 3)))
+        // The prompt keeps what was said.
+        #expect(parse("abre un claude que revise el cloud setup")
+                == .newPane(PaneRequest(tool: .claude, prompt: "revise el cloud setup")))
+    }
+}

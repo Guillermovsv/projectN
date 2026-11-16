@@ -13,6 +13,10 @@ enum AssistantIntent: Equatable {
     case home
     case openProject(Project)
     case openWorkspace(id: UUID, name: String)
+    /// A space of the open workspace, by its name ("ve a Videos").
+    case selectSpace(id: UUID, name: String)
+    /// The Agents view (⌃⌘2).
+    case agentsView
     case newSpace(Project?)
     case nextSpace
     case previousSpace
@@ -46,6 +50,8 @@ enum AssistantCommands {
     struct Context {
         var projects: [Project]
         var workspaces: [(id: UUID, name: String)] = []
+        /// Spaces of the open workspace.
+        var spaces: [(id: UUID, name: String)] = []
         var agents: [AgentProfile] = []
         /// Open panes by name, for "dile a Ada que …".
         var panes: [(ref: Store.PaneRef, title: String)] = []
@@ -58,7 +64,7 @@ enum AssistantCommands {
 
     static func parse(_ raw: String, _ ctx: Context) -> AssistantIntent {
         let text = stripWake(raw.trimmingCharacters(in: .whitespacesAndNewlines))
-        let f = normalize(text)
+        let f = misheard(normalize(text))
         guard !f.isEmpty else { return .unknown(raw) }
 
         if matchesAny(f, exact: ["stop", "para", "silencio", "callate", "calla", "basta", "shh", "quiet", "shut up", "ya"]) { return .stopSpeaking }
@@ -83,12 +89,18 @@ enum AssistantCommands {
         // Panes first, so a prompt that mentions spaces or projects stays part of the prompt:
         // "abre 5 claude en opus 5.5 low que …", "nueva terminal", "lanza codex en blog".
         let paneVerbs = ["abre", "abrir", "nuevo", "nueva", "nuevos", "nuevas", "lanza", "lanzar", "inicia", "arranca",
-                         "crea", "crear", "open", "new", "launch", "start", "add", "create", "agrega", "pon"]
+                         "crea", "crear", "open", "new", "launch", "start", "add", "create", "agrega", "pon", "dame", "give me"]
         if startsWithAny(f, paneVerbs), let r = paneRequest(text, ctx) { return .newPane(r) }
 
         if has(f, ["pendiente", "pendientes", "necesita", "necesitan", "needs input", "needs me", "waiting", "esperando", "aprobacion", "approval"]) { return .pending }
         if has(f, ["estado", "status", "que esta corriendo", "que hay corriendo", "whats running", "what is running", "resumen", "summary", "como va", "como van", "how is it going"]) { return .status }
         if matchesAny(f, exact: ["inicio", "home", "overview", "vista general", "ve al inicio", "go home"]) { return .home }
+        if has(f, ["agents view", "agent view", "vista de agentes", "vista agentes", "agentes view"])
+            || matchesAny(f, exact: ["agents", "agentes", "los agentes", "the agents"])
+            || (startsWithAny(f, goVerbs) && matchesAny(stripLead(f), exact: ["agents", "agentes", "proyecto agents", "proyecto agentes",
+                                                                             "agents project", "workspace agents", "los agentes", "the agents"])) {
+            return .agentsView
+        }
 
         // Right panel tabs.
         let opens = ["muestra", "mostrar", "abre", "abrir", "show", "open", "ve a", "go to"]
@@ -106,18 +118,62 @@ enum AssistantCommands {
         }
         if let n = spaceNumber(f) { return .gotoSpace(n) }
 
-        // Projects / workspaces: "abre web shop", "ve al proyecto landing", "switch to blog".
-        let goVerbs = ["abre", "abrir", "ve a", "ve al", "ir a", "vamos a", "cambia a", "open", "go to", "switch to", "show me"]
-        if startsWithAny(f, goVerbs) || has(f, ["proyecto", "project"]) {
-            let hits = projects(in: f, ctx.projects)
-            if hits.count == 1 { return .openProject(hits[0]) }
-            if hits.count > 1 { return .ambiguousProject(hits) }
-            if let w = ctx.workspaces.sorted(by: { $0.name.count > $1.name.count })
-                .first(where: { SlackRouter.containsPhrase(f, normalize($0.name)) }) {
+        // Projects / workspaces / spaces: "abre web shop", "ve al proyecto landing", "switch to blog", "cambia a Videos".
+        // Names are matched loosely (speech gets them slightly wrong): "aire dinamica" → Airedinamica,
+        // "solar debs" → Solar Devs, "doctor sergio" → dr-sergio, "seo app" → SEO Core App.
+        let named = startsWithAny(f, goVerbs) || has(f, ["proyecto", "project", "workspace", "espacio", "space"])
+        let lead = stripLead(f)
+        if named || lead.split(separator: " ").count <= 4 {
+            let hits = projects(in: lead, ctx.projects)
+            // Without a verb, only when what you said is basically just the name ("Hotel system").
+            let bare = !named && hits.count == 1 && Self.coversMost(lead, normalize(hits[0].name))
+            if named || bare {
+                if hits.count == 1 { return .openProject(hits[0]) }
+                if hits.count > 1 { return .ambiguousProject(hits) }
+            }
+            let names = ctx.workspaces.map { (key: $0.id, names: [$0.name]) }
+            if let id = bestNames(in: lead, names).first, let w = ctx.workspaces.first(where: { $0.id == id }),
+               named || Self.coversMost(lead, normalize(w.name)) {
                 return .openWorkspace(id: w.id, name: w.name)
+            }
+            let spaces = ctx.spaces.filter { !normalize($0.name).hasPrefix("space ") && !normalize($0.name).hasPrefix("espacio ") }
+            if let id = bestNames(in: lead, spaces.map { (key: $0.id, names: [$0.name]) }).first,
+               let s = spaces.first(where: { $0.id == id }), named || Self.coversMost(lead, normalize(s.name)) {
+                return .selectSpace(id: s.id, name: s.name)
             }
         }
         return .unknown(raw)
+    }
+
+    private static let goVerbs = ["abre", "abrir", "ve a", "ve al", "vete a", "ir a", "vamos a", "cambia", "cambiate", "cambiame",
+                                  "pasa a", "pasate a", "llevame a", "muestrame", "selecciona", "open", "go to", "switch", "change",
+                                  "show me", "take me to", "move to", "jump to", "select"]
+
+    /// Drops the leading verb and filler ("cambia al proyecto …", "switch to the …") so only the name is left.
+    static func stripLead(_ f: String) -> String {
+        var t = f
+        let filler = #"^(?:(?:abre|abrir|ve|vete|ir|vamos|cambia|cambiate|cambiame|pasa|pasate|llevame|muestrame|selecciona|open|go|switch|change|show|take|move|jump|select|me|a|al|to|the|el|la|los|las|de|del|over|on|en|proyecto|project|workspace|espacio|space)\s+)+"#
+        if let r = t.range(of: filler, options: .regularExpression) { t.removeSubrange(r) }
+        return t.trimmingCharacters(in: .whitespaces)
+    }
+
+    /// What speech recognition usually makes of the words commands use: "cloud" for Claude, "tree" for three,
+    /// "lounge" for launch. Only for recognizing the command; the prompt keeps what you said.
+    static func misheard(_ f: String) -> String {
+        var t = " " + f + " "
+        let fixes: [(String, String)] = [
+            (#" (?:claude|cloud|clod|clad|claud|clout) code(?=\s)"#, " claude"),
+            (#" (?:clouds|clods|clouts|clauds)(?=\s)"#, " claudes"),
+            (#" (?:cloud|clod|clout|claud|klaud|clawed)(?=\s)"#, " claude"),
+            (#" code(?= (?:agents?|agentes?|panes?|paneles?|terminals?|terminales?|sessions?|sesiones?) )"#, " claude"),
+            (#" (?:codecs|codes|codec|codexs)(?=\s)"#, " codex"),
+            (#" (?:lounge|lunch|lancha|lanch|lance)(?=\s)"#, " launch"),
+            (#" tree(?=\s)"#, " three"),
+            // "in this space": the current one, which is where new panes go anyway.
+            (#" (?:in|on|at|en|a) (?:this|the current|este|esta|el) (?:space|espacio|page|pagina|workspace)(?=\s)"#, " "),
+        ]
+        for (pattern, with) in fixes { t = t.replacingOccurrences(of: pattern, with: with, options: .regularExpression) }
+        return t.replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression).trimmingCharacters(in: .whitespaces)
     }
 
     // MARK: Pieces
@@ -130,13 +186,13 @@ enum AssistantCommands {
 
     static func paneRequest(_ text: String, _ ctx: Context) -> PaneRequest? {
         var (cmd, prompt) = splitPrompt(text, promptSeparators)
-        var f = normalize(cmd)
+        var f = misheard(normalize(cmd))
         guard !has(f, ["espacio", "space"]),
               let tool = toolWords.first(where: { SlackRouter.containsPhrase(f, $0.0) })?.1 else { return nil }
         if tool == .terminal {
             // A terminal's "prompt" is a shell command: only take one that is clearly introduced.
             (cmd, prompt) = splitPrompt(text, commandSeparators)
-            f = normalize(cmd)
+            f = misheard(normalize(cmd))
         }
         var r = PaneRequest(tool: tool, project: project(in: f, ctx.projects), prompt: prompt)
         var d = digitize(f)
@@ -262,12 +318,98 @@ enum AssistantCommands {
     }
 
     static func projects(in f: String, _ all: [Project]) -> [Project] {
-        var hits = all.filter { p in
-            Set([normalize(p.name), normalize(URL(fileURLWithPath: p.path).lastPathComponent)])
-                .contains { !$0.isEmpty && SlackRouter.containsPhrase(f, $0) }
-        }
+        let ids = bestNames(in: f, all.map { p in (key: p.id, names: [p.name, URL(fileURLWithPath: p.path).lastPathComponent]) })
+        var hits = all.filter { ids.contains($0.id) }
         hits = hits.filter { h in !hits.contains { o in o.id != h.id && o.name.count > h.name.count && normalize(o.name).contains(normalize(h.name)) } }
         return hits
+    }
+
+    // MARK: Loose name matching
+
+    /// The candidates named in `f`, best match level only: said exactly, then said with the spaces or a letter or
+    /// two off ("aire dinamica", "solar debs"), then said in part ("seo app" for SEO Core App).
+    static func bestNames<K: Hashable>(in f: String, _ candidates: [(key: K, names: [String])]) -> [K] {
+        let said = canonical(f)
+        let words = said.split(separator: " ").map(String.init)
+        guard !words.isEmpty else { return [] }
+        var best = Int.max
+        var out: [K] = []
+        for c in candidates {
+            let levels = c.names.map(canonical).filter { !$0.isEmpty }.compactMap { matchLevel(said, words, $0) }
+            guard let l = levels.min() else { continue }
+            if l < best { best = l; out = [c.key] } else if l == best, !out.contains(c.key) { out.append(c.key) }
+        }
+        return out
+    }
+
+    /// 0 exact phrase, 1 same letters ignoring spaces, 2 a letter or two off, 3 several of its words in order,
+    /// 4 one of its words said alone. nil: not said.
+    private static func matchLevel(_ said: String, _ words: [String], _ name: String) -> Int? {
+        if SlackRouter.containsPhrase(said, name) { return 0 }
+        let compact = name.replacingOccurrences(of: " ", with: "")
+        let nameWords = name.split(separator: " ").map(String.init)
+        let span = min(words.count, max(1, nameWords.count + 2))
+        var level: Int?
+        for len in 1...span {
+            for i in 0...(words.count - len) {
+                let window = words[i..<(i + len)].joined()
+                if window == compact, compact.count >= 4 { return 1 }
+                if len == 1, genericWords.contains(window) { continue }
+                let allowed = compact.count >= 9 ? 2 : (compact.count >= 5 ? 1 : 0)
+                if allowed > 0, abs(window.count - compact.count) <= allowed, editDistance(window, compact) <= allowed { level = 2 }
+            }
+        }
+        if level != nil { return level }
+        // Part of a longer name: at least two of its words, in order, as the whole of a stretch of what was said.
+        if nameWords.count >= 3 {
+            let meaningful = words.filter { !stopwords.contains($0) }
+            if meaningful.count >= 2, isSubsequence(meaningful, of: nameWords) { return 3 }
+        }
+        // Just one distinctive word of the name, said on its own: "cambia a CRM" → CRM 4VMarketing.
+        if nameWords.count >= 2, words.count == 1, words[0].count >= 3, !genericWords.contains(words[0]),
+           !stopwords.contains(words[0]), nameWords.contains(words[0]) { return 4 }
+        return nil
+    }
+
+    /// Words commands use all the time: never taken for a slightly misheard name ("project" isn't projectN).
+    private static let genericWords: Set<String> = ["project", "proyecto", "projects", "proyectos", "space", "espacio", "workspace",
+                                                    "claude", "claudes", "codex", "cursor", "terminal", "terminales", "terminals",
+                                                    "agent", "agents", "agente", "agentes", "open", "abre", "nuevo", "nueva"]
+
+    private static let stopwords: Set<String> = ["el", "la", "los", "las", "de", "del", "a", "al", "en", "y", "the", "of", "to", "and", "in", "on"]
+
+    /// Normalized, with the spellings speech and people use interchangeably made the same.
+    static func canonical(_ s: String) -> String {
+        let swaps = ["doctor": "dr", "doctora": "dra", "senor": "sr", "senora": "sra", "and": "y"]
+        return normalize(s).split(separator: " ").map { swaps[String($0)] ?? String($0) }.joined(separator: " ")
+    }
+
+    /// True when `name` accounts for most of what was said (so a bare name counts as "open it").
+    static func coversMost(_ said: String, _ name: String) -> Bool {
+        let s = said.split(separator: " ").filter { !stopwords.contains(String($0)) }.count
+        let n = name.split(separator: " ").count
+        return s > 0 && s <= n + 1
+    }
+
+    private static func isSubsequence(_ a: [String], of b: [String]) -> Bool {
+        var i = 0
+        for w in b where i < a.count && a[i] == w { i += 1 }
+        return i == a.count
+    }
+
+    static func editDistance(_ a: String, _ b: String) -> Int {
+        let a = Array(a), b = Array(b)
+        if a.isEmpty { return b.count }
+        if b.isEmpty { return a.count }
+        var prev = Array(0...b.count)
+        for i in 1...a.count {
+            var cur = [i] + Array(repeating: 0, count: b.count)
+            for j in 1...b.count {
+                cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] == b[j - 1] ? 0 : 1))
+            }
+            prev = cur
+        }
+        return prev[b.count]
     }
 
     private static func project(in f: String, _ all: [Project]) -> Project? {
