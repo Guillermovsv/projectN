@@ -342,15 +342,26 @@ final class NVoiceController: NSObject, ObservableObject {
 
     private var assistantPrepared = false
 
+    /// The Assistant opened: build the mic engine now (in the background) so its first recording starts at once,
+    /// even when dictation is off.
+    func assistantPrewarm() {
+        useChosenMic()
+        transcriber.prewarm()
+    }
+
+    private func useChosenMic() {
+        transcriber.inputDeviceProvider = {
+            AudioDevices.resolve(NVoiceDefaults.store.string(forKey: "microphone") ?? AudioDevices.automatic)
+        }
+    }
+
     /// Starts recording for the Assistant panel. Levels go to `onLevel` instead of the dictation overlay.
     func assistantStart(onLevel: @escaping (Float) -> Void) async throws {
         guard !transcriber.isRecording, !busy else { throw TranscriberError.micUnavailable("dictation is in use") }
         if !assistantPrepared {
             // Dictation may be off: permissions, mic choice and speech models aren't set up yet.
             guard await Transcriber.requestPermissions() else { throw TranscriberError.micDenied }
-            transcriber.inputDeviceProvider = {
-                AudioDevices.resolve(NVoiceDefaults.store.string(forKey: "microphone") ?? AudioDevices.automatic)
-            }
+            useChosenMic()
             for id in profiles.activeLocaleIDs { try await transcriber.ensureModel(localeID: id) }
             assistantPrepared = true
         }
@@ -365,7 +376,8 @@ final class NVoiceController: NSObject, ObservableObject {
 
     /// Stops the Assistant's recording and returns what was said (and in which language).
     func assistantStop() async throws -> (text: String, localeID: String) {
-        defer { restoreOverlayLevels() }
+        // Before waiting for the transcript: a late restore would steal the levels of the Assistant's next recording.
+        restoreOverlayLevels()
         let r = try await transcriber.stop()
         return (r.text, r.localeID)
     }

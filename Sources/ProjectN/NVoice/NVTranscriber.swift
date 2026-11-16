@@ -264,9 +264,11 @@ final class Transcriber {
     func stop() async throws -> (text: String, duration: TimeInterval, localeID: String) {
         guard isRecording else { return ("", 0, "") }
         let duration = Date().timeIntervalSince(startDate ?? Date())
-        teardownAudio()
-        let (text, locale) = try await pipelineTask?.value ?? ("", "")
+        // Taken now: a new recording may start while this one is still being transcribed.
+        let pipeline = pipelineTask
         pipelineTask = nil
+        teardownAudio()
+        let (text, locale) = try await pipeline?.value ?? ("", "")
         return (text, duration, locale)
     }
 

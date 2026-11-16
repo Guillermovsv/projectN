@@ -8,6 +8,8 @@ final class FloatingAssistant: NSObject, NSWindowDelegate {
     static let shared = FloatingAssistant()
 
     private var window: NSPanel?
+    /// The Assistant view currently in the window (nil while it's closed).
+    private var host: NSView?
     private weak var assistant: AssistantController?
     private weak var panel: RightPanelModel?
     private var makeContent: (() -> AnyView)?
@@ -25,10 +27,12 @@ final class FloatingAssistant: NSObject, NSWindowDelegate {
         let w = window ?? makeWindow()
         window = w
         // A fresh view each time: closing removes it, so the Assistant stops listening when the window goes away.
-        if w.contentView == nil {
-            let host = NSHostingView(rootView: makeContent())
-            host.sizingOptions = []
-            w.contentView = host
+        // (Not `contentView == nil`: a new window already has an empty content view, which left the first one blank.)
+        if host == nil {
+            let h = NSHostingView(rootView: makeContent())
+            h.sizingOptions = []
+            w.contentView = h
+            host = h
         }
         w.makeKeyAndOrderFront(nil)
         assistant?.floatingVisible = true
@@ -83,7 +87,8 @@ final class FloatingAssistant: NSObject, NSWindowDelegate {
     private static let frameName = "ProjectNFloatingAssistant"
 
     func windowWillClose(_ notification: Notification) {
-        window?.contentView = nil
+        window?.contentView = NSView()
+        host = nil
         assistant?.floatingVisible = false
     }
 }

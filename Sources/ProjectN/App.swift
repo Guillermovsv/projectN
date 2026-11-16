@@ -285,11 +285,11 @@ struct AppCommands: Commands {
                 if assistant.floating {
                     if FloatingAssistant.shared.isVisible { assistant.toggleListening() } else {
                         FloatingAssistant.shared.show()
-                        if !assistant.autoListen { assistant.startListening() }
+                        assistant.startListening()
                     }
                 } else if panel.visible && panel.tab == .assistant { assistant.toggleListening() } else {
                     panel.show(.assistant)
-                    if !assistant.autoListen { assistant.startListening() }
+                    assistant.startListening()
                 }
             }
                 .keyboardShortcut("a", modifiers: [.command, .option])

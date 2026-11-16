@@ -72,13 +72,33 @@ final class AssistantController: NSObject, ObservableObject {
     /// "Which project?" asked for an agent request: the next answer picks it.
     private var pendingAgent: (agentID: UUID, instruction: String, candidates: [Project], lang: AssistantLang)?
     private var aiTask: Task<Void, Never>?
-    private var listenStart: Task<Void, Never>?
+    /// Mic operations (start, stop, cancel) run one after another, never overlapping: an old "cancel" can't close a
+    /// newer recording, and a new recording never starts while the last one is still being closed.
+    private var micQueue: Task<Void, Never>?
+    /// The Assistant's recording is running (only changed inside mic operations).
+    private var micOpen = false
+    /// Bumped whenever a listening turn starts or is abandoned: late results of an old turn are ignored.
+    private var listenGen = 0
+    /// When the current turn's mic last sent a level (nil: no audio yet).
+    private var lastLevelAt: Date?
+    /// What you said is being turned into text.
+    private var transcribing = false
+    /// Turns in a row where nothing intelligible was heard (conversation mode stops after two).
+    private var emptyTurns = 0
     private var vad = AssistantVAD()
     /// A spoken back-and-forth is going on (conversation mode keeps listening after each answer).
     private var conversation = false
     private var relisten: DispatchWorkItem?
     /// An AI answer is still being written.
     private var streaming = false
+    /// Sentences handed to the synthesizer and not finished yet. Tracked here rather than with `synth.isSpeaking`,
+    /// which can lag behind its own "finished" callback (that left the Assistant stuck on "Speaking").
+    private var queued: [ObjectIdentifier: AVSpeechUtterance] = [:]
+    private var speechCheck: DispatchWorkItem?
+    private var speechMisses = 0
+    /// Views showing the Assistant (side panel, floating window). It stops when the last one goes away.
+    private var hosts = 0
+    private let createdAt = Date()
     private var liveToken = UUID()
     private var liveSplit = AssistantAI.StreamSplitter()
     private var liveEntryID: UUID?
@@ -100,7 +120,7 @@ final class AssistantController: NSObject, ObservableObject {
         aiModel = d.string(forKey: "assistant.model") ?? "haiku"
         keepWarm = d.object(forKey: "assistant.keepWarm") as? Bool ?? true
         autoListen = d.object(forKey: "assistant.autoListen") as? Bool ?? true
-        silenceSeconds = d.object(forKey: "assistant.silence") as? Double ?? 0.8
+        silenceSeconds = d.object(forKey: "assistant.silence") as? Double ?? 1.0
         speechSpeed = d.object(forKey: "assistant.speed") as? Double ?? 1.05
         floating = d.object(forKey: "assistant.floating") as? Bool ?? false
         super.init()
@@ -119,24 +139,34 @@ final class AssistantController: NSObject, ObservableObject {
     /// Click on the orb / ⌥⌘A: start talking when it's idle; otherwise stop everything (listening, thinking, speaking).
     func toggleListening() { orb.phase == .idle ? startListening() : stopAll() }
 
-    /// The Assistant tab was opened: get the AI ready and, if wanted, start listening.
+    /// The Assistant was shown (side panel tab or floating window): get the AI and the mic ready and, if wanted,
+    /// start listening right away.
     func opened() {
-        // Not when ProjectN starts with the Assistant tab already showing: only when you open it.
-        guard Date().timeIntervalSince(Self.launchedAt) > 2 else { return }
+        hosts += 1
+        // Not when ProjectN starts with the Assistant already showing: only when you open it.
+        // (This used to compare against a lazily-created static, so it skipped the first open of every launch.)
+        guard Date().timeIntervalSince(createdAt) > 2 else { return }
         prewarm()
+        NVoiceController.shared.assistantPrewarm()
         if autoListen, orb.phase == .idle { startListening() }
     }
-    private static let launchedAt = Date()
 
-    /// The Assistant tab was closed or hidden.
-    func closed() { stopAll() }
+    /// The Assistant was hidden. Moving it between the panel and the floating window hides one view and shows the
+    /// other in no fixed order, so it only stops once no view is left.
+    func closed() {
+        hosts = max(0, hosts - 1)
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.hosts == 0 else { return }
+            self.stopAll()
+        }
+    }
 
     func stopAll() {
         conversation = false
         relisten?.cancel()
         cancelAI()
         stopSpeaking()
-        if isListening { cancelListening() }
+        endTurn()
         orb.phase = .idle
     }
 
@@ -149,77 +179,179 @@ final class AssistantController: NSObject, ObservableObject {
     func startListening(auto: Bool = false) {
         guard !isListening else { return }
         relisten?.cancel()
-        if !auto { conversation = true }
+        if !auto { conversation = true; emptyTurns = 0 }
         stopSpeaking()
         cancelAI()
+        listenGen += 1
+        let gen = listenGen
+        transcribing = false
         vad = AssistantVAD()
         vad.silenceToEnd = silenceSeconds
+        vad.giveUpAfter = auto ? 8 : 12
+        lastLevelAt = nil
         orb.phase = .listening
-        listenStart = Task { [weak self] in
+        Diagnostics.log("assistant: listening\(auto ? " (conversation)" : "")")
+        micOp { [weak self] in
+            guard let self, gen == self.listenGen else { return }
             do {
-                try await NVoiceController.shared.assistantStart { [weak self] l in self?.heard(level: l) }
+                try await NVoiceController.shared.assistantStart { [weak self] l in self?.heard(level: l, gen: gen) }
+                self.micOpen = true
             } catch {
-                guard let self else { return }
+                Diagnostics.log("assistant: mic didn't start — \(error.localizedDescription)")
+                guard gen == self.listenGen else { return }
                 self.conversation = false
                 self.orb.phase = .idle
-                self.reply(error.localizedDescription, .es, speak: false)
+                self.reply(error.localizedDescription, Self.uiLang, speak: false)
+                return
             }
+            // Abandoned while the mic was starting.
+            guard gen == self.listenGen, self.isListening else { self.closeMic(); return }
+            self.watchForAudio(gen)
+        }
+    }
+
+    /// Runs mic operations strictly in order (see `micQueue`).
+    private func micOp(_ op: @escaping @MainActor () async -> Void) {
+        let previous = micQueue
+        micQueue = Task { @MainActor in
+            await previous?.value
+            await op()
+        }
+    }
+
+    /// Inside a mic operation: closes the Assistant's recording without transcribing it.
+    private func closeMic() {
+        guard micOpen else { return }
+        micOpen = false
+        NVoiceController.shared.assistantCancel()
+    }
+
+    /// Drops the current turn: late audio, transcripts and errors from it are ignored, and the mic is closed.
+    private func endTurn() {
+        listenGen += 1
+        transcribing = false
+        micOp { [weak self] in self?.closeMic() }
+    }
+
+    /// The mic started but no audio comes in (a disconnected or silent input): say so instead of listening forever.
+    private func watchForAudio(_ gen: Int) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+            guard let self, gen == self.listenGen, self.isListening, self.lastLevelAt == nil else { return }
+            Diagnostics.log("assistant: no audio from the mic 3 s after starting")
+            self.conversation = false
+            self.cancelListening()
+            self.reply(Self.uiLang == .es ? "No me llega audio del micrófono. Revisa cuál está elegido en Ajustes › Voz."
+                                          : "No audio is coming from the microphone. Check which one is chosen in Settings › Voice.",
+                       Self.uiLang, speak: false)
         }
     }
 
     /// Mic levels while listening: drive the orb and notice when you've finished talking.
-    private func heard(level l: Float) {
-        guard isListening else { return }
+    private func heard(level l: Float, gen: Int) {
+        guard isListening, gen == listenGen else { return }
+        lastLevelAt = Date()
         orb.push(l)
         switch vad.push(l) {
         case .listening: break
         case .endOfSpeech: stopListening()
         case .nothingSaid:
+            Diagnostics.log("assistant: nothing said, stopped listening")
             conversation = false
             cancelListening()
         }
     }
 
+    /// You finished talking (pause, or a click): transcribe and answer.
     func stopListening() {
         guard isListening else { return }
         orb.phase = .thinking
-        Task { [weak self] in
-            await self?.listenStart?.value
+        transcribing = true
+        let gen = listenGen
+        micOp { [weak self] in
+            guard let self else { return }
+            guard self.micOpen else {
+                if gen == self.listenGen { self.transcribing = false; self.heardNothing() }
+                return
+            }
+            self.micOpen = false
+            let t0 = Date()
             do {
-                let r = try await NVoiceController.shared.assistantStop()
+                // Bounded: a transcript that never comes must not leave the Assistant on "Thinking".
+                let r = try await Self.within(12) { try await NVoiceController.shared.assistantStop() }
+                guard gen == self.listenGen else { return }
+                self.transcribing = false
                 let text = r.text.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard let self else { return }
-                if text.isEmpty { self.conversation = false; self.orb.phase = .idle; return }
+                Diagnostics.log(String(format: "assistant: heard %d characters (transcribed in %.1f s)", text.count, Date().timeIntervalSince(t0)))
+                if text.isEmpty { self.heardNothing(); return }
+                self.emptyTurns = 0
                 self.handle(text, localeID: r.localeID)
             } catch {
-                self?.conversation = false
-                self?.orb.phase = .idle
-                self?.reply(error.localizedDescription, .es, speak: false)
+                Diagnostics.log("assistant: transcription failed — \(error.localizedDescription)")
+                guard gen == self.listenGen else { return }
+                self.transcribing = false
+                self.conversation = false
+                self.orb.phase = .idle
+                self.reply(error.localizedDescription, Self.uiLang, speak: false)
             }
         }
+    }
+
+    /// Sound but no words (a cough, a door): in conversation mode, just listen again — twice in a row ends it.
+    private func heardNothing() {
+        emptyTurns += 1
+        if emptyTurns >= 2 { conversation = false }
+        orb.phase = .idle
+        settle()
     }
 
     func cancelListening() {
         guard isListening else { return }
         orb.phase = .idle
-        Task { [weak self] in
-            await self?.listenStart?.value
-            NVoiceController.shared.assistantCancel()
-        }
+        endTurn()
     }
 
     /// Nothing more is being said or written: idle, and in conversation mode, listen again.
     private func settle() {
-        guard !streaming, !synth.isSpeaking, !isListening else { return }
+        guard !streaming, !transcribing, !isSpeaking, !isListening else { return }
         if aiTask == nil || aiTask?.isCancelled == true || orb.phase != .thinking { orb.phase = .idle }
         guard conversation, handsFree, orb.phase == .idle else { return }
         relisten?.cancel()
         let w = DispatchWorkItem { [weak self] in
-            guard let self, self.conversation, self.orb.phase == .idle, !self.synth.isSpeaking else { return }
+            guard let self, self.conversation, self.orb.phase == .idle, !self.isSpeaking else { return }
             self.startListening(auto: true)
         }
         relisten = w
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: w)
+    }
+
+    /// The language for messages that don't come from something you said.
+    private static let uiLang: AssistantLang = Locale.preferredLanguages.first?.hasPrefix("es") == true ? .es : .en
+
+    private struct TimedOut: LocalizedError {
+        var errorDescription: String? { "The transcription took too long. Try again." }
+    }
+
+    private final class RaceFlag { var done = false; var timer: Task<Void, Never>? }
+
+    /// `op`'s result, or `TimedOut` after `seconds` even if `op` never returns.
+    private static func within<T>(_ seconds: Double, _ op: @escaping @MainActor () async throws -> T) async throws -> T {
+        let once = RaceFlag()
+        return try await withCheckedThrowingContinuation { (c: CheckedContinuation<T, Error>) in
+            once.timer = Task { @MainActor in
+                try? await Task.sleep(for: .seconds(seconds))
+                guard !Task.isCancelled, !once.done else { return }
+                once.done = true
+                c.resume(throwing: TimedOut())
+            }
+            Task { @MainActor in
+                let result: Result<T, Error>
+                do { result = .success(try await op()) } catch { result = .failure(error) }
+                guard !once.done else { return }
+                once.done = true
+                once.timer?.cancel()
+                c.resume(with: result)
+            }
+        }
     }
 
     // MARK: Requests
@@ -513,8 +645,12 @@ final class AssistantController: NSObject, ObservableObject {
                 }
                 self.streamDone(raw, token: token, lang: lang)
             } catch {
-                guard let self, self.liveToken == token, !(error is CancellationError) else { return }
+                guard let self, self.liveToken == token else { return }
+                Diagnostics.log("assistant: AI failed — \(error.localizedDescription)")
+                // Both cleared, or `settle` keeps the orb on "Thinking" forever and conversation mode never listens again.
                 self.streaming = false
+                self.aiTask = nil
+                if error is CancellationError { self.settle(); return }
                 self.reply((lang == .es ? "La IA no respondió: " : "The AI didn't answer: ") + error.localizedDescription, lang, speak: false)
             }
         }
@@ -653,18 +789,51 @@ final class AssistantController: NSObject, ObservableObject {
     func say(_ text: String, _ lang: AssistantLang) {
         let clean = AssistantCommands.spoken(text, limit: 600)
         guard !clean.isEmpty else { settle(); return }
+        if isListening {
+            // Something to report (an agent finished…) while the mic is open: the mic would hear it and take it
+            // for you. If you're mid-sentence it stays in the conversation unspoken; otherwise listen again after.
+            if vad.heardSpeech { return }
+            cancelListening()
+        }
         let u = AVSpeechUtterance(string: clean)
         u.voice = voice(lang)
         u.prefersAssistiveTechnologySettings = false
         u.rate = min(AVSpeechUtteranceMaximumSpeechRate, Float(Double(AVSpeechUtteranceDefaultSpeechRate) * speechSpeed))
         u.preUtteranceDelay = 0
         u.postUtteranceDelay = 0.05
-        if orb.phase != .listening { orb.phase = .speaking }
+        orb.phase = .speaking
+        queued[ObjectIdentifier(u)] = u
         synth.speak(u)
+        watchSpeech()
     }
 
+    private var isSpeaking: Bool { !queued.isEmpty }
+
     func stopSpeaking() {
+        queued.removeAll()
+        speechCheck?.cancel()
         if synth.isSpeaking { synth.stopSpeaking(at: .immediate) }
+    }
+
+    /// Safety net for a "finished" callback that never comes (it happens with some voices): once the synthesizer
+    /// has been silent for two checks in a row, the speech is over.
+    private func watchSpeech() {
+        speechCheck?.cancel()
+        speechMisses = 0
+        scheduleSpeechCheck()
+    }
+
+    private func scheduleSpeechCheck() {
+        let w = DispatchWorkItem { [weak self] in
+            guard let self, self.isSpeaking else { return }
+            if self.synth.isSpeaking { self.speechMisses = 0 } else { self.speechMisses += 1 }
+            guard self.speechMisses >= 2 else { self.scheduleSpeechCheck(); return }
+            Diagnostics.log("assistant: speech ended without a callback")
+            self.queued.removeAll()
+            self.finishedSpeaking()
+        }
+        speechCheck = w
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2, execute: w)
     }
 
     func clear() { log.removeAll(); lastReply = nil; pendingAgent = nil }
@@ -721,45 +890,85 @@ extension AssistantController: AVSpeechSynthesizerDelegate {
     }
 
     nonisolated func speechSynthesizer(_ s: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
-        Task { @MainActor [weak self] in self?.speechEnded() }
+        let id = ObjectIdentifier(utterance)
+        Task { @MainActor [weak self] in self?.speechEnded(id) }
     }
 
     nonisolated func speechSynthesizer(_ s: AVSpeechSynthesizer, didCancel utterance: AVSpeechUtterance) {
-        Task { @MainActor [weak self] in self?.speechEnded() }
+        let id = ObjectIdentifier(utterance)
+        Task { @MainActor [weak self] in self?.speechEnded(id) }
     }
 
-    private func speechEnded() {
-        guard !synth.isSpeaking else { return }
-        if orb.phase == .speaking { orb.phase = streaming ? .thinking : .idle }
+    /// One sentence ended. Ones dropped by `stopSpeaking` are already gone and change nothing.
+    private func speechEnded(_ id: ObjectIdentifier) {
+        guard queued.removeValue(forKey: id) != nil, queued.isEmpty else { return }
+        finishedSpeaking()
+    }
+
+    private func finishedSpeaking() {
+        speechCheck?.cancel()
+        // Between streamed sentences the answer may still be coming: back to "Thinking" until the next one.
+        if orb.phase == .speaking { orb.phase = streaming || transcribing ? .thinking : .idle }
         settle()
     }
 }
 
 /// Notices when you've finished talking, from the mic level alone (cheap: no extra audio processing).
-/// It calibrates to the room for a moment, then ends after a short silence once you've said something.
+/// It learns the room's background level first, then ends after a short silence once you've said something.
+/// Thresholds are relative to that background, so a fan or a noisy room doesn't count as speech (which used to
+/// keep it listening until the 45 s limit), and a lone click or key press doesn't either.
 struct AssistantVAD {
     enum Result: Equatable { case listening, endOfSpeech, nothingSaid }
 
     var silenceToEnd: TimeInterval = 0.9
     var giveUpAfter: TimeInterval = 7
     var maxLength: TimeInterval = 45
+    /// How long the background level is measured before speech can be detected.
+    static let calibration: TimeInterval = 0.4
     private var began: Date?
+    private var calibrating: [(level: Float, at: Date)] = []
+    private var calibrated = false
     private var floor: Float = 0
-    private var samples = 0
+    private var loudRun = 0
     private(set) var heardSpeech = false
     private var lastLoud = Date.distantPast
 
     init() {}
 
+    /// Speech starts above this…
+    private var startLevel: Float { max(0.3, floor + 0.18) }
+    /// …and goes on while above this.
+    private var keepLevel: Float { max(0.22, floor + 0.1) }
+
     mutating func push(_ level: Float, now: Date = Date()) -> Result {
         if began == nil { began = now }
         let t = now.timeIntervalSince(began!)
-        if t < 0.3 && level < 0.45 {                               // room noise
-            floor = (floor * Float(samples) + level) / Float(samples + 1); samples += 1
+        if !calibrated {
+            calibrating.append((level, now))
+            guard t >= Self.calibration else { return .listening }
+            // The quiet moments are the room: even someone who starts talking at once pauses between syllables.
+            // A low percentile, not the minimum: the first buffers of a starting mic can be pure silence.
+            let sorted = calibrating.map(\.level).sorted()
+            floor = sorted[min(sorted.count - 1, sorted.count / 5)]
+            calibrated = true
+            for s in calibrating.dropLast() { loudness(s.level, at: s.at) }
+            calibrating = []
         }
-        if level > max(0.32, min(floor, 0.3) + 0.15) { heardSpeech = true; lastLoud = now }
+        loudness(level, at: now)
         if t > maxLength { return heardSpeech ? .endOfSpeech : .nothingSaid }
         if heardSpeech { return now.timeIntervalSince(lastLoud) > silenceToEnd ? .endOfSpeech : .listening }
         return t > giveUpAfter ? .nothingSaid : .listening
+    }
+
+    private mutating func loudness(_ level: Float, at now: Date) {
+        if level > (heardSpeech ? keepLevel : startLevel) {
+            loudRun += 1
+            if loudRun >= 2 { heardSpeech = true }       // two buffers in a row (~40 ms): not a click
+            if heardSpeech { lastLoud = now }
+        } else {
+            loudRun = 0
+            // Before you speak, follow the room: down quickly, up slowly.
+            if !heardSpeech { floor += (level - floor) * (level < floor ? 0.3 : 0.02) }
+        }
     }
 }

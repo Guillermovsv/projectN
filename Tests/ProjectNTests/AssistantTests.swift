@@ -200,8 +200,42 @@ struct AssistantRealtimeTests {
     @Test func vadHandlesSpeakingRightAway() {
         var v = AssistantVAD()
         let t0 = Date()
-        #expect(v.push(0.8, now: t0) == .listening)
-        #expect(v.push(0.1, now: t0.addingTimeInterval(1.0)) == .endOfSpeech)
+        func at(_ s: Double) -> Date { t0.addingTimeInterval(s) }
+        // Talking from the first buffer, with the usual dips between syllables.
+        for (i, l) in [0.8, 0.15, 0.8, 0.75, 0.2, 0.7].enumerated() { #expect(v.push(Float(l), now: at(Double(i) * 0.06)) == .listening) }
+        #expect(v.push(0.7, now: at(0.5)) == .listening)
+        #expect(v.push(0.1, now: at(1.0)) == .listening)
+        #expect(v.push(0.1, now: at(1.5)) == .endOfSpeech)
+    }
+
+    @Test func vadIgnoresAConstantlyNoisyRoom() {
+        var v = AssistantVAD()
+        let t0 = Date()
+        // A loud fan (after the mic's first silent buffer): never speech, so it gives up instead of listening
+        // until the 45 s limit.
+        for i in 0..<150 {
+            let t = 0.03 + Double(i) * 0.05
+            let r = v.push(i == 0 ? 0 : 0.55, now: t0.addingTimeInterval(t))
+            if i != 140 { #expect(r == (i > 140 ? .nothingSaid : .listening)) }   // 140 is the 7 s mark itself
+        }
+        // Speaking over it is heard, and going back to just the fan ends the turn.
+        var w = AssistantVAD()
+        for i in 0..<10 { _ = w.push(0.55, now: t0.addingTimeInterval(Double(i) * 0.05)) }
+        #expect(w.push(0.85, now: t0.addingTimeInterval(1.0)) == .listening)
+        #expect(w.push(0.85, now: t0.addingTimeInterval(1.05)) == .listening)
+        #expect(w.heardSpeech)
+        #expect(w.push(0.55, now: t0.addingTimeInterval(1.5)) == .listening)
+        #expect(w.push(0.55, now: t0.addingTimeInterval(2.1)) == .endOfSpeech)
+    }
+
+    @Test func vadIgnoresASingleClick() {
+        var v = AssistantVAD()
+        let t0 = Date()
+        for i in 0..<10 { _ = v.push(0.05, now: t0.addingTimeInterval(Double(i) * 0.05)) }
+        _ = v.push(0.9, now: t0.addingTimeInterval(0.6))        // a key press
+        _ = v.push(0.05, now: t0.addingTimeInterval(0.65))
+        #expect(!v.heardSpeech)
+        #expect(v.push(0.05, now: t0.addingTimeInterval(2)) == .listening)
     }
 
     @Test func streamDeltaReadsClaudeChunks() {
