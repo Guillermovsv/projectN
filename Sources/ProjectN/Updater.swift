@@ -35,8 +35,8 @@ struct UpdateSource: Equatable {
     var webURL: URL { URL(string: "https://github.com/\(owner)/\(name)")! }
 }
 
-/// In-app updates, built from source: checks GitHub for commits on main newer than this build, and on
-/// request clones/pulls the repo into ~/.projectn/updates/source, runs build.sh there and stages the
+/// In-app updates, built from source: checks GitHub for commits on main newer than this build (checking only
+/// looks), and when you click "Descargar actualización" clones/pulls the repo into ~/.projectn/updates/source, runs build.sh there and stages the
 /// new app. Installing (quit → replace the app → reopen) only happens after the user confirms.
 ///
 /// Building locally means no Apple signing or notarization is needed: a locally built app carries no
@@ -88,12 +88,6 @@ final class UpdateModel: ObservableObject {
     @Published private(set) var lastRelease: Release?
     /// Show the "what's new" window.
     @Published var showWhatsNew = false
-    @Published var autoPrepare = UserDefaults.standard.bool(forKey: "updatesAutoPrepare") {
-        didSet {
-            UserDefaults.standard.set(autoPrepare, forKey: "updatesAutoPrepare")
-            if autoPrepare { maybeAutoPrepare() }
-        }
-    }
 
     let repo: UpdateSource
     /// This build's commit (short sha, without "+dirty"); nil when not running from a built app.
@@ -195,7 +189,6 @@ final class UpdateModel: ObservableObject {
             case .failure(let e):
                 checkError = e.message
             }
-            maybeAutoPrepare()
         }
     }
 
@@ -296,15 +289,7 @@ final class UpdateModel: ObservableObject {
 
     // MARK: Build
 
-    private func maybeAutoPrepare() {
-        guard autoPrepare, available, let head = remoteHead else { return }
-        switch phase {
-        case .idle: prepare()
-        case .ready(let built) where built != head: prepare()
-        default: break
-        }
-    }
-
+    /// Only when you ask ("Descargar actualización"): checking never downloads or builds anything.
     /// Fetch main into the private clone, build it and stage the new app. Runs in the background.
     func prepare() {
         guard !isBuilding, disabledReason == nil else { return }
@@ -541,7 +526,7 @@ struct UpdatesPanel: View {
     @EnvironmentObject var updates: UpdateModel
     @State private var confirmRestart = false
     @State private var showLog = false
-    @State private var showDetails = false
+    @State private var showChanges = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -553,7 +538,7 @@ struct UpdatesPanel: View {
                 }
                 .buttonStyle(.hover)
                 .disabled(updates.disabledReason != nil)
-                .help("Buscar ahora")
+                .help("Buscar actualizaciones (solo revisa; no descarga nada)")
             }
             Text("Instalada: \(AppVersion.label)")
                 .font(.caption.monospacedDigit())
@@ -564,12 +549,6 @@ struct UpdatesPanel: View {
                 Text(reason).font(.callout).foregroundStyle(.secondary)
             } else {
                 content
-                Divider()
-                Toggle("Compilar automáticamente cuando haya cambios", isOn: $updates.autoPrepare)
-                    .toggleStyle(.checkbox)
-                    .font(.caption)
-                Text("Antes de reiniciar siempre se te pide confirmación.")
-                    .font(.caption2).foregroundStyle(.tertiary)
             }
             footer
         }
@@ -581,7 +560,6 @@ struct UpdatesPanel: View {
         } message: {
             Text(restartMessage)
         }
-        .onAppear { if case .ready = updates.phase { showDetails = true } }
     }
 
     @ViewBuilder
@@ -598,7 +576,7 @@ struct UpdatesPanel: View {
                     Button("Compilar de nuevo") { updates.prepare() }.controlSize(.small)
                 }
             }
-            commitList(updates.stagedCommits)
+            changesList(updates.stagedCommits)
             Button { confirmRestart = true } label: {
                 Label("Reiniciar e instalar…", systemImage: "arrow.clockwise").frame(maxWidth: .infinity)
             }
@@ -629,19 +607,21 @@ struct UpdatesPanel: View {
             logView
 
         case .idle:
-            if updates.available {
+            if updates.available, let latest = updates.pending.first {
                 Text(updates.baseUnknown
-                     ? "Tu versión (\(updates.localCommit ?? "?")) no está en GitHub. Últimos cambios de main:"
-                     : "\(updates.pending.count) \(updates.pending.count == 1 ? "cambio nuevo" : "cambios nuevos") en main")
+                     ? "Tu versión (\(updates.localCommit ?? "?")) no está en GitHub. La más reciente de main:"
+                     : "Nueva actualización disponible")
                     .font(.callout.weight(.semibold))
-                commitList(updates.pending)
+                latestCard(latest)
                 Button { updates.prepare() } label: {
-                    Label("Descargar y compilar", systemImage: "arrow.down.circle").frame(maxWidth: .infinity)
+                    Label("Descargar actualización", systemImage: "arrow.down.circle").frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.borderedProminent)
                 .controlSize(.large)
-                Text("Se compila en segundo plano. Cuando esté lista te pedimos confirmar el reinicio.")
+                Text("Descarga la versión más reciente y la compila en segundo plano (unos minutos). Cuando esté lista te pide confirmar el reinicio para instalarla.")
                     .font(.caption2).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                if updates.pending.count > 1 { changesList(updates.pending) }
             } else if let e = updates.checkError {
                 Label(e, systemImage: "exclamationmark.triangle").font(.caption).foregroundStyle(.orange)
             } else if updates.lastChecked != nil {
@@ -667,33 +647,40 @@ struct UpdatesPanel: View {
         return m + "ProjectN se cerrará y abrirá la nueva versión. Tus espacios, terminales y conversaciones se restauran al abrir. Al abrir verás de nuevo qué cambió."
     }
 
-    /// A one-sentence summary of the update; "Ver más" expands every change with its full description.
+    /// The newest change on main: what downloading gets you (it includes every change below it).
+    private func latestCard(_ c: UpdateModel.Commit) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(c.title).font(.callout.weight(.medium)).fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 4) {
+                Text(c.short).monospaced()
+                if let d = c.date { Text("· \(d.formatted(.relative(presentation: .named)))") }
+                if updates.pending.count > 1 { Text("· incluye \(updates.pending.count) cambios") }
+            }
+            .font(.caption2).foregroundStyle(.tertiary)
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.05)))
+    }
+
+    /// Every change, collapsed; open the list, then open any change to read what it contains.
     @ViewBuilder
-    private func commitList(_ commits: [UpdateModel.Commit]) -> some View {
+    private func changesList(_ commits: [UpdateModel.Commit]) -> some View {
         if !commits.isEmpty {
-            VStack(alignment: .leading, spacing: 8) {
-                Text(UpdateModel.summary(of: commits))
-                    .font(.callout)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .textSelection(.enabled)
-                if showDetails {
-                    ScrollView {
-                        VStack(alignment: .leading, spacing: 12) {
-                            ForEach(commits) { c in CommitRow(commit: c) }
-                        }
-                        .padding(.vertical, 2)
+            DisclosureGroup(isExpanded: $showChanges) {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 6) {
+                        ForEach(commits) { ExpandableCommitRow(commit: $0) }
                     }
-                    .frame(maxHeight: 340)
-                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.vertical, 4)
                 }
-                Button {
-                    withAnimation(.easeInOut(duration: 0.15)) { showDetails.toggle() }
-                } label: {
-                    Label(showDetails ? "Ver menos" : "Ver más (\(commits.count) \(commits.count == 1 ? "cambio" : "cambios"))",
-                          systemImage: showDetails ? "chevron.up" : "chevron.down")
-                        .font(.caption)
-                }
-                .buttonStyle(.link)
+                .frame(maxHeight: 320)
+                .fixedSize(horizontal: false, vertical: true)
+            } label: {
+                Text("Qué incluye (\(commits.count) \(commits.count == 1 ? "cambio" : "cambios"))")
+                    .font(.caption.weight(.medium))
+                    .contentShape(Rectangle())
+                    .onTapGesture { withAnimation(.easeInOut(duration: 0.15)) { showChanges.toggle() } }
             }
         }
     }
@@ -724,6 +711,48 @@ struct UpdatesPanel: View {
         }
         .font(.caption2)
         .foregroundStyle(.tertiary)
+    }
+}
+
+/// One change in the Updates list: its title; open it to see the description, sha, author, date and GitHub link.
+struct ExpandableCommitRow: View {
+    let commit: UpdateModel.Commit
+    @State private var open = false
+
+    var body: some View {
+        let c = commit
+        DisclosureGroup(isExpanded: $open) {
+            VStack(alignment: .leading, spacing: 4) {
+                if !c.body.isEmpty {
+                    Text(c.body)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .textSelection(.enabled)
+                }
+                HStack(spacing: 4) {
+                    Text(c.short).monospaced()
+                    if !c.author.isEmpty { Text("· \(c.author)") }
+                    if let u = c.url {
+                        Button("Ver en GitHub") { NSWorkspace.shared.open(u) }.buttonStyle(.link)
+                    }
+                }
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.top, 2)
+        } label: {
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Text(c.title).font(.callout).fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 4)
+                if let d = c.date {
+                    Text(d.formatted(.relative(presentation: .named))).font(.caption2).foregroundStyle(.tertiary)
+                }
+            }
+            .contentShape(Rectangle())
+            .onTapGesture { withAnimation(.easeInOut(duration: 0.15)) { open.toggle() } }
+        }
     }
 }
 

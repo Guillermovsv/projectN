@@ -58,6 +58,8 @@ final class AssistantController: NSObject, ObservableObject {
     @Published var floatingVisible = false
     /// Speaking speed, 0.8…1.3 × the voice's normal rate.
     @Published var speechSpeed: Double { didSet { d.set(speechSpeed, forKey: "assistant.speed") } }
+    /// In conversation mode the mic stays open while it answers: start talking and it stops to listen to you.
+    @Published var bargeIn: Bool { didSet { d.set(bargeIn, forKey: "assistant.bargeIn") } }
 
     private let d = UserDefaults.standard
     private weak var store: Store?
@@ -107,6 +109,13 @@ final class AssistantController: NSObject, ObservableObject {
     private var suppressSpeech = false
     /// Panes the Assistant opened last: "diles a todos que…", "al último…".
     private var lastOpened: [Store.PaneRef] = []
+    /// The mic is open during an answer, only to notice you talking over it.
+    private var watchingBargeIn = false
+    private var bargeDetector = AssistantBargeIn()
+    /// Everything spoken for the current request: the start of a turn that interrupted it may still carry it (echo).
+    private var spokenTurn = ""
+    /// This turn began by interrupting an answer: what was being said, to remove from the transcript.
+    private var echoText: String?
 
     override init() {
         speakReplies = d.object(forKey: "assistant.speak") as? Bool ?? true
@@ -123,6 +132,7 @@ final class AssistantController: NSObject, ObservableObject {
         silenceSeconds = d.object(forKey: "assistant.silence") as? Double ?? 1.0
         speechSpeed = d.object(forKey: "assistant.speed") as? Double ?? 1.05
         floating = d.object(forKey: "assistant.floating") as? Bool ?? false
+        bargeIn = d.object(forKey: "assistant.bargeIn") as? Bool ?? true
         super.init()
         synth.delegate = self
     }
@@ -137,7 +147,16 @@ final class AssistantController: NSObject, ObservableObject {
     var isListening: Bool { orb.phase == .listening }
 
     /// Click on the orb / ⌥⌘A: start talking when it's idle; otherwise stop everything (listening, thinking, speaking).
-    func toggleListening() { orb.phase == .idle ? startListening() : stopAll() }
+    /// While it's answering, a click cuts the answer short and listens to you instead.
+    func toggleListening() {
+        switch orb.phase {
+        case .idle: startListening()
+        case .speaking:
+            Diagnostics.log("assistant: answer cut short (click)")
+            startListening()
+        case .listening, .thinking: stopAll(reason: "click")
+        }
+    }
 
     /// The Assistant was shown (side panel tab or floating window): get the AI and the mic ready and, if wanted,
     /// start listening right away.
@@ -157,12 +176,15 @@ final class AssistantController: NSObject, ObservableObject {
         hosts = max(0, hosts - 1)
         DispatchQueue.main.async { [weak self] in
             guard let self, self.hosts == 0 else { return }
-            self.stopAll()
+            self.stopAll(reason: "hidden")
         }
     }
 
-    func stopAll() {
+    func stopAll(reason: String? = nil) {
+        if let reason, orb.phase != .idle { Diagnostics.log("assistant: stopped (\(reason))") }
         conversation = false
+        watchingBargeIn = false
+        echoText = nil
         relisten?.cancel()
         cancelAI()
         stopSpeaking()
@@ -179,6 +201,8 @@ final class AssistantController: NSObject, ObservableObject {
     func startListening(auto: Bool = false) {
         guard !isListening else { return }
         relisten?.cancel()
+        echoText = nil
+        if watchingBargeIn { watchingBargeIn = false; endTurn() }
         if !auto { conversation = true; emptyTurns = 0 }
         stopSpeaking()
         cancelAI()
@@ -280,8 +304,14 @@ final class AssistantController: NSObject, ObservableObject {
                 let r = try await Self.within(12) { try await NVoiceController.shared.assistantStop() }
                 guard gen == self.listenGen else { return }
                 self.transcribing = false
-                let text = r.text.trimmingCharacters(in: .whitespacesAndNewlines)
-                Diagnostics.log(String(format: "assistant: heard %d characters (transcribed in %.1f s)", text.count, Date().timeIntervalSince(t0)))
+                var text = r.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                if let echo = self.echoText {
+                    self.echoText = nil
+                    let raw = text
+                    text = AssistantBargeIn.stripEcho(text, spoken: echo)
+                    if text != raw { Diagnostics.log("assistant: removed its own voice from the start of what it heard") }
+                }
+                Diagnostics.log(String(format: "assistant: heard \"%@\" (transcribed in %.1f s)", String(text.prefix(140)), Date().timeIntervalSince(t0)))
                 if text.isEmpty { self.heardNothing(); return }
                 self.emptyTurns = 0
                 self.handle(text, localeID: r.localeID)
@@ -313,6 +343,8 @@ final class AssistantController: NSObject, ObservableObject {
     /// Nothing more is being said or written: idle, and in conversation mode, listen again.
     private func settle() {
         guard !streaming, !transcribing, !isSpeaking, !isListening else { return }
+        // The answer is over: the mic that was waiting for an interruption closes (a fresh turn opens below).
+        if watchingBargeIn { watchingBargeIn = false; endTurn() }
         if aiTask == nil || aiTask?.isCancelled == true || orb.phase != .thinking { orb.phase = .idle }
         guard conversation, handsFree, orb.phase == .idle else { return }
         relisten?.cancel()
@@ -361,6 +393,7 @@ final class AssistantController: NSObject, ObservableObject {
         let text = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty, let store, let harness else { return }
         log.append(Entry(fromUser: true, text: text))
+        spokenTurn = ""
         let lang = AssistantCommands.language(text, localeID: localeID)
 
         // Answering "which project?".
@@ -389,6 +422,8 @@ final class AssistantController: NSObject, ObservableObject {
             efforts: [.claude: LaunchCatalog.claudeEfforts,
                       .codex: LaunchCatalog.efforts(for: .codex, model: nil, settings: store.settings)])
         let intent = AssistantCommands.parse(text, ctx)
+        let kind = Mirror(reflecting: intent).children.first?.label ?? "\(intent)"
+        Diagnostics.log("assistant: request → \(kind == "unknown" ? (useAI ? "AI (\(aiProvider.rawValue) \(aiModel))" : "not a command, AI is OFF") : kind)")
         if case .unknown = intent, useAI {
             askAI(text, lang: lang)
         } else {
@@ -467,7 +502,9 @@ final class AssistantController: NSObject, ObservableObject {
         case .ambiguousProject(let list):
             reply(L("¿Cuál? ", "Which one? ") + list.map(\.name).joined(separator: ", ") + "?", lang)
         case .unknown:
-            reply(L("No entendí. Di ayuda para ver lo que puedo hacer.", "I didn't get that. Say help to hear what I can do."), lang)
+            reply(useAI ? L("No entendí. Di ayuda para ver lo que puedo hacer.", "I didn't get that. Say help to hear what I can do.")
+                        : L("Eso no es un comando que conozca, y la IA del Assistant está apagada. Actívala en Ajustes, Assistant, para que pueda responder cualquier cosa.",
+                            "That's not a command I know, and the Assistant's AI is off. Turn it on in Settings, Assistant, so I can answer anything."), lang)
         }
     }
 
@@ -667,6 +704,7 @@ final class AssistantController: NSObject, ObservableObject {
         guard token == liveToken else { return }
         for s in liveSplit.finish() { speakLive(s, lang) }
         let plan = AssistantAI.parse(raw)
+        Diagnostics.log("assistant: AI answered \"\(plan.say.prefix(140))\"\(plan.actions.isEmpty ? "" : " + \(plan.actions.map(\.kind).joined(separator: ", "))")")
         if !liveSpoke, !plan.say.isEmpty { speakLive(plan.say, lang) }   // an answer that wasn't streamable (JSON)
         let said = liveEntryID.flatMap { id in log.first { $0.id == id }?.text } ?? ""
         if said.isEmpty, !plan.say.isEmpty { showLive(plan.say) }
@@ -780,6 +818,7 @@ final class AssistantController: NSObject, ObservableObject {
     // MARK: Speaking
 
     private func reply(_ text: String, _ lang: AssistantLang, speak: Bool = true) {
+        Diagnostics.log("assistant: replied \"\(text.prefix(140))\"")
         log.append(Entry(fromUser: false, text: text))
         if log.count > 80 { log.removeFirst(log.count - 80) }
         lastReply = (text, lang)
@@ -803,8 +842,58 @@ final class AssistantController: NSObject, ObservableObject {
         u.postUtteranceDelay = 0.05
         orb.phase = .speaking
         queued[ObjectIdentifier(u)] = u
+        spokenTurn += " " + clean
         synth.speak(u)
         watchSpeech()
+        watchForBargeIn()
+    }
+
+    // MARK: Interrupting
+
+    /// While it answers in a conversation, keep the mic open: talking over the answer stops it and becomes your turn.
+    private func watchForBargeIn() {
+        guard bargeIn, conversation, handsFree, !watchingBargeIn, !isListening, !transcribing else { return }
+        watchingBargeIn = true
+        bargeDetector = AssistantBargeIn()
+        listenGen += 1
+        let gen = listenGen
+        micOp { [weak self] in
+            guard let self, gen == self.listenGen, self.watchingBargeIn else { return }
+            do {
+                try await NVoiceController.shared.assistantStart { [weak self] l in self?.micLevel(l, gen: gen) }
+                self.micOpen = true
+            } catch {
+                Diagnostics.log("assistant: can't listen for interruptions — \(error.localizedDescription)")
+                if gen == self.listenGen { self.watchingBargeIn = false }
+                return
+            }
+            // The answer ended (or was stopped) while the mic was starting.
+            guard gen == self.listenGen, self.watchingBargeIn || self.isListening else { self.closeMic(); return }
+        }
+    }
+
+    private func micLevel(_ l: Float, gen: Int) {
+        guard gen == listenGen else { return }
+        guard watchingBargeIn else { heard(level: l, gen: gen); return }
+        if bargeDetector.push(l) { bargedIn() }
+    }
+
+    /// You started talking over the answer: it stops, and the recording already running becomes your turn
+    /// (so your first words aren't lost).
+    private func bargedIn() {
+        Diagnostics.log("assistant: interrupted — you talked over the answer")
+        watchingBargeIn = false
+        echoText = spokenTurn
+        relisten?.cancel()
+        stopSpeaking()
+        cancelAI()
+        conversation = true
+        emptyTurns = 0
+        vad = AssistantVAD()
+        vad.silenceToEnd = silenceSeconds
+        vad.startSpeaking(floor: bargeDetector.quiet)
+        lastLevelAt = Date()
+        orb.phase = .listening
     }
 
     private var isSpeaking: Bool { !queued.isEmpty }
@@ -935,6 +1024,16 @@ struct AssistantVAD {
 
     init() {}
 
+    /// Listening picks up mid-sentence (you interrupted an answer): already speaking, in a room at `floor`.
+    mutating func startSpeaking(floor f: Float, now: Date = Date()) {
+        began = now
+        calibrating = []
+        calibrated = true
+        floor = f
+        heardSpeech = true
+        lastLoud = now
+    }
+
     /// Speech starts above this…
     private var startLevel: Float { max(0.3, floor + 0.18) }
     /// …and goes on while above this.
@@ -970,5 +1069,53 @@ struct AssistantVAD {
             // Before you speak, follow the room: down quickly, up slowly.
             if !heardSpeech { floor += (level - floor) * (level < floor ? 0.3 : 0.02) }
         }
+    }
+}
+
+/// Notices you talking over the Assistant's answer. The mic also hears the answer itself from the speakers, so it
+/// follows that echo and only fires on something clearly louder that lasts (a word, not a cough or a click).
+/// With headphones there is no echo and any speech counts.
+struct AssistantBargeIn {
+    /// The very start of the answer is ignored: the mic may still carry the end of your last sentence.
+    static let settle: TimeInterval = 0.5
+    var minLevel: Float = 0.45
+    var margin: Float = 0.15
+    var holdFor: TimeInterval = 0.3
+    private var began: Date?
+    /// What the speakers put into the mic: follows peaks quickly, decays slowly.
+    private(set) var echo: Float = 0
+    private var loudSince: Date?
+    private var lastLoud: Date?
+    /// The quietest level seen (the room).
+    private(set) var quiet: Float = 1
+
+    init() {}
+
+    /// True once you're talking over the answer.
+    mutating func push(_ l: Float, now: Date = Date()) -> Bool {
+        if began == nil { began = now }
+        quiet = min(quiet, l)
+        let t = now.timeIntervalSince(began!)
+        if t >= Self.settle, l > max(minLevel, echo + margin) {
+            if loudSince == nil { loudSince = now }
+            lastLoud = now
+            return now.timeIntervalSince(loudSince!) >= holdFor
+        }
+        // Short dips between syllables don't restart the count.
+        if let ll = lastLoud, now.timeIntervalSince(ll) > 0.15 { loudSince = nil; lastLoud = nil }
+        if loudSince == nil { echo += (l - echo) * (l > echo ? 0.5 : 0.04) }
+        return false
+    }
+
+    /// The start of a turn that interrupted an answer may be the answer itself, heard through the speakers:
+    /// leading words that were just spoken are dropped (two or more in a row — one word like "no" may be yours).
+    static func stripEcho(_ heard: String, spoken: String) -> String {
+        func norm(_ w: Substring) -> String { String(w).folded.trimmingCharacters(in: .punctuationCharacters.union(.symbols)) }
+        let said = Set(spoken.split(whereSeparator: \.isWhitespace).map(norm).filter { !$0.isEmpty })
+        let words = heard.split(whereSeparator: \.isWhitespace)
+        var i = 0
+        while i < words.count, said.contains(norm(words[i])) { i += 1 }
+        guard i >= 2 || (i == words.count && i > 0) else { return heard }
+        return words[i...].joined(separator: " ")
     }
 }

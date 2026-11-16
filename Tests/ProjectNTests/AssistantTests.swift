@@ -228,6 +228,46 @@ struct AssistantRealtimeTests {
         #expect(w.push(0.55, now: t0.addingTimeInterval(2.1)) == .endOfSpeech)
     }
 
+    @Test func bargeInIgnoresItsOwnVoiceAndHearsYou() {
+        var b = AssistantBargeIn()
+        let t0 = Date()
+        func at(_ s: Double) -> Date { t0.addingTimeInterval(s) }
+        // The answer through the speakers: loud-ish and steady, for 3 s — never an interruption.
+        for i in 0..<60 { let r = b.push(i.isMultiple(of: 3) ? 0.5 : 0.55, now: at(Double(i) * 0.05)); #expect(!r) }
+        // A cough: loud but short.
+        do { let r = b.push(0.9, now: at(3.05)); #expect(!r) }
+        do { let r = b.push(0.55, now: at(3.3)); #expect(!r) }
+        // You talking over it, with a dip between syllables.
+        do { let r = b.push(0.85, now: at(3.5)); #expect(!r) }
+        do { let r = b.push(0.8, now: at(3.6)); #expect(!r) }
+        do { let r = b.push(0.6, now: at(3.7)); #expect(!r) }
+        do { let r = b.push(0.85, now: at(3.85)); #expect(r) }
+    }
+
+    @Test func bargeInWaitsForTheAnswerToStart() {
+        var b = AssistantBargeIn()
+        let t0 = Date()
+        // The tail of your own last sentence right when it starts answering.
+        for i in 0..<8 { let r = b.push(0.9, now: t0.addingTimeInterval(Double(i) * 0.05)); #expect(!r) }
+    }
+
+    @Test func stripEchoDropsTheAnswerFromTheStart() {
+        let spoken = "Abrí Claude en Opus como Claude 2. ¿Algo más?"
+        #expect(AssistantBargeIn.stripEcho("como Claude 2 no espera ábrelo en Codex", spoken: spoken) == "no espera ábrelo en Codex")
+        #expect(AssistantBargeIn.stripEcho("No, ábrelo en Codex", spoken: spoken) == "No, ábrelo en Codex")
+        #expect(AssistantBargeIn.stripEcho("algo más", spoken: spoken) == "")
+        #expect(AssistantBargeIn.stripEcho("detente", spoken: spoken) == "detente")
+    }
+
+    @Test func vadCanStartMidSentence() {
+        var v = AssistantVAD()
+        let t0 = Date()
+        v.startSpeaking(floor: 0.1, now: t0)
+        #expect(v.heardSpeech)
+        #expect(v.push(0.7, now: t0.addingTimeInterval(0.3)) == .listening)
+        #expect(v.push(0.1, now: t0.addingTimeInterval(1.5)) == .endOfSpeech)
+    }
+
     @Test func vadIgnoresASingleClick() {
         var v = AssistantVAD()
         let t0 = Date()
