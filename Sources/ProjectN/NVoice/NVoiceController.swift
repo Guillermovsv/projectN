@@ -338,6 +338,47 @@ final class NVoiceController: NSObject, ObservableObject {
         }
     }
 
+    // MARK: Assistant (shares the warm mic engine: no second audio engine)
+
+    private var assistantPrepared = false
+
+    /// Starts recording for the Assistant panel. Levels go to `onLevel` instead of the dictation overlay.
+    func assistantStart(onLevel: @escaping (Float) -> Void) async throws {
+        guard !transcriber.isRecording, !busy else { throw TranscriberError.micUnavailable("dictation is in use") }
+        if !assistantPrepared {
+            // Dictation may be off: permissions, mic choice and speech models aren't set up yet.
+            guard await Transcriber.requestPermissions() else { throw TranscriberError.micDenied }
+            transcriber.inputDeviceProvider = {
+                AudioDevices.resolve(NVoiceDefaults.store.string(forKey: "microphone") ?? AudioDevices.automatic)
+            }
+            for id in profiles.activeLocaleIDs { try await transcriber.ensureModel(localeID: id) }
+            assistantPrepared = true
+        }
+        transcriber.onLevel = onLevel
+        do {
+            try transcriber.start(localeIDs: profiles.activeLocaleIDs, contextualStrings: profiles.contextualStrings)
+        } catch {
+            restoreOverlayLevels()
+            throw error
+        }
+    }
+
+    /// Stops the Assistant's recording and returns what was said (and in which language).
+    func assistantStop() async throws -> (text: String, localeID: String) {
+        defer { restoreOverlayLevels() }
+        let r = try await transcriber.stop()
+        return (r.text, r.localeID)
+    }
+
+    func assistantCancel() {
+        transcriber.cancel()
+        restoreOverlayLevels()
+    }
+
+    private func restoreOverlayLevels() {
+        transcriber.onLevel = { [weak self] in self?.overlay?.model.push(level: $0) }
+    }
+
     // MARK: Dictation flow
 
     private func startDictation() {

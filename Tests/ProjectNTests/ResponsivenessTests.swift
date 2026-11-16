@@ -12,7 +12,7 @@ struct ResponsivenessTests {
 
     private func makeStore() throws -> Store {
         let home = Self.home
-        #expect(AppHome.root == home)
+        #expect(AppHome.root.standardizedFileURL.path == home.standardizedFileURL.path)
         _ = NSApplication.shared
         AppHome.bootstrap()
         var settings = AppSettings()

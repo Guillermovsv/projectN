@@ -1,14 +1,15 @@
 import AppKit
 import SwiftUI
 
-/// State of the right-hand panel (Files · Activity · Browser). Owned by the app so menu commands can drive it.
+/// State of the right-hand panel (Assistant · Files · Activity · Browser). Owned by the app so menu commands can drive it.
 @MainActor
 final class RightPanelModel: ObservableObject {
     enum Tab: String, CaseIterable, Identifiable {
-        case files, activity, browser
+        case assistant, files, activity, browser
         var id: String { rawValue }
         var label: String {
             switch self {
+            case .assistant: return "Assistant"
             case .files: return "Files"
             case .activity: return "Activity"
             case .browser: return "Browser"
@@ -16,6 +17,7 @@ final class RightPanelModel: ObservableObject {
         }
         var symbol: String {
             switch self {
+            case .assistant: return "circle.hexagongrid.circle"
             case .files: return "folder"
             case .activity: return "waveform.path.ecg"
             case .browser: return "globe"
@@ -58,6 +60,7 @@ struct RightPanelView: View {
             header
             Group {
                 switch panel.tab {
+                case .assistant: AssistantView()
                 case .files: FileTreeView()
                 case .activity: ActivityView()
                 case .browser: BrowserView(model: panel.browser)
@@ -84,7 +87,7 @@ struct RightPanelView: View {
     }
 }
 
-/// Always-visible icon rail on the window's right edge: Files · Activity · Browser.
+/// Always-visible icon rail on the window's right edge: Assistant · Files · Activity · Browser.
 /// Click an icon to open that tab; click the active one again to close the panel.
 struct RightRail: View {
     @EnvironmentObject var store: Store

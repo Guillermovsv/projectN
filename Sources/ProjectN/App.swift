@@ -33,6 +33,7 @@ struct ProjectNApp: App {
     @StateObject private var nav = NavigationModel()
     @StateObject private var agents = AgentHarness()
     @StateObject private var slack = SlackConnector()
+    @StateObject private var assistant = AssistantController()
 
     var body: some Scene {
         WindowGroup("ProjectN") {
@@ -44,6 +45,7 @@ struct ProjectNApp: App {
                 .environmentObject(nav)
                 .environmentObject(agents)
                 .environmentObject(slack)
+                .environmentObject(assistant)
                 .frame(minWidth: 960, minHeight: 600)
                 .sheet(isPresented: $nav.showAddFromGitHub) {
                     AddFromGitHubSheet()
@@ -58,6 +60,7 @@ struct ProjectNApp: App {
                     // Agent harness + Slack (Socket Mode) live only while ProjectN runs.
                     agents.attach(store)
                     slack.attach(store: store, harness: agents)
+                    assistant.attach(store: store, harness: agents, panel: panel, nav: nav)
                     usage.start(store: store)
                     updates.start()
                     NVoiceController.shared.onOpenSettings = { [weak nav, weak panel] in

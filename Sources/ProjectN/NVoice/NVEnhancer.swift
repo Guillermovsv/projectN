@@ -37,13 +37,19 @@ enum Enhancer {
     }
 
     static func enhance(_ text: String, settings s: NVoiceSettings, terms: [String] = []) async throws -> String {
-        let provider = s.provider
-        let model = s.effectiveModel
         var system = s.enhancePrompt
         if !terms.isEmpty {
             system += "\n\nThe speaker's personal dictionary. Keep these exactly as written (spelling and capitalization), never \"correct\" them: "
                 + terms.joined(separator: ", ")
         }
+        return try await complete(system: system, input: text, settings: s)
+    }
+
+    /// One-shot answer from the configured local CLI (NVoice's provider + model): no tools, no MCP, no web.
+    static func complete(system: String, input text: String, settings s: NVoiceSettings,
+                         timeout: TimeInterval = 90) async throws -> String {
+        let provider = s.provider
+        let model = s.effectiveModel
         let override = provider == .claude ? s.claudePath : s.codexPath
         return try await Task.detached(priority: .userInitiated) {
             guard let bin = locate(provider, override: override) else { throw EnhancerError.cliNotFound(provider.binaryName) }
@@ -57,7 +63,7 @@ enum Enhancer {
                     "--no-session-persistence",
                     "--strict-mcp-config",
                     "--setting-sources", "",
-                ], stdin: text, timeout: 90)
+                ], stdin: text, timeout: timeout)
             case .codex:
                 let outFile = FileManager.default.temporaryDirectory.appendingPathComponent("nvoice-\(UUID().uuidString).txt")
                 defer { try? FileManager.default.removeItem(at: outFile) }
@@ -66,8 +72,8 @@ enum Enhancer {
                             "--color", "never", "-o", outFile.path]
                 for name in codexMCPServers() { args += ["-c", "mcp_servers.\(name).enabled=false"] }
                 args.append("-")
-                let prompt = "\(system)\n\n<dictation>\n\(text)\n</dictation>"
-                let r = try run(bin, args, stdin: prompt, timeout: 120)
+                let prompt = "\(system)\n\n<input>\n\(text)\n</input>"
+                let r = try run(bin, args, stdin: prompt, timeout: timeout + 30)
                 let last = (try? String(contentsOf: outFile, encoding: .utf8)) ?? ""
                 result = (last, r.stderr + r.stdout, r.status)
             }
