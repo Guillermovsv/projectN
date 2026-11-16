@@ -46,10 +46,11 @@ enum Enhancer {
     }
 
     /// One-shot answer from the configured local CLI (NVoice's provider + model): no tools, no MCP, no web.
+    /// `provider` / `model` override NVoice's choice (the Assistant has its own).
     static func complete(system: String, input text: String, settings s: NVoiceSettings,
-                         timeout: TimeInterval = 90) async throws -> String {
-        let provider = s.provider
-        let model = s.effectiveModel
+                         timeout: TimeInterval = 90, provider: AIProvider? = nil, model: String? = nil) async throws -> String {
+        let provider = provider ?? s.provider
+        let model = model ?? s.effectiveModel
         let override = provider == .claude ? s.claudePath : s.codexPath
         return try await Task.detached(priority: .userInitiated) {
             guard let bin = locate(provider, override: override) else { throw EnhancerError.cliNotFound(provider.binaryName) }
@@ -85,6 +86,97 @@ enum Enhancer {
             }
             return out
         }.value
+    }
+
+    /// Like `complete`, but hands over the answer as it is written (`onText`, main thread, one piece at a time).
+    /// Claude streams token by token; Codex answers all at once. Cancelling the task stops the CLI.
+    static func stream(system: String, input text: String, settings s: NVoiceSettings, timeout: TimeInterval = 90,
+                       provider: AIProvider? = nil, model: String? = nil,
+                       onText: @escaping (String) -> Void) async throws -> String {
+        guard (provider ?? s.provider) == .claude else {
+            let full = try await complete(system: system, input: text, settings: s, timeout: timeout, provider: provider, model: model)
+            await MainActor.run { onText(full) }
+            return full
+        }
+        let model = model ?? s.effectiveModel, override = s.claudePath
+        let work = Task.detached(priority: .userInitiated) { () throws -> String in
+            guard let bin = locate(.claude, override: override) else { throw EnhancerError.cliNotFound("claude") }
+            return try runStreaming(bin, [
+                "-p", "--model", model, "--system-prompt", system,
+                "--tools", "", "--no-session-persistence", "--strict-mcp-config", "--setting-sources", "",
+                "--output-format", "stream-json", "--include-partial-messages", "--verbose",
+            ], stdin: text, timeout: timeout, onText: onText)
+        }
+        return try await withTaskCancellationHandler { try await work.value } onCancel: { work.cancel() }
+    }
+
+    /// Text pieces from one line of `claude -p --output-format stream-json --include-partial-messages`.
+    static func streamDelta(_ line: Substring) -> String? {
+        guard line.contains("text_delta"),
+              let obj = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+              let event = obj["event"] as? [String: Any], event["type"] as? String == "content_block_delta",
+              let delta = event["delta"] as? [String: Any], delta["type"] as? String == "text_delta" else { return nil }
+        return delta["text"] as? String
+    }
+
+    private static func runStreaming(_ path: String, _ args: [String], stdin: String, timeout: TimeInterval,
+                                     onText: @escaping (String) -> Void) throws -> String {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: path)
+        p.arguments = args
+        p.currentDirectoryURL = FileManager.default.temporaryDirectory
+        var env = ProcessInfo.processInfo.environment
+        env["PATH"] = (searchDirs + [env["PATH"] ?? ""]).joined(separator: ":")
+        env["NO_COLOR"] = "1"
+        p.environment = env
+        let outPipe = Pipe(), errPipe = Pipe(), inPipe = Pipe()
+        p.standardOutput = outPipe; p.standardError = errPipe; p.standardInput = inPipe
+
+        let lock = NSLock()
+        var buffer = Data(), full = "", errData = Data()
+        outPipe.fileHandleForReading.readabilityHandler = { h in
+            let chunk = h.availableData
+            lock.lock(); defer { lock.unlock() }
+            buffer.append(chunk)
+            while let nl = buffer.firstIndex(of: 0x0A) {
+                let line = String(decoding: buffer[buffer.startIndex..<nl], as: UTF8.self)
+                buffer.removeSubrange(buffer.startIndex...nl)
+                if let t = streamDelta(Substring(line)) {
+                    full += t
+                    DispatchQueue.main.async { onText(t) }
+                }
+            }
+        }
+        errPipe.fileHandleForReading.readabilityHandler = { h in
+            let d = h.availableData
+            lock.lock(); errData.append(d); lock.unlock()
+        }
+        try p.run()
+        inPipe.fileHandleForWriting.write(Data(stdin.utf8))
+        try? inPipe.fileHandleForWriting.close()
+
+        let deadline = Date().addingTimeInterval(timeout)
+        while p.isRunning {
+            if Task.isCancelled { p.terminate(); break }
+            if Date() > deadline { p.terminate(); throw EnhancerError.timeout }
+            Thread.sleep(forTimeInterval: 0.03)
+        }
+        p.waitUntilExit()
+        outPipe.fileHandleForReading.readabilityHandler = nil
+        errPipe.fileHandleForReading.readabilityHandler = nil
+        if Task.isCancelled { throw CancellationError() }
+        lock.lock(); defer { lock.unlock() }
+        // Whatever arrived after the last handler call.
+        buffer.append(outPipe.fileHandleForReading.readDataToEndOfFile())
+        for line in String(decoding: buffer, as: UTF8.self).split(separator: "\n") {
+            if let t = streamDelta(line) { full += t; DispatchQueue.main.async { onText(t) } }
+        }
+        let out = full.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard p.terminationStatus == 0, !out.isEmpty else {
+            let err = String(decoding: errData, as: UTF8.self).split(separator: "\n").last.map(String.init) ?? "exit code \(p.terminationStatus)"
+            throw EnhancerError.failed("claude: \(err)")
+        }
+        return out
     }
 
     /// Names of MCP servers in ~/.codex/config.toml, so we can turn them off for this one-shot call (much faster startup).

@@ -44,7 +44,7 @@ struct UpdateSource: Equatable {
 /// so macOS keeps its permissions across updates.
 @MainActor
 final class UpdateModel: ObservableObject {
-    struct Commit: Identifiable, Hashable {
+    struct Commit: Identifiable, Hashable, Codable {
         let sha: String
         let title: String
         /// The rest of the commit message (trailers like Co-Authored-By removed); may be empty.
@@ -54,6 +54,15 @@ final class UpdateModel: ObservableObject {
         let url: URL?
         var id: String { sha }
         var short: String { String(sha.prefix(7)) }
+    }
+
+    /// An installed update: what it brought, shown once when the new version opens ("Novedades").
+    struct Release: Codable, Equatable {
+        var fromVersion: String
+        var sha: String
+        var commits: [Commit]
+        var installedAt: Date
+        var shown = false
     }
 
     enum Phase: Equatable {
@@ -75,6 +84,10 @@ final class UpdateModel: ObservableObject {
     @Published private(set) var checkError: String?
     @Published private(set) var log = ""
     @Published private(set) var toolsMissing = false
+    /// The last update installed (kept so its changes can be seen again).
+    @Published private(set) var lastRelease: Release?
+    /// Show the "what's new" window.
+    @Published var showWhatsNew = false
     @Published var autoPrepare = UserDefaults.standard.bool(forKey: "updatesAutoPrepare") {
         didSet {
             UserDefaults.standard.set(autoPrepare, forKey: "updatesAutoPrepare")
@@ -92,12 +105,52 @@ final class UpdateModel: ObservableObject {
     static var sourceDir: URL { dir.appendingPathComponent("source") }
     static var stagedApp: URL { dir.appendingPathComponent("ProjectN.app") }
     static var logFile: URL { dir.appendingPathComponent("build.log") }
+    nonisolated static var releaseFile: URL { AppHome.root.appendingPathComponent("updates/last-update.json") }
 
     init() {
         let stamped = Bundle.main.object(forInfoDictionaryKey: "ProjectNRepoURL") as? String
         repo = stamped.flatMap(UpdateSource.init(url:)) ?? .fallback
         localCommit = AppVersion.commit.map { $0.replacingOccurrences(of: "+dirty", with: "") }.flatMap { $0.isEmpty || $0 == "unknown" ? nil : $0 }
         restoreStaged()
+        lastRelease = Self.loadRelease()
+    }
+
+    /// The commits the staged (or about to be built) app brings, newest first. Main may have moved on since it
+    /// was built: newer commits aren't in it.
+    var stagedCommits: [Commit] {
+        guard case .ready(let sha) = phase,
+              let i = pending.firstIndex(where: { sha.hasPrefix($0.sha) || $0.sha.hasPrefix(sha) }) else { return pending }
+        return Array(pending[i...])
+    }
+
+    nonisolated static func loadRelease(from url: URL = releaseFile) -> Release? {
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        let dec = JSONDecoder()
+        dec.dateDecodingStrategy = .iso8601
+        return try? dec.decode(Release.self, from: data)
+    }
+
+    nonisolated static func saveRelease(_ r: Release, to url: URL = releaseFile) {
+        let enc = JSONEncoder()
+        enc.dateEncodingStrategy = .iso8601
+        enc.outputFormatting = [.prettyPrinted, .sortedKeys]
+        try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? enc.encode(r).write(to: url, options: .atomic)
+    }
+
+    /// Whether this launch is the first one of a just-installed update (its build is the release's commit).
+    nonisolated static func isFirstLaunch(of r: Release, running local: String?) -> Bool {
+        guard !r.shown, let local, !local.isEmpty else { return false }
+        return r.sha.hasPrefix(local) || local.hasPrefix(r.sha)
+    }
+
+    /// First launch after an update: show what changed, once.
+    private func showWhatsNewIfJustUpdated() {
+        guard var r = lastRelease, Self.isFirstLaunch(of: r, running: localCommit) else { return }
+        r.shown = true
+        Self.saveRelease(r)
+        lastRelease = r
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in self?.showWhatsNew = true }
     }
 
     var available: Bool { !pending.isEmpty }
@@ -114,6 +167,7 @@ final class UpdateModel: ObservableObject {
 
     func start() {
         guard timer == nil, disabledReason == nil, !AppHome.isTestProcess else { return }
+        showWhatsNewIfJustUpdated()
         DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in self?.checkNow() }
         let t = Timer(timeInterval: Self.checkInterval, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.checkNow() }
@@ -377,7 +431,7 @@ final class UpdateModel: ObservableObject {
 
     /// Quit (everything is saved and restored on launch), replace the app with the staged one, reopen it.
     func installAndRelaunch() {
-        guard case .ready = phase, FileManager.default.fileExists(atPath: Self.stagedApp.path) else { return }
+        guard case .ready(let sha) = phase, FileManager.default.fileExists(atPath: Self.stagedApp.path) else { return }
         let current = Bundle.main.bundleURL
         let dest = current.pathExtension == "app" ? current : URL(fileURLWithPath: "/Applications/ProjectN.app")
         let script = Self.dir.appendingPathComponent("install.sh")
@@ -407,6 +461,8 @@ final class UpdateModel: ObservableObject {
             return
         }
         UserDefaults.standard.removeObject(forKey: "updatesStagedSHA")
+        // Remember what this update brings, to show it when the new version opens.
+        Self.saveRelease(Release(fromVersion: AppVersion.label, sha: sha, commits: stagedCommits, installedAt: Date()))
         NSApp.terminate(nil)
     }
 
@@ -523,8 +579,9 @@ struct UpdatesPanel: View {
             Button("Reiniciar e instalar") { updates.installAndRelaunch() }
             Button("Cancelar", role: .cancel) {}
         } message: {
-            Text("ProjectN se cerrará y abrirá la nueva versión. Tus espacios, terminales y conversaciones se restauran al abrir.")
+            Text(restartMessage)
         }
+        .onAppear { if case .ready = updates.phase { showDetails = true } }
     }
 
     @ViewBuilder
@@ -541,7 +598,7 @@ struct UpdatesPanel: View {
                     Button("Compilar de nuevo") { updates.prepare() }.controlSize(.small)
                 }
             }
-            commitList
+            commitList(updates.stagedCommits)
             Button { confirmRestart = true } label: {
                 Label("Reiniciar e instalar…", systemImage: "arrow.clockwise").frame(maxWidth: .infinity)
             }
@@ -577,7 +634,7 @@ struct UpdatesPanel: View {
                      ? "Tu versión (\(updates.localCommit ?? "?")) no está en GitHub. Últimos cambios de main:"
                      : "\(updates.pending.count) \(updates.pending.count == 1 ? "cambio nuevo" : "cambios nuevos") en main")
                     .font(.callout.weight(.semibold))
-                commitList
+                commitList(updates.pending)
                 Button { updates.prepare() } label: {
                     Label("Descargar y compilar", systemImage: "arrow.down.circle").frame(maxWidth: .infinity)
                 }
@@ -589,25 +646,40 @@ struct UpdatesPanel: View {
                 Label(e, systemImage: "exclamationmark.triangle").font(.caption).foregroundStyle(.orange)
             } else if updates.lastChecked != nil {
                 Label("Estás al día", systemImage: "checkmark.circle").font(.callout).foregroundStyle(.secondary)
+                if updates.lastRelease != nil {
+                    Button("Ver qué cambió en la última actualización") { updates.showWhatsNew = true }
+                        .buttonStyle(.link).font(.caption)
+                }
             } else {
                 Text("Buscando actualizaciones…").font(.callout).foregroundStyle(.secondary)
             }
         }
     }
 
+    private var restartMessage: String {
+        let commits = updates.stagedCommits
+        var m = ""
+        if !commits.isEmpty {
+            m = "Esta versión trae \(commits.count) \(commits.count == 1 ? "cambio" : "cambios"):\n"
+                + commits.prefix(8).map { "• \($0.title)" }.joined(separator: "\n")
+                + (commits.count > 8 ? "\n• y \(commits.count - 8) más…" : "") + "\n\n"
+        }
+        return m + "ProjectN se cerrará y abrirá la nueva versión. Tus espacios, terminales y conversaciones se restauran al abrir. Al abrir verás de nuevo qué cambió."
+    }
+
     /// A one-sentence summary of the update; "Ver más" expands every change with its full description.
     @ViewBuilder
-    private var commitList: some View {
-        if !updates.pending.isEmpty {
+    private func commitList(_ commits: [UpdateModel.Commit]) -> some View {
+        if !commits.isEmpty {
             VStack(alignment: .leading, spacing: 8) {
-                Text(UpdateModel.summary(of: updates.pending))
+                Text(UpdateModel.summary(of: commits))
                     .font(.callout)
                     .fixedSize(horizontal: false, vertical: true)
                     .textSelection(.enabled)
                 if showDetails {
                     ScrollView {
                         VStack(alignment: .leading, spacing: 12) {
-                            ForEach(updates.pending) { c in commitRow(c) }
+                            ForEach(commits) { c in CommitRow(commit: c) }
                         }
                         .padding(.vertical, 2)
                     }
@@ -617,38 +689,13 @@ struct UpdatesPanel: View {
                 Button {
                     withAnimation(.easeInOut(duration: 0.15)) { showDetails.toggle() }
                 } label: {
-                    Label(showDetails ? "Ver menos" : "Ver más (\(updates.pending.count) \(updates.pending.count == 1 ? "cambio" : "cambios"))",
+                    Label(showDetails ? "Ver menos" : "Ver más (\(commits.count) \(commits.count == 1 ? "cambio" : "cambios"))",
                           systemImage: showDetails ? "chevron.up" : "chevron.down")
                         .font(.caption)
                 }
                 .buttonStyle(.link)
             }
         }
-    }
-
-    private func commitRow(_ c: UpdateModel.Commit) -> some View {
-        VStack(alignment: .leading, spacing: 3) {
-            Text(c.title).font(.callout.weight(.medium))
-                .fixedSize(horizontal: false, vertical: true)
-            if !c.body.isEmpty {
-                Text(c.body)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .textSelection(.enabled)
-            }
-            HStack(spacing: 4) {
-                Text(c.short).monospaced()
-                if !c.author.isEmpty { Text("· \(c.author)") }
-                if let d = c.date { Text("· \(d.formatted(.relative(presentation: .named)))") }
-                if let u = c.url {
-                    Button("Ver en GitHub") { NSWorkspace.shared.open(u) }.buttonStyle(.link)
-                }
-            }
-            .font(.caption2)
-            .foregroundStyle(.tertiary)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private var logView: some View {
@@ -677,5 +724,88 @@ struct UpdatesPanel: View {
         }
         .font(.caption2)
         .foregroundStyle(.tertiary)
+    }
+}
+
+/// One change: title, description, sha · author · date · GitHub link.
+struct CommitRow: View {
+    let commit: UpdateModel.Commit
+
+    var body: some View {
+        let c = commit
+        return VStack(alignment: .leading, spacing: 3) {
+            Text(c.title).font(.callout.weight(.medium))
+                .fixedSize(horizontal: false, vertical: true)
+            if !c.body.isEmpty {
+                Text(c.body)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+            }
+            HStack(spacing: 4) {
+                Text(c.short).monospaced()
+                if !c.author.isEmpty { Text("· \(c.author)") }
+                if let d = c.date { Text("· \(d.formatted(.relative(presentation: .named)))") }
+                if let u = c.url {
+                    Button("Ver en GitHub") { NSWorkspace.shared.open(u) }.buttonStyle(.link)
+                }
+            }
+            .font(.caption2)
+            .foregroundStyle(.tertiary)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+}
+
+/// Shown once when an update opens: what changed since the previous version.
+struct WhatsNewView: View {
+    @EnvironmentObject var updates: UpdateModel
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 12) {
+                Image(systemName: "sparkles")
+                    .font(.title2)
+                    .foregroundStyle(Color.appAccent)
+                    .frame(width: 40, height: 40)
+                    .background(RoundedRectangle(cornerRadius: 10).fill(Color.appAccent.opacity(0.14)))
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("ProjectN se actualizó").font(.title3.weight(.semibold))
+                    Text("Ahora: \(AppVersion.label)").font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                    if let r = updates.lastRelease {
+                        Text("Antes: \(r.fromVersion) · instalada \(r.installedAt.formatted(.relative(presentation: .named)))")
+                            .font(.caption.monospacedDigit()).foregroundStyle(.tertiary)
+                    }
+                }
+            }
+            if let r = updates.lastRelease, !r.commits.isEmpty {
+                Text(UpdateModel.summary(of: r.commits))
+                    .font(.callout)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+                Divider()
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 14) {
+                        ForEach(r.commits) { CommitRow(commit: $0) }
+                    }
+                    .padding(.vertical, 2)
+                }
+                .frame(maxHeight: 420)
+            } else {
+                Text("No hay detalle de cambios para esta actualización.").font(.callout).foregroundStyle(.secondary)
+            }
+            HStack {
+                Button(updates.repo.slug) { NSWorkspace.shared.open(updates.repo.webURL) }.buttonStyle(.link).font(.caption)
+                Spacer()
+                Button("Listo") { dismiss() }
+                    .keyboardShortcut(.defaultAction)
+                    .buttonStyle(.borderedProminent)
+            }
+        }
+        .padding(20)
+        .frame(width: 520)
     }
 }

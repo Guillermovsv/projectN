@@ -21,7 +21,7 @@ final class AssistantController: NSObject, ObservableObject {
     struct Entry: Identifiable, Equatable {
         let id = UUID()
         let fromUser: Bool
-        let text: String
+        var text: String
     }
 
     let orb = AssistantOrbModel()
@@ -33,6 +33,27 @@ final class AssistantController: NSObject, ObservableObject {
     @Published var enhanceRequests: Bool { didSet { d.set(enhanceRequests, forKey: "assistant.enhance") } }
     /// Finished agent results are summarized by the AI before being read (otherwise: trimmed locally).
     @Published var aiSummaries: Bool { didSet { d.set(aiSummaries, forKey: "assistant.summaries") } }
+    /// Conversation mode: after answering, listen again on its own (ends after a few quiet seconds or "gracias").
+    @Published var handsFree: Bool { didSet { d.set(handsFree, forKey: "assistant.handsFree") } }
+    /// Chosen voice per language (identifier; empty = the most natural one installed).
+    @Published var voiceES: String { didSet { d.set(voiceES, forKey: "assistant.voice.es") } }
+    @Published var voiceEN: String { didSet { d.set(voiceEN, forKey: "assistant.voice.en") } }
+    /// The Assistant's own AI (independent of NVoice's): Claude Haiku answers fastest.
+    @Published var aiProvider: AIProvider {
+        didSet {
+            d.set(aiProvider.rawValue, forKey: "assistant.provider")
+            if !aiProvider.models.contains(aiModel) { aiModel = aiProvider == .claude ? "haiku" : aiProvider.models[0] }
+        }
+    }
+    @Published var aiModel: String { didSet { d.set(aiModel, forKey: "assistant.model") } }
+    /// Keep a Claude session open while the Assistant is in use (answers start ~3 s sooner).
+    @Published var keepWarm: Bool { didSet { d.set(keepWarm, forKey: "assistant.keepWarm"); if !keepWarm { AssistantBrain.shared.shutdown() } } }
+    /// Opening the Assistant starts listening right away.
+    @Published var autoListen: Bool { didSet { d.set(autoListen, forKey: "assistant.autoListen") } }
+    /// Pause (seconds) that means you've finished talking.
+    @Published var silenceSeconds: Double { didSet { d.set(silenceSeconds, forKey: "assistant.silence") } }
+    /// Speaking speed, 0.8…1.3 × the voice's normal rate.
+    @Published var speechSpeed: Double { didSet { d.set(speechSpeed, forKey: "assistant.speed") } }
 
     private let d = UserDefaults.standard
     private weak var store: Store?
@@ -40,7 +61,7 @@ final class AssistantController: NSObject, ObservableObject {
     private weak var panel: RightPanelModel?
     private weak var nav: NavigationModel?
     private let synth = AVSpeechSynthesizer()
-    private var voices: [AssistantLang: AVSpeechSynthesisVoice] = [:]
+    private var voiceLists: [AssistantLang: [AVSpeechSynthesisVoice]] = [:]
     /// Tasks started from here, and the language to report them in.
     private var watched: [UUID: AssistantLang] = [:]
     private var lastReply: (text: String, lang: AssistantLang)?
@@ -48,12 +69,33 @@ final class AssistantController: NSObject, ObservableObject {
     private var pendingAgent: (agentID: UUID, instruction: String, candidates: [Project], lang: AssistantLang)?
     private var aiTask: Task<Void, Never>?
     private var listenStart: Task<Void, Never>?
+    private var vad = AssistantVAD()
+    /// A spoken back-and-forth is going on (conversation mode keeps listening after each answer).
+    private var conversation = false
+    private var relisten: DispatchWorkItem?
+    /// An AI answer is still being written.
+    private var streaming = false
+    private var liveToken = UUID()
+    private var liveSplit = AssistantAI.StreamSplitter()
+    private var liveEntryID: UUID?
+    private var liveSpoke = false
+    /// Confirmations of actions the AI already announced aren't spoken again.
+    private var suppressSpeech = false
 
     override init() {
         speakReplies = d.object(forKey: "assistant.speak") as? Bool ?? true
         useAI = d.object(forKey: "assistant.ai") as? Bool ?? true
         enhanceRequests = d.object(forKey: "assistant.enhance") as? Bool ?? false
         aiSummaries = d.object(forKey: "assistant.summaries") as? Bool ?? true
+        handsFree = d.object(forKey: "assistant.handsFree") as? Bool ?? true
+        voiceES = d.string(forKey: "assistant.voice.es") ?? ""
+        voiceEN = d.string(forKey: "assistant.voice.en") ?? ""
+        aiProvider = AIProvider(rawValue: d.string(forKey: "assistant.provider") ?? "") ?? .claude
+        aiModel = d.string(forKey: "assistant.model") ?? "haiku"
+        keepWarm = d.object(forKey: "assistant.keepWarm") as? Bool ?? true
+        autoListen = d.object(forKey: "assistant.autoListen") as? Bool ?? true
+        silenceSeconds = d.object(forKey: "assistant.silence") as? Double ?? 0.8
+        speechSpeed = d.object(forKey: "assistant.speed") as? Double ?? 1.05
         super.init()
         synth.delegate = self
     }
@@ -67,21 +109,67 @@ final class AssistantController: NSObject, ObservableObject {
 
     var isListening: Bool { orb.phase == .listening }
 
-    func toggleListening() { isListening ? stopListening() : startListening() }
+    /// Click on the orb / ⌥⌘A: start talking when it's idle; otherwise stop everything (listening, thinking, speaking).
+    func toggleListening() { orb.phase == .idle ? startListening() : stopAll() }
 
-    func startListening() {
-        guard !isListening else { return }
+    /// The Assistant tab was opened: get the AI ready and, if wanted, start listening.
+    func opened() {
+        // Not when ProjectN starts with the Assistant tab already showing: only when you open it.
+        guard Date().timeIntervalSince(Self.launchedAt) > 2 else { return }
+        prewarm()
+        if autoListen, orb.phase == .idle { startListening() }
+    }
+    private static let launchedAt = Date()
+
+    /// The Assistant tab was closed or hidden.
+    func closed() { stopAll() }
+
+    func stopAll() {
+        conversation = false
+        relisten?.cancel()
+        cancelAI()
         stopSpeaking()
-        aiTask?.cancel()
+        if isListening { cancelListening() }
+        orb.phase = .idle
+    }
+
+    func prewarm() {
+        guard useAI, keepWarm, aiProvider == .claude else { return }
+        AssistantBrain.shared.prewarm(model: aiModel, system: AssistantAI.systemPrompt())
+    }
+
+    /// `auto`: conversation mode opening the mic again after an answer.
+    func startListening(auto: Bool = false) {
+        guard !isListening else { return }
+        relisten?.cancel()
+        if !auto { conversation = true }
+        stopSpeaking()
+        cancelAI()
+        vad = AssistantVAD()
+        vad.silenceToEnd = silenceSeconds
         orb.phase = .listening
         listenStart = Task { [weak self] in
             do {
-                try await NVoiceController.shared.assistantStart { [weak self] l in self?.orb.push(l) }
+                try await NVoiceController.shared.assistantStart { [weak self] l in self?.heard(level: l) }
             } catch {
                 guard let self else { return }
+                self.conversation = false
                 self.orb.phase = .idle
                 self.reply(error.localizedDescription, .es, speak: false)
             }
+        }
+    }
+
+    /// Mic levels while listening: drive the orb and notice when you've finished talking.
+    private func heard(level l: Float) {
+        guard isListening else { return }
+        orb.push(l)
+        switch vad.push(l) {
+        case .listening: break
+        case .endOfSpeech: stopListening()
+        case .nothingSaid:
+            conversation = false
+            cancelListening()
         }
     }
 
@@ -94,9 +182,10 @@ final class AssistantController: NSObject, ObservableObject {
                 let r = try await NVoiceController.shared.assistantStop()
                 let text = r.text.trimmingCharacters(in: .whitespacesAndNewlines)
                 guard let self else { return }
-                if text.isEmpty { self.orb.phase = .idle; return }
+                if text.isEmpty { self.conversation = false; self.orb.phase = .idle; return }
                 self.handle(text, localeID: r.localeID)
             } catch {
+                self?.conversation = false
                 self?.orb.phase = .idle
                 self?.reply(error.localizedDescription, .es, speak: false)
             }
@@ -105,8 +194,25 @@ final class AssistantController: NSObject, ObservableObject {
 
     func cancelListening() {
         guard isListening else { return }
-        NVoiceController.shared.assistantCancel()
         orb.phase = .idle
+        Task { [weak self] in
+            await self?.listenStart?.value
+            NVoiceController.shared.assistantCancel()
+        }
+    }
+
+    /// Nothing more is being said or written: idle, and in conversation mode, listen again.
+    private func settle() {
+        guard !streaming, !synth.isSpeaking, !isListening else { return }
+        if aiTask == nil || aiTask?.isCancelled == true || orb.phase != .thinking { orb.phase = .idle }
+        guard conversation, handsFree, orb.phase == .idle else { return }
+        relisten?.cancel()
+        let w = DispatchWorkItem { [weak self] in
+            guard let self, self.conversation, self.orb.phase == .idle, !self.synth.isSpeaking else { return }
+            self.startListening(auto: true)
+        }
+        relisten = w
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: w)
     }
 
     // MARK: Requests
@@ -145,7 +251,11 @@ final class AssistantController: NSObject, ObservableObject {
 
         switch intent {
         case .stopSpeaking:
+            conversation = false
             stopSpeaking(); orb.phase = .idle
+        case .endConversation:
+            conversation = false
+            reply(L("De nada.", "You're welcome."), lang)
         case .repeatLast:
             if let r = lastReply { say(r.text, r.lang) } else { reply(L("Aún no he dicho nada.", "I haven't said anything yet."), lang) }
         case .help:
@@ -253,8 +363,11 @@ final class AssistantController: NSObject, ObservableObject {
         guard enhanceRequests else { go(instruction); return }
         orb.phase = .thinking
         aiTask = Task { [weak self] in
-            let better = (try? await Enhancer.enhance(instruction, settings: NVoiceSettings.shared)) ?? instruction
+            let s = NVoiceSettings.shared
+            let better = (try? await Enhancer.complete(system: s.enhancePrompt, input: instruction, settings: s, timeout: 45,
+                                                       provider: self?.aiProvider, model: self?.aiModel)) ?? instruction
             guard !Task.isCancelled else { return }
+            self?.aiTask = nil
             go(better)
         }
     }
@@ -282,7 +395,8 @@ final class AssistantController: NSObject, ObservableObject {
                 Summarize this coding agent's report so it can be read aloud: 1–2 short sentences in \(lang == .es ? "Spanish" : "English"), \
                 what was done and anything the user must do. No markdown, code, file paths or URLs. Reply with the summary only.
                 """
-                let s = (try? await Enhancer.complete(system: system, input: result, settings: NVoiceSettings.shared, timeout: 45))
+                let s = (try? await Enhancer.complete(system: system, input: result, settings: NVoiceSettings.shared, timeout: 45,
+                                                      provider: self?.aiProvider, model: self?.aiModel))
                 self?.reply(head + (s.map { AssistantCommands.spoken($0) } ?? AssistantCommands.spoken(result)), lang)
             }
         default:
@@ -292,26 +406,83 @@ final class AssistantController: NSObject, ObservableObject {
 
     // MARK: AI fallback
 
+    private func cancelAI() {
+        aiTask?.cancel()
+        aiTask = nil
+        liveToken = UUID()
+        streaming = false
+    }
+
+    /// Asks the AI and speaks its answer sentence by sentence while it's still being written.
     private func askAI(_ text: String, lang: AssistantLang) {
+        cancelAI()
         orb.phase = .thinking
-        let system = AssistantAI.systemPrompt(lang: lang)
+        let system = AssistantAI.systemPrompt()
         let input = AssistantAI.snapshot(store: store, harness: harness, panel: panel)
             + "\n\nRecent conversation:\n" + log.suffix(7).dropLast().map { ($0.fromUser ? "User: " : "Assistant: ") + $0.text }.joined(separator: "\n")
             + "\n\nUser request: \(text)"
-        aiTask?.cancel()
+        let token = UUID()
+        liveToken = token
+        liveSplit = AssistantAI.StreamSplitter()
+        liveEntryID = nil
+        liveSpoke = false
+        streaming = true
         aiTask = Task { [weak self] in
             do {
-                let raw = try await Enhancer.complete(system: system, input: input, settings: NVoiceSettings.shared, timeout: 60)
-                guard !Task.isCancelled, let self else { return }
-                let plan = AssistantAI.parse(raw)
-                if !plan.say.isEmpty { self.reply(plan.say, lang) }
-                for a in plan.actions { self.runAction(a, lang: lang, quiet: !plan.say.isEmpty) }
-                if plan.say.isEmpty && plan.actions.isEmpty { self.orb.phase = .idle }
+                guard let self else { return }
+                let onText: (String) -> Void = { [weak self] piece in self?.streamed(piece, token: token, lang: lang) }
+                let raw: String
+                if self.aiProvider == .claude && self.keepWarm {
+                    raw = try await AssistantBrain.shared.ask(input, model: self.aiModel, system: system, onText: onText)
+                } else {
+                    raw = try await Enhancer.stream(system: system, input: input, settings: NVoiceSettings.shared, timeout: 60,
+                                                    provider: self.aiProvider, model: self.aiModel, onText: onText)
+                }
+                self.streamDone(raw, token: token, lang: lang)
             } catch {
-                guard !Task.isCancelled else { return }
-                self?.reply((lang == .es ? "La IA no respondió: " : "The AI didn't answer: ") + error.localizedDescription, lang, speak: false)
+                guard let self, self.liveToken == token, !(error is CancellationError) else { return }
+                self.streaming = false
+                self.reply((lang == .es ? "La IA no respondió: " : "The AI didn't answer: ") + error.localizedDescription, lang, speak: false)
             }
         }
+    }
+
+    private func streamed(_ piece: String, token: UUID, lang: AssistantLang) {
+        guard token == liveToken else { return }
+        let sentences = liveSplit.feed(piece)
+        showLive(liveSplit.speakable)
+        for s in sentences { speakLive(s, lang) }
+    }
+
+    private func streamDone(_ raw: String, token: UUID, lang: AssistantLang) {
+        guard token == liveToken else { return }
+        for s in liveSplit.finish() { speakLive(s, lang) }
+        let plan = AssistantAI.parse(raw)
+        if !liveSpoke, !plan.say.isEmpty { speakLive(plan.say, lang) }   // an answer that wasn't streamable (JSON)
+        let said = liveEntryID.flatMap { id in log.first { $0.id == id }?.text } ?? ""
+        if said.isEmpty, !plan.say.isEmpty { showLive(plan.say) }
+        lastReply = (said.isEmpty ? plan.say : said, lang)
+        streaming = false
+        aiTask = nil
+        for a in plan.actions { runAction(a, lang: lang, quiet: liveSpoke) }
+        settle()
+    }
+
+    private func showLive(_ text: String) {
+        let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !t.isEmpty else { return }
+        if let id = liveEntryID, let i = log.firstIndex(where: { $0.id == id }) {
+            log[i].text = t
+        } else {
+            let e = Entry(fromUser: false, text: t)
+            liveEntryID = e.id
+            log.append(e)
+        }
+    }
+
+    private func speakLive(_ sentence: String, _ lang: AssistantLang) {
+        liveSpoke = true
+        if speakReplies { say(sentence, lang) }
     }
 
     /// Runs one action the AI chose. With `quiet`, the AI already said what it's doing: confirmations aren't spoken.
@@ -330,16 +501,17 @@ final class AssistantController: NSObject, ObservableObject {
         case "cancel_agent": intent = agent.map { .cancelAgent(id: $0.id, name: $0.name) }
         case "ask_agent":
             if let agent, let ins = a.instruction, !ins.isEmpty {
+                suppressSpeech = quiet
                 routeAgent(agent.id, instruction: ins, lang: lang, projectName: project?.name)
+                suppressSpeech = false
             }
             return
         default: intent = nil
         }
         guard let intent else { return }
-        let wasMuted = speakReplies
-        if quiet { speakReplies = false }
+        suppressSpeech = quiet
         perform(intent, lang: lang)
-        if quiet { speakReplies = wasMuted }
+        suppressSpeech = false
     }
 
     // MARK: Status text
@@ -378,13 +550,18 @@ final class AssistantController: NSObject, ObservableObject {
         log.append(Entry(fromUser: false, text: text))
         if log.count > 80 { log.removeFirst(log.count - 80) }
         lastReply = (text, lang)
-        if speak && speakReplies { say(text, lang) } else if orb.phase != .listening { orb.phase = .idle }
+        if speak && speakReplies && !suppressSpeech { say(text, lang) } else { settle() }
     }
 
     func say(_ text: String, _ lang: AssistantLang) {
-        let u = AVSpeechUtterance(string: AssistantCommands.spoken(text, limit: 600))
+        let clean = AssistantCommands.spoken(text, limit: 600)
+        guard !clean.isEmpty else { settle(); return }
+        let u = AVSpeechUtterance(string: clean)
         u.voice = voice(lang)
         u.prefersAssistiveTechnologySettings = false
+        u.rate = min(AVSpeechUtteranceMaximumSpeechRate, Float(Double(AVSpeechUtteranceDefaultSpeechRate) * speechSpeed))
+        u.preUtteranceDelay = 0
+        u.postUtteranceDelay = 0.05
         if orb.phase != .listening { orb.phase = .speaking }
         synth.speak(u)
     }
@@ -395,15 +572,48 @@ final class AssistantController: NSObject, ObservableObject {
 
     func clear() { log.removeAll(); lastReply = nil; pendingAgent = nil }
 
-    /// The best installed voice for the language (Premium › Enhanced › default).
-    private func voice(_ lang: AssistantLang) -> AVSpeechSynthesisVoice? {
-        if let v = voices[lang] { return v }
-        let all = AVSpeechSynthesisVoice.speechVoices().filter { $0.language.hasPrefix(lang.rawValue) }
-        let v = all.max { $0.quality.rawValue < $1.quality.rawValue }
-            ?? AVSpeechSynthesisVoice(language: lang == .es ? "es-MX" : "en-US")
-        voices[lang] = v
-        return v
+    // MARK: Voices
+
+    /// Installed voices for the language, most natural first (Siri › Premium › Enhanced › regular; novelty last).
+    func availableVoices(_ lang: AssistantLang) -> [AVSpeechSynthesisVoice] {
+        if let l = voiceLists[lang] { return l }
+        let l = AVSpeechSynthesisVoice.speechVoices()
+            .filter { $0.language.hasPrefix(lang.rawValue) }
+            .sorted { Self.naturalness($0) > Self.naturalness($1) }
+        voiceLists[lang] = l
+        return l
     }
+
+    static func naturalness(_ v: AVSpeechSynthesisVoice) -> Int {
+        let id = v.identifier.lowercased()
+        var score = v.quality.rawValue * 10                        // default 1, enhanced 2, premium 3
+        if id.contains("siri") { score += 25 }
+        if v.voiceTraits.contains(.isPersonalVoice) { score += 5 }
+        if id.contains("super-compact") { score -= 3 }
+        if id.contains("eloquence") { score -= 15 }               // Eddy, Flo, Grandma…: robotic
+        if id.contains("speech.synthesis.voice") || v.voiceTraits.contains(.isNoveltyVoice) { score -= 30 }
+        if v.language == "es-MX" || v.language == "en-US" { score += 1 }
+        return score
+    }
+
+    private func voice(_ lang: AssistantLang) -> AVSpeechSynthesisVoice? {
+        let chosen = lang == .es ? voiceES : voiceEN
+        let list = availableVoices(lang)
+        return list.first { $0.identifier == chosen } ?? list.first ?? AVSpeechSynthesisVoice(language: lang == .es ? "es-MX" : "en-US")
+    }
+
+    /// The best voice installed is still a basic one: worth downloading a better one.
+    func onlyBasicVoices(_ lang: AssistantLang) -> Bool {
+        (availableVoices(lang).first.map(Self.naturalness) ?? 0) < 20
+    }
+
+    func preview(_ lang: AssistantLang) {
+        stopSpeaking()
+        voiceLists[lang] = nil
+        say(lang == .es ? "Hola, así sueno. ¿En qué te ayudo con ProjectN?" : "Hi, this is how I sound. How can I help with ProjectN?", lang)
+    }
+
+    func refreshVoices() { voiceLists.removeAll() }
 }
 
 extension AssistantController: AVSpeechSynthesizerDelegate {
@@ -422,6 +632,37 @@ extension AssistantController: AVSpeechSynthesizerDelegate {
     }
 
     private func speechEnded() {
-        if !synth.isSpeaking, orb.phase == .speaking { orb.phase = .idle }
+        guard !synth.isSpeaking else { return }
+        if orb.phase == .speaking { orb.phase = streaming ? .thinking : .idle }
+        settle()
+    }
+}
+
+/// Notices when you've finished talking, from the mic level alone (cheap: no extra audio processing).
+/// It calibrates to the room for a moment, then ends after a short silence once you've said something.
+struct AssistantVAD {
+    enum Result: Equatable { case listening, endOfSpeech, nothingSaid }
+
+    var silenceToEnd: TimeInterval = 0.9
+    var giveUpAfter: TimeInterval = 7
+    var maxLength: TimeInterval = 45
+    private var began: Date?
+    private var floor: Float = 0
+    private var samples = 0
+    private(set) var heardSpeech = false
+    private var lastLoud = Date.distantPast
+
+    init() {}
+
+    mutating func push(_ level: Float, now: Date = Date()) -> Result {
+        if began == nil { began = now }
+        let t = now.timeIntervalSince(began!)
+        if t < 0.3 && level < 0.45 {                               // room noise
+            floor = (floor * Float(samples) + level) / Float(samples + 1); samples += 1
+        }
+        if level > max(0.32, min(floor, 0.3) + 0.15) { heardSpeech = true; lastLoud = now }
+        if t > maxLength { return heardSpeech ? .endOfSpeech : .nothingSaid }
+        if heardSpeech { return now.timeIntervalSince(lastLoud) > silenceToEnd ? .endOfSpeech : .listening }
+        return t > giveUpAfter ? .nothingSaid : .listening
     }
 }

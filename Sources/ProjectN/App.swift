@@ -47,6 +47,9 @@ struct ProjectNApp: App {
                 .environmentObject(slack)
                 .environmentObject(assistant)
                 .frame(minWidth: 960, minHeight: 600)
+                .sheet(isPresented: $updates.showWhatsNew) {
+                    WhatsNewView().environmentObject(updates)
+                }
                 .sheet(isPresented: $nav.showAddFromGitHub) {
                     AddFromGitHubSheet()
                         .environmentObject(store)
@@ -72,7 +75,7 @@ struct ProjectNApp: App {
         }
         .windowStyle(.hiddenTitleBar)
         .defaultSize(width: 1400, height: 880)
-        .commands { AppCommands(store: store, panel: panel, nav: nav) }
+        .commands { AppCommands(store: store, panel: panel, nav: nav, assistant: assistant) }
     }
 }
 
@@ -237,6 +240,7 @@ struct AppCommands: Commands {
     @ObservedObject var store: Store
     @ObservedObject var panel: RightPanelModel
     @ObservedObject var nav: NavigationModel
+    let assistant: AssistantController
 
     private var current: (Workspace, Space)? {
         guard let w = store.selectedWorkspace, let s = store.selectedSpace else { return nil }
@@ -266,6 +270,13 @@ struct AppCommands: Commands {
                 Button("Show \(tab.label)") { panel.show(tab) }
                     .keyboardShortcut(KeyEquivalent(Character("\(i + 1)")), modifiers: [.command, .option])
             }
+            Button("Talk to Assistant") {
+                if panel.visible && panel.tab == .assistant { assistant.toggleListening() } else {
+                    panel.show(.assistant)
+                    if !assistant.autoListen { assistant.startListening() }
+                }
+            }
+                .keyboardShortcut("a", modifiers: [.command, .option])
             Divider()
         }
         CommandGroup(after: .toolbar) {

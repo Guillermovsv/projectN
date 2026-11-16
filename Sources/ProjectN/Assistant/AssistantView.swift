@@ -1,8 +1,11 @@
+import AVFoundation
 import SwiftUI
 
 /// Right panel › Assistant: the orb (click to talk), the conversation, and a field to type instead.
 struct AssistantView: View {
     @EnvironmentObject var assistant: AssistantController
+    @EnvironmentObject var nav: NavigationModel
+    @EnvironmentObject var panel: RightPanelModel
     @State private var draft = ""
     @FocusState private var fieldFocused: Bool
 
@@ -15,6 +18,8 @@ struct AssistantView: View {
             Divider()
             inputBar
         }
+        .onAppear { assistant.opened() }
+        .onDisappear { assistant.closed() }
     }
 
     private var conversation: some View {
@@ -22,7 +27,7 @@ struct AssistantView: View {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 8) {
                     if assistant.log.isEmpty {
-                        Text("Click the orb and talk, or type below.\nTry “open web shop”, “new Claude”, “what's running?” or “Developer, fix the login”.")
+                        Text("Just talk — it answers when you pause and keeps listening. Click the orb to stop, or type below. (⌥⌘A)\nTry “open web shop”, “new Claude”, “what's running?” or “Developer, fix the login”.")
                             .font(.callout)
                             .foregroundStyle(.secondary)
                             .multilineTextAlignment(.center)
@@ -74,13 +79,12 @@ struct AssistantView: View {
 
     private var optionsMenu: some View {
         Menu {
+            Toggle("Listen as soon as it opens", isOn: $assistant.autoListen)
+            Toggle("Conversation mode (keeps listening)", isOn: $assistant.handsFree)
             Toggle("Speak replies", isOn: $assistant.speakReplies)
-            Toggle("Use AI for anything else", isOn: $assistant.useAI)
-            Toggle("Enhance requests to agents", isOn: $assistant.enhanceRequests)
-            Toggle("AI summaries of agent results", isOn: $assistant.aiSummaries)
             Divider()
-            Text("AI: NVoice's provider and model (Settings › Voice)")
             Button("Clear conversation") { assistant.clear() }
+            Button("Assistant Settings…") { nav.openSettings(.assistant, panel: panel) }
         } label: {
             Image(systemName: "slider.horizontal.3")
         }
@@ -88,6 +92,14 @@ struct AssistantView: View {
         .menuIndicator(.hidden)
         .fixedSize()
         .help("Assistant options")
+    }
+
+    static func voiceLabel(_ v: AVSpeechSynthesisVoice) -> String {
+        let id = v.identifier.lowercased()
+        let kind = id.contains("siri") ? "Siri, natural"
+            : v.quality == .premium ? "Premium" : v.quality == .enhanced ? "Enhanced"
+            : id.contains("eloquence") || id.contains("speech.synthesis") ? "robotic" : "basic"
+        return "\(v.name) (\(v.language), \(kind))"
     }
 
     private func send() {
@@ -189,11 +201,11 @@ struct AssistantOrbButton: View {
     private var caption: String {
         switch orb.phase {
         case .idle: return "Click to talk"
-        case .listening: return "Listening… click when done"
-        case .thinking: return "Thinking…"
-        case .speaking: return "Speaking — click to interrupt"
+        case .listening: return "Listening… click to stop"
+        case .thinking: return "Thinking… click to stop"
+        case .speaking: return "Speaking… click to stop"
         }
     }
 
-    private var help: String { orb.phase == .listening ? "Stop listening" : "Talk to the assistant" }
+    private var help: String { orb.phase == .idle ? "Talk to the assistant" : "Stop" }
 }

@@ -47,3 +47,23 @@ struct UpdaterTests {
         #expect(UpdateModel.shellQuote("/a b/it's") == "'/a b/it'\\''s'")
     }
 }
+
+struct WhatsNewTests {
+    @Test func releaseRoundTripsAndShowsOnceOnTheNewBuild() throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("release-\(UUID()).json")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let commits = [UpdateModel.Commit(sha: "91490b3aaaa", title: "Assistant: voice tab", body: "Orb and voice.", author: "memo",
+                                          date: Date(timeIntervalSince1970: 1_800_000_000), url: URL(string: "https://github.com/o/r/commit/91490b3"))]
+        let r = UpdateModel.Release(fromVersion: "v0.7.4 (38) 7e8ea54", sha: "91490b3aaaa", commits: commits, installedAt: Date(timeIntervalSince1970: 1_800_000_100))
+        UpdateModel.saveRelease(r, to: url)
+        let back = try #require(UpdateModel.loadRelease(from: url))
+        #expect(back == r)
+        // First launch of the installed build: show it.
+        #expect(UpdateModel.isFirstLaunch(of: back, running: "91490b3"))
+        // The old build (install failed) or an already-shown release: don't.
+        #expect(!UpdateModel.isFirstLaunch(of: back, running: "7e8ea54"))
+        var shown = back; shown.shown = true
+        #expect(!UpdateModel.isFirstLaunch(of: shown, running: "91490b3"))
+        #expect(!UpdateModel.isFirstLaunch(of: back, running: nil))
+    }
+}

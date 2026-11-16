@@ -243,3 +243,38 @@ struct LiveAcceptanceTests {
         #expect(p.permission == .readOnly && !p.instructions.isEmpty)
     }
 }
+
+/// The Assistant's warm Claude session: streams, answers several questions on one process, survives cancelling.
+/// Off by default. Run with:  PROJECTN_LIVE_CLAUDE=1 ./scripts/test.sh --filter LiveAssistantBrain
+@Suite(.serialized, .enabled(if: ProcessInfo.processInfo.environment["PROJECTN_LIVE_CLAUDE"] == "1"))
+struct LiveAssistantBrainTests {
+    @Test func warmSessionStreamsAndIsReused() async throws {
+        let brain = AssistantBrain.shared
+        let system = AssistantAI.systemPrompt()
+        brain.prewarm(model: "haiku", system: system)
+        try await Task.sleep(for: .seconds(4))
+        var pieces = 0
+        for q in ["ProjectN right now:\nProjects: Blog\n\nUser request: ¿qué proyectos tengo?",
+                  "ProjectN right now:\nProjects: Blog\n\nUser request: abre el proyecto Blog"] {
+            let t0 = Date()
+            var first: TimeInterval?
+            let raw = try await brain.ask(q, model: "haiku", system: system) { _ in
+                if first == nil { first = Date().timeIntervalSince(t0) }
+                pieces += 1
+            }
+            try await Task.sleep(for: .milliseconds(50))   // let main-thread callbacks land
+            print("assistant-live: first piece \(String(format: "%.2f", first ?? -1)) s, total \(String(format: "%.2f", Date().timeIntervalSince(t0))) s: \(raw)")
+            #expect(!raw.isEmpty)
+            if q.contains("abre") { #expect(AssistantAI.parse(raw).actions.map(\.kind) == ["open_project"]) }
+        }
+        #expect(pieces > 1)
+        // Cancelling mid-answer leaves a usable session behind.
+        let slow = Task { try await brain.ask("User request: cuenta del 1 al 50 en palabras", model: "haiku", system: system) { _ in } }
+        try await Task.sleep(for: .milliseconds(1500))
+        slow.cancel()
+        _ = try? await slow.value
+        let after = try await brain.ask("User request: di hola", model: "haiku", system: system) { _ in }
+        #expect(!after.isEmpty)
+        brain.shutdown()
+    }
+}

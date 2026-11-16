@@ -98,3 +98,77 @@ struct AssistantAITests {
         #expect(AssistantAI.findProject("the Blog", all)?.name == "Blog")
     }
 }
+
+struct AssistantRealtimeTests {
+    @Test func splitterSpeaksSentencesAsTheyArrive() {
+        var s = AssistantAI.StreamSplitter()
+        #expect(s.feed("Claro, abro el pro").isEmpty)
+        #expect(s.feed("yecto Blog ahora. Y le pido") == ["Claro, abro el proyecto Blog ahora."])
+        #expect(s.feed(" a Developer que lo revise.\nACT").isEmpty == false)
+        #expect(s.feed("ION {\"do\":\"open_project\",\"project\":\"Blog\"}\n").isEmpty)
+        #expect(s.finish().isEmpty)
+        #expect(!s.speakable.contains("ACTION"))
+        let plan = AssistantAI.parse(s.full)
+        #expect(plan.actions.map(\.kind) == ["open_project"])
+        #expect(plan.say.contains("Developer"))
+    }
+
+    @Test func splitterHoldsBackAPossibleActionLine() {
+        var s = AssistantAI.StreamSplitter()
+        _ = s.feed("Hecho, ya está abierto el proyecto.\nAC")
+        #expect(!s.speakable.contains("AC"))
+        #expect(s.finish().isEmpty)
+    }
+
+    @Test func splitterFlushesTheTailAtTheEnd() {
+        var s = AssistantAI.StreamSplitter()
+        #expect(s.feed("Hay dos terminales corriendo").isEmpty)
+        #expect(s.finish() == ["Hay dos terminales corriendo"])
+    }
+
+    @Test func splitterNeverSpeaksJSON() {
+        var s = AssistantAI.StreamSplitter()
+        #expect(s.feed("{\"say\": \"Hola.\", \"actions\": []}").isEmpty)
+        #expect(s.finish().isEmpty)
+        #expect(AssistantAI.parse(s.full).say == "Hola.")
+    }
+
+    @Test func vadEndsAfterAPauseOnceYouSpoke() {
+        var v = AssistantVAD()
+        let t0 = Date()
+        func at(_ s: Double) -> Date { t0.addingTimeInterval(s) }
+        for i in 0..<6 { #expect(v.push(0.1, now: at(Double(i) * 0.05)) == .listening) }   // room
+        #expect(v.push(0.7, now: at(0.5)) == .listening)                                  // talking
+        #expect(v.push(0.65, now: at(1.2)) == .listening)
+        #expect(v.push(0.1, now: at(1.8)) == .listening)                                  // short pause
+        #expect(v.push(0.1, now: at(2.2)) == .endOfSpeech)
+    }
+
+    @Test func vadGivesUpWhenNothingIsSaid() {
+        var v = AssistantVAD()
+        let t0 = Date()
+        #expect(v.push(0.1, now: t0) == .listening)
+        #expect(v.push(0.15, now: t0.addingTimeInterval(3)) == .listening)
+        #expect(v.push(0.1, now: t0.addingTimeInterval(7.5)) == .nothingSaid)
+    }
+
+    @Test func vadHandlesSpeakingRightAway() {
+        var v = AssistantVAD()
+        let t0 = Date()
+        #expect(v.push(0.8, now: t0) == .listening)
+        #expect(v.push(0.1, now: t0.addingTimeInterval(1.0)) == .endOfSpeech)
+    }
+
+    @Test func streamDeltaReadsClaudeChunks() {
+        let line = #"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" Uno, d"}},"session_id":"x"}"#
+        #expect(Enhancer.streamDelta(Substring(line)) == " Uno, d")
+        #expect(Enhancer.streamDelta(#"{"type":"assistant","message":{}}"#) == nil)
+    }
+
+    @MainActor @Test func endConversationPhrases() {
+        let ctx = AssistantCommands.Context(projects: [])
+        #expect(AssistantCommands.parse("Gracias", ctx) == .endConversation)
+        #expect(AssistantCommands.parse("eso es todo.", ctx) == .endConversation)
+        #expect(AssistantCommands.parse("that's all", ctx) == .endConversation)
+    }
+}

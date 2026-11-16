@@ -5,6 +5,8 @@ import NaturalLanguage
 enum AssistantIntent: Equatable {
     case help
     case stopSpeaking
+    /// "gracias", "eso es todo": ends conversation mode.
+    case endConversation
     case repeatLast
     case status
     case pending
@@ -38,6 +40,8 @@ enum AssistantCommands {
         guard !f.isEmpty else { return .unknown(raw) }
 
         if matchesAny(f, exact: ["stop", "para", "silencio", "callate", "calla", "basta", "shh", "quiet", "shut up", "ya"]) { return .stopSpeaking }
+        if matchesAny(f, exact: ["gracias", "muchas gracias", "eso es todo", "es todo", "nada mas", "adios", "hasta luego",
+                                 "listo gracias", "ok gracias", "thanks", "thank you", "thats all", "that s all", "bye", "goodbye"]) { return .endConversation }
         if has(f, ["ayuda", "help", "que puedes hacer", "what can you do", "comandos", "commands"]) { return .help }
         if has(f, ["repite", "repitelo", "repeat", "otra vez", "say again", "say that again"]) { return .repeatLast }
 
