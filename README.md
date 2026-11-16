@@ -67,7 +67,7 @@ Every Claude/Codex pane has a chat box under its terminal (hide it from the pane
 
 | | Claude | Codex |
 |---|---|---|
-| Model | Fable 5.1, Opus 5.5, Sonnet 5.5, Haiku 5.5 (+ previous versions) (`--model <id>`) | models from Codex's own cache (`-m`) |
+| Model | Fable 5.2, Opus 5.5, Sonnet 5.5, Haiku 5.5 (+ previous versions) (`--model <id>`) | models from Codex's own cache (`-m`) |
 | Effort | low … max (`--effort`) | levels the chosen model supports (`model_reasoning_effort`) |
 | Permissions | Ask, Accept edits, Plan, Auto mode, Don't ask, ⚠︎ Bypass all (`--permission-mode`) | Read only, Workspace, Workspace no prompts, ⚠︎ Full access (`-s` / `-a`) |
 

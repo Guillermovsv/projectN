@@ -8,7 +8,7 @@ enum AIProvider: String, CaseIterable, Identifiable {
     var binaryName: String { rawValue }
     var models: [String] {
         switch self {
-        case .claude: return ["haiku", "sonnet", "opus", "claude-fable-5-1"]
+        case .claude: return ["haiku", "sonnet", "opus", "claude-fable-5-2"]
         case .codex: return AIProvider.codexModelsFromCache() ?? ["gpt-6.1-sol", "gpt-6-astra", "gpt-6-luna"]
         }
     }

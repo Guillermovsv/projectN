@@ -15,10 +15,11 @@ enum LaunchCatalog {
 
     /// Explicit model versions (IDs as Claude Code knows them), newest first.
     static let claudeModels: [Choice] = [
-        Choice(value: "claude-fable-5-1", label: "Fable 5.1", detail: "Most capable"),
+        Choice(value: "claude-fable-5-2", label: "Fable 5.2", detail: "Most capable"),
         Choice(value: "claude-opus-5-5", label: "Opus 5.5"),
         Choice(value: "claude-sonnet-5-5", label: "Sonnet 5.5"),
         Choice(value: "claude-haiku-5-5", label: "Haiku 5.5", detail: "Fastest"),
+        Choice(value: "claude-fable-5-1", label: "Fable 5.1", older: true),
         Choice(value: "claude-fable-5", label: "Fable 5", older: true),
         Choice(value: "claude-opus-5", label: "Opus 5", older: true),
         Choice(value: "claude-sonnet-5", label: "Sonnet 5", older: true),
@@ -32,7 +33,7 @@ enum LaunchCatalog {
 
     /// Claude Code's aliases point at the latest version of each family.
     static let claudeAliases: [String: String] = [
-        "fable": "claude-fable-5-1", "opus": "claude-opus-5-5", "sonnet": "claude-sonnet-5-5", "haiku": "claude-haiku-5-5",
+        "fable": "claude-fable-5-2", "opus": "claude-opus-5-5", "sonnet": "claude-sonnet-5-5", "haiku": "claude-haiku-5-5",
     ]
 
     static func normalizeClaudeModel(_ m: String) -> String {
