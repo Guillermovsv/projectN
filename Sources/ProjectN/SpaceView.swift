@@ -67,7 +67,6 @@ struct SpaceView: View {
             UsageMeters(tools: store.visibleAgentTools)
 
             ActiveCounts()
-            AddPaneMenu(workspace: w, space: s)
         }
     }
 
@@ -113,11 +112,13 @@ struct SpaceView: View {
     }
 }
 
-/// The single "+" in the top bar: Claude / Codex / Terminal (grouped by project when the workspace has several).
+/// The "+" in each pane's header: Claude / Codex / Cursor / Terminal (grouped by project when the
+/// workspace has several, with the pane's own project first).
 struct AddPaneMenu: View {
     @EnvironmentObject var store: Store
     let workspace: Workspace
     let space: Space
+    var preferredProjectID: UUID? = nil
 
     var body: some View {
         Menu {
@@ -129,21 +130,22 @@ struct AddPaneMenu: View {
             } else if workspace.projectIDs.count == 1 {
                 items(projectID: workspace.projectIDs[0])
             } else {
-                let def = store.defaultProjectID(in: workspace.id, space: space.id)
-                ForEach(workspace.projectIDs, id: \.self) { pid in
+                let def = preferredProjectID ?? store.defaultProjectID(in: workspace.id, space: space.id)
+                let ordered = workspace.projectIDs.filter { $0 == def } + workspace.projectIDs.filter { $0 != def }
+                ForEach(ordered, id: \.self) { pid in
                     if let p = store.project(pid) {
                         Section(p.name + (pid == def ? "  (current)" : "")) { items(projectID: pid) }
                     }
                 }
             }
         } label: {
-            Image(systemName: "plus")
+            Image(systemName: "plus").font(.caption.weight(.semibold))
         }
         .menuStyle(.borderlessButton)
-            .hoverHighlight()
+        .hoverHighlight()
         .menuIndicator(.hidden)
         .fixedSize()
-        .frame(width: 28, height: 24)
+        .frame(width: 24, height: 22)
         .help(space.isFull ? "Space is full" : "Add pane — ⌘T Claude · ⌘Y Codex · ⌘I Cursor · ⌘U Terminal")
     }
 
@@ -371,6 +373,10 @@ struct PaneHeader: View {
             Spacer(minLength: 4)
             if index < 9 {
                 Text("⌘\(index + 1)").font(.caption2.monospaced()).foregroundStyle(.tertiary)
+            }
+            if let w = store.workspace(workspaceID),
+               let sp = w.spaces.first(where: { $0.panes.contains { $0.id == pane.id } }) {
+                AddPaneMenu(workspace: w, space: sp, preferredProjectID: pane.projectID)
             }
             AutoMenu(pane: pane, workspaceID: workspaceID, onRename: onRename)
             if canMaximize {

@@ -91,7 +91,7 @@ The icon rail on the right edge opens **Files**, **Activity** or **Browser** (cl
 - **Activity**: every Claude/Codex pane across all workspaces, grouped as *Needs your input*, *Working*, *Idle*, *Not running*. Panes waiting on a prompt are highlighted **yellow** (also on the pane, its space in the sidebar, and the panel button). Click a row to jump to it.
 - **Browser**: preview `localhost` dev servers or any URL (`3000` → `http://localhost:3000`). Viewport presets: Fit (panel width), Mobile 390, Tablet 820, Desktop 1440. The page really gets that CSS width and is scaled to fit, so media queries behave like the device.
 
-New panes are added from the **+** in the top bar (or ⌘T / ⌘Y / ⌘U).
+New panes are added from the **+** in any pane's header — it offers the pane's own project first — or with ⌘T / ⌘Y / ⌘I / ⌘U; an empty space shows its own buttons.
 
 ## Restoring after quitting
 
