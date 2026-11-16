@@ -71,4 +71,38 @@ struct CursorAutoTests {
         #expect(AutoResponder.decide(screen: ["Press any key to continue (y)", ""]) == nil)
         #expect(AutoResponder.decide(screen: Array(approval.prefix(9)) + Array(repeating: "output line", count: 12)) == nil)
     }
+
+    // Newer Claude Code dialogs: options without numbers, "Enter to confirm" below.
+    private let trust = [
+        "─────────────",
+        " Accessing workspace:",
+        "",
+        " /Users/me/project",
+        "",
+        " Quick safety check: Is this a project you created or one you trust?",
+        "",
+        " Security guide",
+        "",
+        " ❯ No, exit",
+        "   Yes, I trust this folder",
+        "",
+        " Enter to confirm · Esc to cancel",
+    ]
+
+    @Test func answersUnnumberedClaudeDialog() {
+        let d = AutoResponder.decide(screen: trust)
+        #expect(d?.keys == [AutoResponder.down, AutoResponder.enter])
+        #expect(d?.label == "Yes, I trust this folder")
+        #expect(AutoResponder.pendingPrompt(screen: trust) != nil)
+        var moved = trust
+        moved[9] = "   No, exit"
+        moved[10] = " ❯ Yes, I trust this folder"
+        #expect(AutoResponder.decide(screen: moved)?.keys == [AutoResponder.enter])
+    }
+
+    @Test func multiLineDraftIsNotAMenu() {
+        let draft = ["────", "❯ fix the login", "  Yes do it now", "────", "  ⏸ manual mode on · ? for shortcuts"]
+        #expect(AutoResponder.decide(screen: draft) == nil)
+        #expect(AutoResponder.pendingPrompt(screen: draft) == nil)
+    }
 }

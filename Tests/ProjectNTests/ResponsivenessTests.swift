@@ -136,6 +136,23 @@ struct ResponsivenessTests {
         #expect(runtime.autoAnswerCount == 1)
     }
 
+    /// Auto turned on while a prompt is already waiting (nothing new on screen) still answers it.
+    @Test func autoModeTurnedOnAtAWaitingPromptAnswersIt() async throws {
+        let store = try makeStore()
+        defer { store.terminateAll() }
+        let script = "printf 'Do you want to proceed?\\r\\n\\342\\235\\257 1. Yes\\r\\n  2. No\\r\\n'; read x; printf 'got-answer\\r\\n'; sleep 3"
+        let plan = Launcher.Plan(executable: "/bin/sh", args: ["-c", script], environment: ["TERM=xterm-256color"],
+                                 directory: Self.home.path, commandLine: "auto-mode late fixture")
+        let runtime = TerminalSession(id: UUID(), plan: plan, fontSize: 13)
+        defer { runtime.terminate() }
+        // The activity scan reads the prompt first (as the Store's 1 s timer does), then nothing more is drawn.
+        try await waitUntil { runtime.refreshActivity(); return runtime.needsInput }
+        try await Task.sleep(for: .milliseconds(1500))
+        runtime.refreshActivity()
+        runtime.setAutoComplete(true)
+        try await waitUntil { runtime.autoAnswerCount == 1 }
+    }
+
     @Test func messagesQueuedDuringLaunchReachTheSamePane() async throws {
         let store = try makeStore()
         defer { store.terminateAll() }

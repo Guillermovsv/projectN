@@ -47,6 +47,7 @@ enum AutoResponder {
         if let d = inlineYesNoDecision(window) { return d }
         if let d = menuDecision(window) { return d }
         if let d = keyHintDecision(window) { return d }
+        if let d = plainMenuDecision(window) { return d }
         return nil
     }
 
@@ -57,9 +58,15 @@ enum AutoResponder {
         if inlineYesNoDecision(window) != nil { return window.last }
         // Numbered menus first, as in `decide` (Codex's "1. Allow (y) … 4. Cancel (esc)" also looks like key hints).
         guard let menu = findMenu(window) else {
-            guard let hint = findKeyHintMenu(window) else { return nil }
-            return window[max(0, hint.first - 4)..<hint.first].reversed()
-                .first { !$0.isEmpty && $0.rangeOfCharacter(from: .letters) != nil } ?? "Choose an option"
+            if let hint = findKeyHintMenu(window) {
+                return window[max(0, hint.first - 4)..<hint.first].reversed()
+                    .first { !$0.isEmpty && $0.rangeOfCharacter(from: .letters) != nil } ?? "Choose an option"
+            }
+            guard let plain = findPlainMenu(window) else { return nil }
+            let first = plain.options.first!.line
+            let above = window[max(0, first - 8)..<first].reversed()
+            return above.first { $0.contains("?") && $0.rangeOfCharacter(from: .letters) != nil }
+                ?? above.first { !$0.isEmpty && $0.rangeOfCharacter(from: .letters) != nil } ?? "Choose an option"
         }
         let first = menu.block.first!.line
         // A real question ("…?") above the options wins: Codex prints the tool's parameters (e.g. "post_id: 798")
@@ -201,6 +208,68 @@ enum AutoResponder {
         while let c = t.last, c == ":" || c == "?" || c == " " { t.removeLast() }
         guard ynPatterns.contains(where: { t.hasSuffix($0) }) else { return nil }
         return Decision(keys: ["y", enter], label: "y", fingerprint: "yn:" + last)
+    }
+
+    // MARK: Unnumbered menus (newer Claude Code dialogs)
+
+    /// Newer Claude Code dialogs drop the numbers and end with an "Enter to confirm" hint:
+    ///
+    ///     ❯ No, exit
+    ///       Yes, I trust this folder
+    ///
+    ///     Enter to confirm · Esc to cancel
+    ///
+    /// The hint is required, so a multi-line draft in the input box ("❯ …" + indented lines) is never taken for a menu.
+    private struct PlainMenu {
+        let options: [Option]
+        let current: Option
+    }
+
+    private static func findPlainMenu(_ window: [String]) -> PlainMenu? {
+        guard let hint = window.lastIndex(where: { $0.range(of: "enter to ", options: .caseInsensitive) != nil }),
+              window.count - 1 - hint <= 2 else { return nil }
+        // The option block ends just above the hint (blank lines allowed in between).
+        var end = hint - 1
+        while end >= 0, window[end].isEmpty { end -= 1 }
+        guard end >= 1 else { return nil }
+        var start = end
+        while start > 0, !window[start - 1].isEmpty, end - start < 9 { start -= 1 }
+        var options: [Option] = []
+        var number = 0
+        for i in start...end {
+            let line = window[i]
+            var text = line
+            var cursor = false
+            if let f = line.first, cursorGlyphs.contains(f) || f == ">" {
+                cursor = true
+                text = String(line.dropFirst()).trimmingCharacters(in: .whitespaces)
+            }
+            // Numbered blocks belong to `findMenu`; this is only for plain ones.
+            if parseOption(line, line: i) != nil { return nil }
+            number += 1
+            options.append(Option(line: i, number: number, text: text, hasCursor: cursor))
+        }
+        // The rows above the cursor that aren't options (the question) are cut: options start at the first one
+        // drawn indented like the cursor row, i.e. the cursor row or the rows right around it.
+        guard let cur = options.firstIndex(where: \.hasCursor), options.filter(\.hasCursor).count == 1 else { return nil }
+        let lead = options[..<cur].reversed().prefix { !$0.text.hasSuffix("?") && !$0.text.hasSuffix(":") && $0.text.count <= 80 }.count
+        let block = Array(options[(cur - lead)...]).enumerated()
+            .map { Option(line: $0.element.line, number: $0.offset + 1, text: $0.element.text, hasCursor: $0.element.hasCursor) }
+        guard block.count >= 2, block.count <= 8, block.allSatisfy({ !$0.text.isEmpty && $0.text.count <= 80 }) else { return nil }
+        return PlainMenu(options: block, current: block.first(where: \.hasCursor)!)
+    }
+
+    private static func plainMenuDecision(_ window: [String]) -> Decision? {
+        guard let menu = findPlainMenu(window) else { return nil }
+        guard let target = menu.options.first(where: { $0.text.range(of: "recommended", options: .caseInsensitive) != nil })
+                ?? menu.options.first(where: { isYes($0.text) }) else { return nil }
+        let delta = target.number - menu.current.number
+        var keys = Array(repeating: delta > 0 ? down : up, count: abs(delta))
+        keys.append(enter)
+        let first = menu.options.first!.line
+        let context = window[max(0, first - 3)..<first].joined(separator: "\n")
+        let fp = "plain:" + context + "\n" + menu.options.map(\.text).joined(separator: "\n")
+        return Decision(keys: keys, label: cleanLabel(target.text), fingerprint: fp)
     }
 
     // MARK: Key-hint menus (Cursor Agent)
