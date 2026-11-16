@@ -439,18 +439,35 @@ final class Store: ObservableObject {
         return sp?.panes.first { $0.id == sp?.focusedPaneID }?.projectID ?? sp?.panes.last?.projectID ?? w.projectIDs.first
     }
 
+    /// `options` overrides the new-pane defaults field by field (nil fields keep the default).
+    /// `prompt` is the first message: Claude and Codex start with it, Cursor and terminals get it typed in once running.
     @discardableResult
-    func addPane(tool: Tool, projectID: UUID? = nil, in wid: UUID, space sid: UUID) -> Pane? {
+    func addPane(tool: Tool, projectID: UUID? = nil, in wid: UUID, space sid: UUID,
+                 options: LaunchOptions? = nil, prompt: String? = nil) -> Pane? {
         guard let sp = space(sid, in: wid), !sp.isFull,
               let pid = projectID ?? defaultProjectID(in: wid, space: sid) else { return nil }
         var pane = Pane(tool: tool, projectID: pid)
         let used = Set(state.workspaces.flatMap { $0.spaces.flatMap { $0.panes.map(paneTitle) } })
         pane.title = PaneNames.pick(avoiding: used)
-        switch tool {
-        case .claude: pane.launchOptions = LaunchCatalog.explicit(settings.claudeDefaults, tool: .claude, settings: settings)
-        case .codex: pane.launchOptions = LaunchCatalog.explicit(settings.codexDefaults, tool: .codex, settings: settings)
-        case .cursor: pane.launchOptions = LaunchCatalog.explicit(settings.cursorDefaults, tool: .cursor, settings: settings)
-        case .terminal: break
+        let defaults: LaunchOptions? = switch tool {
+        case .claude: settings.claudeDefaults
+        case .codex: settings.codexDefaults
+        case .cursor: settings.cursorDefaults
+        case .terminal: nil
+        }
+        if var d = defaults {
+            if let o = options {
+                d.model = o.model ?? d.model
+                d.effort = o.effort ?? d.effort
+                d.permission = o.permission ?? d.permission
+            }
+            pane.launchOptions = LaunchCatalog.explicit(d, tool: tool, settings: settings)
+        }
+        let first = prompt?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !first.isEmpty {
+            pane.lastPrompt = first
+            if tool == .claude || tool == .codex { initialPrompts[pane.id] = first }
+            else { pendingMessages[pane.id, default: []].append(first) }
         }
         updateWorkspace(wid) { if !$0.projectIDs.contains(pid) { $0.projectIDs.append(pid) } }
         updateSpace(sid, in: wid) { $0.panes.append(pane); $0.focusedPaneID = pane.id }

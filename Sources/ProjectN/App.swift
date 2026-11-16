@@ -64,6 +64,15 @@ struct ProjectNApp: App {
                     agents.attach(store)
                     slack.attach(store: store, harness: agents)
                     assistant.attach(store: store, harness: agents, panel: panel, nav: nav)
+                    FloatingAssistant.shared.configure(assistant: assistant, panel: panel) {
+                        AnyView(AssistantView(inWindow: true)
+                            .environmentObject(store)
+                            .environmentObject(panel)
+                            .environmentObject(nav)
+                            .environmentObject(agents)
+                            .environmentObject(assistant)
+                            .frame(minWidth: 290, minHeight: 380))
+                    }
                     usage.start(store: store)
                     updates.start()
                     NVoiceController.shared.onOpenSettings = { [weak nav, weak panel] in
@@ -267,11 +276,18 @@ struct AppCommands: Commands {
             Button(panel.visible ? "Hide Right Panel" : "Show Right Panel") { panel.toggle() }
                 .keyboardShortcut("0", modifiers: [.command, .option])
             ForEach(Array(RightPanelModel.Tab.allCases.enumerated()), id: \.element) { i, tab in
-                Button("Show \(tab.label)") { panel.show(tab) }
+                Button("Show \(tab.label)") {
+                    if tab == .assistant && assistant.floating { FloatingAssistant.shared.show() } else { panel.show(tab) }
+                }
                     .keyboardShortcut(KeyEquivalent(Character("\(i + 1)")), modifiers: [.command, .option])
             }
             Button("Talk to Assistant") {
-                if panel.visible && panel.tab == .assistant { assistant.toggleListening() } else {
+                if assistant.floating {
+                    if FloatingAssistant.shared.isVisible { assistant.toggleListening() } else {
+                        FloatingAssistant.shared.show()
+                        if !assistant.autoListen { assistant.startListening() }
+                    }
+                } else if panel.visible && panel.tab == .assistant { assistant.toggleListening() } else {
                     panel.show(.assistant)
                     if !assistant.autoListen { assistant.startListening() }
                 }

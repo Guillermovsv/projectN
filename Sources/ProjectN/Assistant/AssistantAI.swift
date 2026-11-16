@@ -12,6 +12,11 @@ enum AssistantAI {
         var tool: String?
         var tab: String?
         var n: Int?
+        var count: Int?
+        var model: String?
+        var effort: String?
+        var prompt: String?
+        var pane: String?
     }
 
     struct Plan: Equatable {
@@ -40,7 +45,8 @@ enum AssistantAI {
         ACTION {"do":"open_project","project":"<name>"}
         ACTION {"do":"new_space","project":"<name, optional>"}
         ACTION {"do":"goto_space","n":<1-based number in the current workspace>}
-        ACTION {"do":"new_pane","tool":"claude|codex|cursor|terminal","project":"<name, optional>"}
+        ACTION {"do":"new_pane","tool":"claude|codex|cursor|terminal","project":"<name, optional>","count":<1-16, optional>,"model":"<optional>","effort":"<optional>","prompt":"<first message, optional>"}
+        ACTION {"do":"send_to_pane","pane":"<pane name from the snapshot, or last (the pane you opened last), or all (every pane you opened last)>","prompt":"<message to type into it>"}
         ACTION {"do":"show_panel","tab":"files|activity|browser"}
         ACTION {"do":"home"}
         ACTION {"do":"ask_agent","agent":"<agent name>","project":"<name, optional>","instruction":"<clear task for the agent>"}
@@ -50,6 +56,12 @@ enum AssistantAI {
         Abro Blog y le pido a Developer que revise el login.
         ACTION {"do":"open_project","project":"Blog"}
         ACTION {"do":"ask_agent","agent":"Developer","project":"Blog","instruction":"Review the login flow and fix any bugs you find."}
+        Panes: new_pane opens `count` panes (default 1) in the current space, spilling into new spaces when one fills up.
+        model and effort are optional (names from the snapshot, e.g. "Opus 5.5" and "low"); leave them out to use the defaults.
+        prompt is what the new pane starts working on; with count > 1 every pane gets the same prompt, so for different tasks
+        add one new_pane per task. For a terminal, prompt is a shell command. To give work to a pane that is already open, use
+        send_to_pane with its name. When the user asks for panes/terminals by name ("five Claudes", "a Codex that…") use
+        new_pane/send_to_pane, not ask_agent; use ask_agent when they name an agent or don't ask for a pane.
         For work on code (fix, build, review, write…), use ask_agent with the best-suited agent and a well-written instruction.
         If something is ambiguous, ask and add no actions.
         """
@@ -65,7 +77,9 @@ enum AssistantAI {
             let spaces = w.spaces.map { s -> String in
                 let panes = s.panes.map { p in
                     let state = store.needsInputIDs.contains(p.id) ? "needs input" : (store.runtimes[p.id]?.isRunning == true ? "running" : "stopped")
-                    return "\(store.paneTitle(p)) (\(p.tool.label), \(store.project(p.projectID)?.name ?? "?"), \(state))"
+                    let launch = p.tool == .terminal ? "" : ", " + [LaunchCatalog.modelLabel(p.model ?? "", tool: p.tool), p.effort ?? ""]
+                        .filter { !$0.isEmpty }.joined(separator: " ")
+                    return "\(store.paneTitle(p)) (\(p.tool.label)\(launch), \(store.project(p.projectID)?.name ?? "?"), \(state))"
                 }
                 let sel = s.id == store.state.ui.selectedSpaceID ? " [current]" : ""
                 return "  - \(s.name)\(sel): " + (panes.joined(separator: "; ").nonEmpty ?? "empty")
@@ -73,6 +87,12 @@ enum AssistantAI {
             out.append("Workspace \(w.name)\(w.id == current ? " [open]" : ""):\n" + spaces.joined(separator: "\n"))
         }
         if store.selectedWorkspace == nil { out.append("The user is on the overview (no workspace open).") }
+        let claude = LaunchCatalog.claudeModels.filter { !$0.older }.map(\.label).joined(separator: ", ")
+        out.append("Claude models: \(claude) (efforts: \(LaunchCatalog.claudeEfforts.joined(separator: ", ")))")
+        let codex = LaunchCatalog.codexModels(settings: store.settings).map(\.slug)
+        if !codex.isEmpty {
+            out.append("Codex models: \(codex.joined(separator: ", ")) (efforts: \(LaunchCatalog.efforts(for: .codex, model: nil, settings: store.settings).joined(separator: ", ")))")
+        }
         if let panel { out.append("Right panel: " + (panel.visible ? panel.tab.label : "hidden")) }
         if let harness {
             let agents = harness.profiles.filter(\.enabled).map { a in
@@ -117,7 +137,13 @@ enum AssistantAI {
         guard let kind = (a["do"] ?? a["action"]) as? String else { return nil }
         return Action(kind: kind, project: a["project"] as? String, agent: a["agent"] as? String,
                       instruction: a["instruction"] as? String, tool: (a["tool"] as? String)?.lowercased(),
-                      tab: (a["tab"] as? String)?.lowercased(), n: (a["n"] as? Int) ?? (a["n"] as? String).flatMap(Int.init))
+                      tab: (a["tab"] as? String)?.lowercased(), n: int(a["n"]), count: int(a["count"]),
+                      model: a["model"] as? String, effort: (a["effort"] as? String)?.lowercased(),
+                      prompt: a["prompt"] as? String, pane: a["pane"] as? String)
+    }
+
+    private static func int(_ v: Any?) -> Int? {
+        (v as? Int) ?? (v as? String).flatMap { Int($0.trimmingCharacters(in: .whitespaces)) }
     }
 
     /// Cuts a reply that is still being written into sentences to speak right away. Never lets ACTION lines
@@ -193,6 +219,6 @@ enum AssistantAI {
     }
 }
 
-private extension String {
+extension String {
     var nonEmpty: String? { isEmpty ? nil : self }
 }

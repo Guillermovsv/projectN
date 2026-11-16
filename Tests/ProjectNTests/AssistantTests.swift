@@ -25,8 +25,39 @@ struct AssistantCommandsTests {
         #expect(parse("espacio dos") == .gotoSpace(2))
         #expect(parse("go to space 3") == .gotoSpace(3))
         #expect(parse("siguiente espacio") == .nextSpace)
-        #expect(parse("abre un Claude en web shop") == .newPane(.claude, shop))
-        #expect(parse("nueva terminal") == .newPane(.terminal, nil))
+        #expect(parse("abre un Claude en web shop") == .newPane(PaneRequest(tool: .claude, project: shop)))
+        #expect(parse("nueva terminal") == .newPane(PaneRequest(tool: .terminal)))
+    }
+
+    @Test func panesWithModelEffortAndPrompt() {
+        #expect(parse("abre cinco claude en Opus 5.5 low")
+                == .newPane(PaneRequest(tool: .claude, count: 5, model: "claude-opus-5-5", effort: "low")))
+        #expect(parse("abre 3 claudes en sonnet con esfuerzo alto en web shop que revisen el Login.")
+                == .newPane(PaneRequest(tool: .claude, project: shop, count: 3, model: "claude-sonnet-5-5", effort: "high",
+                                        prompt: "revisen el Login.")))
+        #expect(parse("abre dos claude en opus cinco punto cinco extra alto")
+                == .newPane(PaneRequest(tool: .claude, count: 2, model: "claude-opus-5-5", effort: "xhigh")))
+        #expect(parse("open a claude on fable 5.1 max to fix the README")
+                == .newPane(PaneRequest(tool: .claude, model: "claude-fable-5-1", effort: "max", prompt: "fix the README")))
+        // A prompt that mentions spaces or projects stays part of the prompt.
+        #expect(parse("nuevo claude: crea un nuevo espacio de trabajo en blog")
+                == .newPane(PaneRequest(tool: .claude, prompt: "crea un nuevo espacio de trabajo en blog")))
+        // Terminals only take a clearly introduced command.
+        #expect(parse("abre una terminal y ejecuta npm test") == .newPane(PaneRequest(tool: .terminal, prompt: "npm test")))
+        #expect(parse("abre una terminal que corra") == .newPane(PaneRequest(tool: .terminal)))
+    }
+
+    @Test func promptsToOpenPanes() {
+        let ada = Store.PaneRef(workspaceID: UUID(), paneID: UUID())
+        let ken = Store.PaneRef(workspaceID: ada.workspaceID, paneID: UUID())
+        let ctx = AssistantCommands.Context(projects: [shop], agents: [dev],
+                                            panes: [(ada, "Ada"), (ken, "Ken")], lastOpened: [ada, ken])
+        #expect(AssistantCommands.parse("dile a Ada que corra los Tests", ctx) == .sendToPanes([ada], names: ["Ada"], prompt: "corra los Tests"))
+        #expect(AssistantCommands.parse("tell ken to fix the build", ctx) == .sendToPanes([ken], names: ["Ken"], prompt: "fix the build"))
+        #expect(AssistantCommands.parse("diles a todos que hagan commit", ctx) == .sendToPanes([ada, ken], names: ["Ada", "Ken"], prompt: "hagan commit"))
+        #expect(AssistantCommands.parse("escríbele al último: revisa el diff", ctx) == .sendToPanes([ken], names: ["Ken"], prompt: "revisa el diff"))
+        // Agents keep priority over panes.
+        if case .askAgent = AssistantCommands.parse("dile a Developer que revise", ctx) {} else { Issue.record("expected askAgent") }
     }
 
     @Test func panelAndStatus() {
@@ -84,6 +115,20 @@ struct AssistantAITests {
         #expect(p.actions.map(\.kind) == ["open_project", "ask_agent", "goto_space"])
         #expect(p.actions[1].instruction == "Review the blog")
         #expect(p.actions[2].n == 2)
+    }
+
+    @Test func parsesPaneActions() {
+        let p = AssistantAI.parse("""
+        Abro cinco Claude y le paso el login a Ada.
+        ACTION {"do":"new_pane","tool":"claude","count":"5","model":"Opus 5.5","effort":"Low","prompt":"Review the login"}
+        ACTION {"do":"send_to_pane","pane":"Ada","prompt":"Run the tests"}
+        """)
+        #expect(p.actions.count == 2)
+        #expect(p.actions[0].count == 5 && p.actions[0].model == "Opus 5.5" && p.actions[0].effort == "low")
+        #expect(p.actions[0].prompt == "Review the login")
+        #expect(p.actions[1].pane == "Ada" && p.actions[1].prompt == "Run the tests")
+        let said = AssistantCommands.digitize(AssistantCommands.normalize("Opus 5.5"))
+        #expect(AssistantCommands.model(in: said, LaunchCatalog.claudeModelChoices)?.0 == "claude-opus-5-5")
     }
 
     @Test func plainTextBecomesSpeech() {

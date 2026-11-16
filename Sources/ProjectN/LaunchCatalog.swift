@@ -308,6 +308,35 @@ enum LaunchCatalog {
         return LaunchOptions(model: o.model ?? d.model, effort: o.effort ?? d.effort, permission: o.permission ?? d.permission)
     }
 
+    // MARK: Picking by name (Assistant)
+
+    static let claudeModelChoices = claudeModels
+        + claudeAliases.map { Choice(value: $0.value, label: $0.key) }.sorted { $0.label < $1.label }
+
+    /// Models a pane of `tool` can be opened with, as (id, spoken name). Claude also answers to its family names
+    /// ("opus" = the newest Opus).
+    static func modelChoices(for tool: Tool, settings: AppSettings) -> [Choice] {
+        switch tool {
+        case .claude: return claudeModelChoices
+        case .codex: return codexModels(settings: settings).map { Choice(value: $0.slug, label: $0.slug) }
+        case .cursor: return cursorModels(settings: settings)
+        case .terminal: return []
+        }
+    }
+
+    /// Efforts a pane of `tool` (with `model`) accepts; empty = no effort setting.
+    static func efforts(for tool: Tool, model: String?, settings: AppSettings) -> [String] {
+        switch tool {
+        case .claude: return claudeEfforts
+        case .codex:
+            let models = codexModels(settings: settings)
+            let m = model ?? explicit(settings.codexDefaults, tool: .codex, settings: settings).model
+            let e = models.first { $0.slug == m }?.efforts ?? []
+            return e.isEmpty ? ["minimal", "low", "medium", "high", "xhigh"] : e
+        case .cursor, .terminal: return []
+        }
+    }
+
     static func modelLabel(_ value: String, tool: Tool) -> String {
         switch tool {
         case .claude: return claudeModels.first { $0.value == value }?.label ?? value

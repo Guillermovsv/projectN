@@ -54,13 +54,15 @@ final class RightPanelModel: ObservableObject {
 struct RightPanelView: View {
     @EnvironmentObject var store: Store
     @EnvironmentObject var panel: RightPanelModel
+    @EnvironmentObject var assistant: AssistantController
 
     var body: some View {
         VStack(spacing: 0) {
             header
             Group {
                 switch panel.tab {
-                case .assistant: AssistantView()
+                case .assistant:
+                    if assistant.floating { FloatingAssistantNotice() } else { AssistantView() }
                 case .files: FileTreeView()
                 case .activity: ActivityView()
                 case .browser: BrowserView(model: panel.browser)
@@ -92,17 +94,20 @@ struct RightPanelView: View {
 struct RightRail: View {
     @EnvironmentObject var store: Store
     @EnvironmentObject var panel: RightPanelModel
+    @EnvironmentObject var assistant: AssistantController
 
     var body: some View {
         VStack(spacing: 6) {
             Color.clear.frame(height: Chrome.topBarHeight - 6)
                 .background(WindowDragArea())
             ForEach(Array(RightPanelModel.Tab.allCases.enumerated()), id: \.element) { i, tab in
+                let floats = tab == .assistant && assistant.floating
                 RailButton(tab: tab,
-                           active: panel.visible && panel.tab == tab,
+                           active: floats ? assistant.floatingVisible : panel.visible && panel.tab == tab,
                            badge: tab == .activity ? store.needsInputCount : 0,
                            shortcut: "⌥⌘\(i + 1)") {
-                    if panel.visible && panel.tab == tab { panel.toggle() } else { panel.show(tab) }
+                    if floats { FloatingAssistant.shared.toggle() }
+                    else if panel.visible && panel.tab == tab { panel.toggle() } else { panel.show(tab) }
                 }
             }
             Spacer()
@@ -186,5 +191,24 @@ struct ColumnResizeHandle: View {
                         }
                         .onEnded { _ in start = nil })
             )
+    }
+}
+
+/// Right panel › Assistant while the Assistant lives in its floating window.
+private struct FloatingAssistantNotice: View {
+    @EnvironmentObject var assistant: AssistantController
+
+    var body: some View {
+        VStack(spacing: 12) {
+            Image(systemName: "macwindow.on.rectangle").font(.system(size: 30)).foregroundStyle(.secondary)
+            Text("The Assistant is in its own floating window.").font(.callout).foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+            HStack {
+                Button(assistant.floatingVisible ? "Bring to Front" : "Show Window") { FloatingAssistant.shared.show() }
+                Button("Dock Here") { FloatingAssistant.shared.setFloating(false) }
+            }
+        }
+        .padding(24)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }

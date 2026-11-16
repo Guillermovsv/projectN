@@ -17,7 +17,10 @@ enum AssistantIntent: Equatable {
     case nextSpace
     case previousSpace
     case gotoSpace(Int)                     // 1-based, in the current workspace
-    case newPane(Tool, Project?)
+    /// One or more panes, optionally with a model, an effort and a first prompt.
+    case newPane(PaneRequest)
+    /// A prompt typed into panes that already exist ("dile a Ada que …", "diles a todos que …").
+    case sendToPanes([Store.PaneRef], names: [String], prompt: String)
     case showPanel(RightPanelModel.Tab)
     case askAgent(id: UUID, name: String, instruction: String)
     case cancelAgent(id: UUID, name: String)
@@ -27,11 +30,30 @@ enum AssistantIntent: Equatable {
 
 enum AssistantLang: String { case es, en }
 
+/// "abre cinco Claude en Opus 5.5 low en web shop que revisen el login"
+struct PaneRequest: Equatable {
+    var tool: Tool
+    var project: Project?
+    var count = 1
+    var model: String?
+    var effort: String?
+    var prompt: String?
+
+    static let maxCount = 16
+}
+
 enum AssistantCommands {
     struct Context {
         var projects: [Project]
         var workspaces: [(id: UUID, name: String)] = []
         var agents: [AgentProfile] = []
+        /// Open panes by name, for "dile a Ada que …".
+        var panes: [(ref: Store.PaneRef, title: String)] = []
+        /// The panes the Assistant opened last ("diles a todos…", "al último…").
+        var lastOpened: [Store.PaneRef] = []
+        /// Models / efforts per tool (Claude's are built in when missing).
+        var models: [Tool: [LaunchCatalog.Choice]] = [:]
+        var efforts: [Tool: [String]] = [:]
     }
 
     static func parse(_ raw: String, _ ctx: Context) -> AssistantIntent {
@@ -47,6 +69,8 @@ enum AssistantCommands {
 
         // "Developer, fix the login" / "pide a Developer que …" / "tell Developer to …"
         if let a = askAgent(text, ctx.agents) { return a }
+        // "dile a Ada que …", "diles a todos que …", "tell the last pane to …"
+        if let m = paneMessage(text, ctx) { return m }
 
         if let verb = firstWord(f), ["cancela", "cancelar", "deten", "detener", "cancel", "kill", "para", "stop"].contains(verb) {
             let rest = String(f.dropFirst(verb.count))
@@ -55,6 +79,12 @@ enum AssistantCommands {
                 return .cancelAgent(id: a.id, name: a.name)
             }
         }
+
+        // Panes first, so a prompt that mentions spaces or projects stays part of the prompt:
+        // "abre 5 claude en opus 5.5 low que …", "nueva terminal", "lanza codex en blog".
+        let paneVerbs = ["abre", "abrir", "nuevo", "nueva", "nuevos", "nuevas", "lanza", "lanzar", "inicia", "arranca",
+                         "crea", "crear", "open", "new", "launch", "start", "add", "create", "agrega", "pon"]
+        if startsWithAny(f, paneVerbs), let r = paneRequest(text, ctx) { return .newPane(r) }
 
         if has(f, ["pendiente", "pendientes", "necesita", "necesitan", "needs input", "needs me", "waiting", "esperando", "aprobacion", "approval"]) { return .pending }
         if has(f, ["estado", "status", "que esta corriendo", "que hay corriendo", "whats running", "what is running", "resumen", "summary", "como va", "como van", "how is it going"]) { return .status }
@@ -76,16 +106,6 @@ enum AssistantCommands {
         }
         if let n = spaceNumber(f) { return .gotoSpace(n) }
 
-        // Panes: "abre un claude en web shop", "new terminal", "lanza codex".
-        let paneVerbs = ["abre", "abrir", "nuevo", "nueva", "lanza", "lanzar", "inicia", "arranca", "open", "new", "launch", "start", "add", "agrega"]
-        if startsWithAny(f, paneVerbs) {
-            let tools: [(String, Tool)] = [("claude", .claude), ("codex", .codex), ("cursor", .cursor),
-                                           ("terminal", .terminal), ("shell", .terminal), ("consola", .terminal)]
-            if let t = tools.first(where: { SlackRouter.containsPhrase(f, $0.0) }) {
-                return .newPane(t.1, project(in: f, ctx.projects))
-            }
-        }
-
         // Projects / workspaces: "abre web shop", "ve al proyecto landing", "switch to blog".
         let goVerbs = ["abre", "abrir", "ve a", "ve al", "ir a", "vamos a", "cambia a", "open", "go to", "switch to", "show me"]
         if startsWithAny(f, goVerbs) || has(f, ["proyecto", "project"]) {
@@ -101,6 +121,132 @@ enum AssistantCommands {
     }
 
     // MARK: Pieces
+
+    private static let toolWords: [(String, Tool)] = [
+        ("claudes", .claude), ("claude", .claude), ("codex", .codex), ("cursores", .cursor), ("cursors", .cursor),
+        ("cursor", .cursor), ("terminales", .terminal), ("terminals", .terminal), ("terminal", .terminal),
+        ("shells", .terminal), ("shell", .terminal), ("consolas", .terminal), ("consola", .terminal),
+    ]
+
+    static func paneRequest(_ text: String, _ ctx: Context) -> PaneRequest? {
+        var (cmd, prompt) = splitPrompt(text, promptSeparators)
+        var f = normalize(cmd)
+        guard !has(f, ["espacio", "space"]),
+              let tool = toolWords.first(where: { SlackRouter.containsPhrase(f, $0.0) })?.1 else { return nil }
+        if tool == .terminal {
+            // A terminal's "prompt" is a shell command: only take one that is clearly introduced.
+            (cmd, prompt) = splitPrompt(text, commandSeparators)
+            f = normalize(cmd)
+        }
+        var r = PaneRequest(tool: tool, project: project(in: f, ctx.projects), prompt: prompt)
+        var d = digitize(f)
+        let words = toolWords.map(\.0).joined(separator: "|")
+        if let m = d.range(of: #"(?:^|\s)(\d{1,2})\s+(?:(?:nuevos?|nuevas?|new)\s+)?(?:"# + words + #")(?=\s|$)"#, options: .regularExpression),
+           let n = Int(d[m].filter(\.isNumber)) {
+            r.count = max(1, min(PaneRequest.maxCount, n))
+        }
+        guard tool != .terminal else { return r }
+        if let (value, phrase) = model(in: d, ctx.models[tool] ?? (tool == .claude ? LaunchCatalog.claudeModelChoices : [])) {
+            r.model = value
+            d = d.replacingOccurrences(of: phrase, with: " ")
+        }
+        r.effort = effort(in: d, allowed: ctx.efforts[tool] ?? (tool == .claude ? LaunchCatalog.claudeEfforts : []))
+        return r
+    }
+
+    /// Best (longest) model whose name or id is said in `f` (normalized + digitized): (id, matched phrase).
+    static func model(in f: String, _ choices: [LaunchCatalog.Choice]) -> (String, String)? {
+        let named = choices.flatMap { c in [normalize(c.label), normalize(c.value)].map { (c.value, $0) } }
+            .filter { !$0.1.isEmpty }
+            .sorted { $0.1.count > $1.1.count }
+        return named.first { SlackRouter.containsPhrase(f, $0.1) }
+    }
+
+    private static let effortWords: [(String, String)] = [
+        ("extra alto", "xhigh"), ("extra alta", "xhigh"), ("muy alto", "xhigh"), ("muy alta", "xhigh"),
+        ("extra high", "xhigh"), ("x high", "xhigh"), ("xhigh", "xhigh"),
+        ("maximo", "max"), ("maxima", "max"), ("maximum", "max"), ("max", "max"),
+        ("minimo", "minimal"), ("minima", "minimal"), ("minimal", "minimal"),
+        ("low", "low"), ("bajo", "low"), ("baja", "low"),
+        ("medium", "medium"), ("medio", "medium"), ("media", "medium"),
+        ("high", "high"), ("alto", "high"), ("alta", "high"),
+    ]
+
+    static func effort(in f: String, allowed: [String]) -> String? {
+        guard let e = effortWords.first(where: { SlackRouter.containsPhrase(f, $0.0) })?.1 else { return nil }
+        return allowed.isEmpty || allowed.contains(e) ? e : nil
+    }
+
+    /// "cinco claude en opus cinco punto cinco" → "5 claude en opus 5 5" (versions are compared without dots).
+    static func digitize(_ f: String) -> String {
+        f.split(separator: " ").compactMap { w -> String? in
+            let s = String(w)
+            if ["punto", "point", "dot", "coma"].contains(s) { return nil }
+            if s == "un" { return "1" }
+            return numbers[s].map(String.init) ?? s
+        }.joined(separator: " ")
+    }
+
+    private static let promptSeparators = [
+        " y dile que ", " y diles que ", " y pidele que ", " y pideles que ", " y que ", " para que ",
+        " con el prompt ", " con prompt ", " con la tarea ", " que ",
+        " and tell it to ", " and tell them to ", " and ask it to ", " and ask them to ",
+        " with the prompt ", " with prompt ", " to ", ": ",
+    ]
+    private static let commandSeparators = [
+        " y ejecuta ", " y ejecute ", " y corre ", " y corra ", " con el comando ", " and run ", " with the command ", ": ",
+    ]
+
+    /// Splits "abre un claude en blog que revise el login" into the command and the prompt (original casing).
+    static func splitPrompt(_ text: String, _ separators: [String]) -> (command: String, prompt: String?) {
+        let folded = text.folded
+        var best: Range<String.Index>?
+        for sep in separators {
+            guard let r = folded.range(of: sep) else { continue }
+            if best == nil || r.lowerBound < best!.lowerBound
+                || (r.lowerBound == best!.lowerBound && r.upperBound > best!.upperBound) { best = r }
+        }
+        guard let r = best else { return (text, nil) }
+        let start = folded.distance(from: folded.startIndex, to: r.lowerBound)
+        let end = folded.distance(from: folded.startIndex, to: r.upperBound)
+        let src = folded.count == text.count ? text : folded
+        let cmd = String(src.prefix(start))
+        let prompt = String(src.dropFirst(end)).trimmingCharacters(in: .whitespacesAndNewlines)
+        return (cmd, prompt.isEmpty ? nil : prompt)
+    }
+
+    private static func paneMessage(_ text: String, _ ctx: Context) -> AssistantIntent? {
+        guard !ctx.panes.isEmpty || !ctx.lastOpened.isEmpty else { return nil }
+        let folded = text.folded
+        let lead = #"^(?:dile|diles|pidele|pideles|escribele|escribeles|escribe|mandale|mandales|manda|enviale|enviales|envia|tell|ask|send|write)\s+(?:al?\s+|to\s+)?(?:(?:el|la|the)\s+)?(?:(?:panel|pane|terminal)\s+)?"#
+        guard let l = folded.range(of: lead, options: .regularExpression) else { return nil }
+        let rest = folded[l.upperBound...]
+        func said(_ w: String) -> Bool {
+            guard rest.hasPrefix(w) else { return false }
+            let next = rest.dropFirst(w.count).first
+            return next == nil || next == " " || next == "," || next == ":"
+        }
+        var refs: [Store.PaneRef] = []
+        var used = 0
+        if let w = ["todos ellos", "todas ellas", "todos", "todas", "all of them", "each of them", "everyone", "all"].first(where: said),
+           !ctx.lastOpened.isEmpty {
+            refs = ctx.lastOpened; used = w.count
+        } else if let w = ["ultimo panel", "ultimo", "ultima", "last pane", "last one", "last"].first(where: said),
+                  let last = ctx.lastOpened.last {
+            refs = [last]; used = w.count
+        } else if let p = ctx.panes.sorted(by: { $0.title.count > $1.title.count }).first(where: { said($0.title.folded) }) {
+            refs = [p.ref]; used = p.title.folded.count
+        }
+        guard !refs.isEmpty else { return nil }
+        let after = rest.dropFirst(used)
+        guard let glue = after.range(of: #"^\s*[,:]?\s*(?:que\s+|to\s+)?"#, options: .regularExpression) else { return nil }
+        let offset = folded.distance(from: folded.startIndex, to: glue.upperBound)
+        let src = folded.count == text.count ? text : folded
+        let prompt = String(src.dropFirst(offset)).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !prompt.isEmpty else { return nil }
+        let names = refs.map { r in ctx.panes.first { $0.ref == r }?.title ?? "?" }
+        return .sendToPanes(refs, names: names, prompt: prompt)
+    }
 
     private static func askAgent(_ text: String, _ agents: [AgentProfile]) -> AssistantIntent? {
         var t = text

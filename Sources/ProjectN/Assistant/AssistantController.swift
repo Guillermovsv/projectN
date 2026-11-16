@@ -52,6 +52,10 @@ final class AssistantController: NSObject, ObservableObject {
     @Published var autoListen: Bool { didSet { d.set(autoListen, forKey: "assistant.autoListen") } }
     /// Pause (seconds) that means you've finished talking.
     @Published var silenceSeconds: Double { didSet { d.set(silenceSeconds, forKey: "assistant.silence") } }
+    /// Lives in its own floating window instead of the right panel.
+    @Published var floating: Bool { didSet { d.set(floating, forKey: "assistant.floating") } }
+    /// The floating window is on screen.
+    @Published var floatingVisible = false
     /// Speaking speed, 0.8…1.3 × the voice's normal rate.
     @Published var speechSpeed: Double { didSet { d.set(speechSpeed, forKey: "assistant.speed") } }
 
@@ -81,6 +85,8 @@ final class AssistantController: NSObject, ObservableObject {
     private var liveSpoke = false
     /// Confirmations of actions the AI already announced aren't spoken again.
     private var suppressSpeech = false
+    /// Panes the Assistant opened last: "diles a todos que…", "al último…".
+    private var lastOpened: [Store.PaneRef] = []
 
     override init() {
         speakReplies = d.object(forKey: "assistant.speak") as? Bool ?? true
@@ -96,6 +102,7 @@ final class AssistantController: NSObject, ObservableObject {
         autoListen = d.object(forKey: "assistant.autoListen") as? Bool ?? true
         silenceSeconds = d.object(forKey: "assistant.silence") as? Double ?? 0.8
         speechSpeed = d.object(forKey: "assistant.speed") as? Double ?? 1.05
+        floating = d.object(forKey: "assistant.floating") as? Bool ?? false
         super.init()
         synth.delegate = self
     }
@@ -233,10 +240,22 @@ final class AssistantController: NSObject, ObservableObject {
             }
         }
 
+        lastOpened = lastOpened.filter { store.pane($0.paneID, in: $0.workspaceID) != nil }
+        var models: [Tool: [LaunchCatalog.Choice]] = [
+            .claude: LaunchCatalog.claudeModelChoices,
+            .codex: LaunchCatalog.modelChoices(for: .codex, settings: store.settings),
+        ]
+        // Reading Cursor's list runs its CLI: only when Cursor is mentioned.
+        if text.folded.contains("cursor") { models[.cursor] = LaunchCatalog.modelChoices(for: .cursor, settings: store.settings) }
         let ctx = AssistantCommands.Context(
             projects: store.state.projects,
             workspaces: store.state.workspaces.filter { !$0.agentHost }.map { ($0.id, $0.name) },
-            agents: harness.profiles)
+            agents: harness.profiles,
+            panes: paneList(),
+            lastOpened: lastOpened,
+            models: models,
+            efforts: [.claude: LaunchCatalog.claudeEfforts,
+                      .codex: LaunchCatalog.efforts(for: .codex, model: nil, settings: store.settings)])
         let intent = AssistantCommands.parse(text, ctx)
         if case .unknown = intent, useAI {
             askAI(text, lang: lang)
@@ -259,8 +278,8 @@ final class AssistantController: NSObject, ObservableObject {
         case .repeatLast:
             if let r = lastReply { say(r.text, r.lang) } else { reply(L("Aún no he dicho nada.", "I haven't said anything yet."), lang) }
         case .help:
-            reply(L("Puedo abrir proyectos y espacios, crear paneles de Claude, Codex o terminal, mostrar actividad, archivos o el navegador, pedirle trabajo a tus agentes, decirte qué está corriendo y qué necesita tu atención. Por ejemplo: abre web shop, nuevo Claude, Developer arregla el login.",
-                    "I can open projects and spaces, add Claude, Codex or terminal panes, show activity, files or the browser, hand work to your agents, and tell you what's running and what needs you. Try: open web shop, new Claude, Developer fix the login."), lang)
+            reply(L("Puedo abrir proyectos y espacios, abrir varios paneles de Claude, Codex, Cursor o terminal con el modelo y el esfuerzo que digas y con un prompt para empezar, mandarle prompts a paneles abiertos, pedirle trabajo a tus agentes y decirte qué está corriendo. Por ejemplo: abre tres Claude en Opus 5.5 low que revisen el login; dile a Ada que corra los tests.",
+                    "I can open projects and spaces, open several Claude, Codex, Cursor or terminal panes with the model and effort you say and a prompt to start on, send prompts to open panes, hand work to your agents and tell you what's running. Try: open three Claude in Opus 5.5 low to review the login; tell Ada to run the tests."), lang)
         case .status:
             reply(statusText(lang), lang)
         case .pending:
@@ -292,16 +311,17 @@ final class AssistantController: NSObject, ObservableObject {
             }
             store.selectSpace(w.spaces[n - 1].id, in: w.id)
             reply(L("Espacio \(n).", "Space \(n)."), lang)
-        case .newPane(let tool, let p):
-            showWorkspaces()
-            if let p, store.selectedWorkspace?.projectIDs.contains(p.id) != true { store.openProject(p) }
-            guard let w = store.selectedWorkspace, let s = store.selectedSpace else {
-                reply(L("Primero abre un proyecto.", "Open a project first."), lang); return
+        case .newPane(let r):
+            openPanes(r, lang: lang)
+        case .sendToPanes(let refs, let names, let prompt):
+            let live = refs.filter { store.pane($0.paneID, in: $0.workspaceID) != nil }
+            guard !live.isEmpty else { reply(L("Ese panel ya no está abierto.", "That pane isn't open anymore."), lang); return }
+            for r in live {
+                store.updatePane(r.paneID, in: r.workspaceID) { $0.lastPrompt = prompt }
+                store.deliver(prompt, to: r)
             }
-            guard let pane = store.addPane(tool: tool, projectID: p?.id, in: w.id, space: s.id) else {
-                reply(L("Este espacio está lleno.", "This space is full."), lang); return
-            }
-            reply(L("Abrí \(tool.label) como \(store.paneTitle(pane)).", "Opened \(tool.label) as \(store.paneTitle(pane))."), lang)
+            reply(live.count == 1 ? L("Se lo mandé a \(names.first ?? "ese panel").", "Sent it to \(names.first ?? "that pane").")
+                                  : L("Se lo mandé a \(live.count) paneles.", "Sent it to \(live.count) panes."), lang)
         case .showPanel(let tab):
             panel?.show(tab)
             reply(tab.label + ".", lang)
@@ -316,6 +336,59 @@ final class AssistantController: NSObject, ObservableObject {
             reply(L("¿Cuál? ", "Which one? ") + list.map(\.name).joined(separator: ", ") + "?", lang)
         case .unknown:
             reply(L("No entendí. Di ayuda para ver lo que puedo hacer.", "I didn't get that. Say help to hear what I can do."), lang)
+        }
+    }
+
+    /// Opens `r.count` panes in the current space; when it fills up, the rest go to new spaces.
+    private func openPanes(_ r: PaneRequest, lang: AssistantLang) {
+        guard let store else { return }
+        func L(_ es: String, _ en: String) -> String { lang == .es ? es : en }
+        showWorkspaces()
+        if let p = r.project, store.selectedWorkspace?.projectIDs.contains(p.id) != true { store.openProject(p) }
+        guard let w = store.selectedWorkspace, var sid = store.selectedSpace?.id else {
+            reply(L("Primero abre un proyecto.", "Open a project first."), lang); return
+        }
+        var effort = r.effort
+        if let e = effort, !LaunchCatalog.efforts(for: r.tool, model: r.model, settings: store.settings).contains(e) { effort = nil }
+        let options = LaunchOptions(model: r.tool == .terminal ? nil : r.model, effort: effort, permission: nil)
+        var opened: [Pane] = []
+        for _ in 0..<max(1, min(PaneRequest.maxCount, r.count)) {
+            if store.space(sid, in: w.id)?.isFull != false {
+                guard let s = store.newSpace(in: w.id) else { break }
+                sid = s.id
+            }
+            guard let pane = store.addPane(tool: r.tool, projectID: r.project?.id, in: w.id, space: sid,
+                                           options: options, prompt: r.prompt) else { break }
+            opened.append(pane)
+        }
+        guard !opened.isEmpty else { reply(L("No pude abrir el panel.", "Couldn't open the pane."), lang); return }
+        lastOpened = opened.map { Store.PaneRef(workspaceID: w.id, paneID: $0.id) }
+
+        let first = opened[0]
+        let how = r.tool == .terminal ? "" : [r.model.map { _ in LaunchCatalog.modelLabel(first.model ?? "", tool: r.tool) },
+                                              effort.map { _ in first.effort ?? "" }].compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: " ")
+        let names = opened.map(store.paneTitle)
+        let list = names.count <= 6 ? names.joined(separator: ", ") : names.prefix(5).joined(separator: ", ") + L(" y \(names.count - 5) más", " and \(names.count - 5) more")
+        var text: String
+        if opened.count == 1 {
+            text = L("Abrí \(r.tool.label)\(how.isEmpty ? "" : " en \(how)") como \(names[0])", "Opened \(r.tool.label)\(how.isEmpty ? "" : " on \(how)") as \(names[0])")
+            text += r.prompt == nil ? "." : L(" y ya tiene el prompt.", " with your prompt.")
+        } else {
+            text = L("Abrí \(opened.count) \(r.tool.label)\(how.isEmpty ? "" : " en \(how)"): \(list)", "Opened \(opened.count) \(r.tool.label)\(how.isEmpty ? "" : " on \(how)"): \(list)")
+            text += r.prompt == nil ? "." : L(", todos con el prompt.", ", all with your prompt.")
+        }
+        if opened.count < r.count { text += L(" No cupieron más.", " No room for more.") }
+        if r.effort != nil, effort == nil { text += L(" Ese esfuerzo no aplica a este modelo; usé el de siempre.", " That effort doesn't apply to this model; used the default.") }
+        reply(text, lang)
+    }
+
+    /// Every open pane by name, the current workspace's first.
+    private func paneList() -> [(ref: Store.PaneRef, title: String)] {
+        guard let store else { return [] }
+        let cur = store.selectedWorkspace?.id
+        let ws = store.state.workspaces.filter { !$0.agentHost }
+        return (ws.filter { $0.id == cur } + ws.filter { $0.id != cur }).flatMap { w in
+            w.spaces.flatMap { s in s.panes.map { (Store.PaneRef(workspaceID: w.id, paneID: $0.id), store.paneTitle($0)) } }
         }
     }
 
@@ -495,7 +568,31 @@ final class AssistantController: NSObject, ObservableObject {
         case "open_project": intent = project.map { .openProject($0) }
         case "new_space": intent = .newSpace(project)
         case "goto_space": intent = a.n.map { .gotoSpace($0) }
-        case "new_pane": intent = Tool(rawValue: a.tool ?? "claude").map { .newPane($0, project) }
+        case "new_pane":
+            intent = Tool(rawValue: a.tool ?? "claude").map { tool in
+                var r = PaneRequest(tool: tool, project: project, count: max(1, min(PaneRequest.maxCount, a.count ?? 1)),
+                                    prompt: a.prompt?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty)
+                if tool != .terminal, let m = a.model?.nonEmpty {
+                    let said = AssistantCommands.digitize(AssistantCommands.normalize(m))
+                    r.model = AssistantCommands.model(in: said, LaunchCatalog.modelChoices(for: tool, settings: store.settings))?.0
+                        ?? (m.contains("-") ? m : nil)
+                }
+                if let e = a.effort?.nonEmpty {
+                    r.effort = AssistantCommands.effort(in: AssistantCommands.normalize(e), allowed: [])
+                }
+                return .newPane(r)
+            }
+        case "send_to_pane":
+            guard let prompt = a.prompt?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty, let target = a.pane?.folded else { return }
+            let panes = paneList()
+            let refs: [Store.PaneRef]
+            switch target {
+            case "last", "ultimo", "the last pane": refs = Array(lastOpened.suffix(1))
+            case "all", "todos", "all of them": refs = lastOpened
+            default: refs = panes.first { $0.title.folded == target }.map { [$0.ref] } ?? []
+            }
+            let names = refs.map { r in panes.first { $0.ref == r }?.title ?? "?" }
+            intent = refs.isEmpty ? nil : .sendToPanes(refs, names: names, prompt: prompt)
         case "show_panel": intent = a.tab.flatMap { RightPanelModel.Tab(rawValue: $0) }.map { .showPanel($0) }
         case "home": intent = .home
         case "cancel_agent": intent = agent.map { .cancelAgent(id: $0.id, name: $0.name) }
