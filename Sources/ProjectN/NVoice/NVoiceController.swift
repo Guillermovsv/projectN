@@ -73,6 +73,8 @@ final class NVoiceController: NSObject, ObservableObject {
 
     /// Opens ProjectN's Settings › Voice (set by ProjectN).
     var onOpenSettings: (() -> Void)?
+    /// Passive wake listening must yield synchronously before a dictation shortcut opens the mic.
+    var onDictationWillStart: (() -> Void)?
 
     private let settings = NVoiceSettings.shared
     private let metrics = MetricsStore.shared
@@ -90,6 +92,7 @@ final class NVoiceController: NSObject, ObservableObject {
     private var wantMenuBarIcon = true
 
     private var recordingStart: Date?
+    private var dictationRecording = false
     private var targetApp: NSRunningApplication?
     private var enhanceThisTime = false
     private var busy = false               // transcribing / enhancing
@@ -141,7 +144,9 @@ final class NVoiceController: NSObject, ObservableObject {
         installObserversOnce()
         wireHotkey()
         applyHotkey(settings.hotkey)
-        transcriber.onLevel = { [weak self] in self?.overlay?.model.push(level: $0) }
+        if !transcriber.isRecording {
+            transcriber.onLevel = { [weak self] in self?.overlay?.model.push(level: $0) }
+        }
         transcriber.inputDeviceProvider = {
             AudioDevices.resolve(NVoiceDefaults.store.string(forKey: "microphone") ?? AudioDevices.automatic)
         }
@@ -174,7 +179,8 @@ final class NVoiceController: NSObject, ObservableObject {
         Diagnostics.log("ProjectN: stopping built-in NVoice")
         lockRetryTimer?.invalidate(); lockRetryTimer = nil
         permissionTimer?.invalidate(); permissionTimer = nil
-        if transcriber.isRecording { transcriber.cancel() }
+        if dictationRecording { transcriber.cancel() }
+        dictationRecording = false
         restoreOtherAudio()
         hotkey.stop()
         bag.removeAll()
@@ -300,7 +306,7 @@ final class NVoiceController: NSObject, ObservableObject {
     }
 
     private func applyHotkey(_ h: DictationHotkey) {
-        if transcriber.isRecording { cancelDictation() }
+        if dictationRecording { cancelDictation() }
         let registered = hotkey.configure(h)
         hotkeyProblem = registered ? nil : "macOS wouldn't register \(h.displayName). Try another shortcut."
         overlay?.model.hotkeyLabel = h.displayName
@@ -309,7 +315,7 @@ final class NVoiceController: NSObject, ObservableObject {
 
     /// While Settings records a new shortcut, the current one is switched off.
     func setCapturingHotkey(_ capturing: Bool) {
-        if capturing && transcriber.isRecording { cancelDictation() }
+        if capturing && dictationRecording { cancelDictation() }
         hotkey.setSuspended(capturing)
     }
 
@@ -319,7 +325,7 @@ final class NVoiceController: NSObject, ObservableObject {
             Diagnostics.log("hotkey down")
             switch self.settings.hotkeyMode {
             case .hold: self.startDictation()
-            case .toggle: self.transcriber.isRecording ? self.finishDictation() : self.startDictation()
+            case .toggle: self.dictationRecording ? self.finishDictation() : self.startDictation()
             }
         }
         hotkey.onHotkeyUp = { [weak self] in
@@ -328,12 +334,12 @@ final class NVoiceController: NSObject, ObservableObject {
         }
         hotkey.onHotkeyChord = { [weak self] in
             // fn + another key (fn+arrows, fn+F-keys…) is a shortcut, not a dictation.
-            guard let self, self.transcriber.isRecording,
+            guard let self, self.dictationRecording,
                   Date().timeIntervalSince(self.recordingStart ?? .distantPast) < 1.0 || self.settings.hotkeyMode == .hold else { return }
             self.cancelDictation("another key pressed with the shortcut")
         }
         hotkey.onEscape = { [weak self] in
-            guard let self, self.transcriber.isRecording else { return }
+            guard let self, self.dictationRecording else { return }
             self.cancelDictation("Esc")
         }
     }
@@ -341,6 +347,21 @@ final class NVoiceController: NSObject, ObservableObject {
     // MARK: Assistant (shares the warm mic engine: no second audio engine)
 
     private var assistantPrepared = false
+    private var assistantProfile: Profile?
+    private var assistantVocabulary: [String] = []
+    private var assistantModelLocales: [String] = []
+    private var assistantTranscriptHandler: ((String) -> Void)?
+    private var assistantTranscriptToken: UUID?
+
+    var assistantRecordingAvailable: Bool { !transcriber.isRecording && !busy && !standaloneRunning }
+
+    func assistantSetLevelHandler(_ onLevel: @escaping (Float) -> Void) {
+        transcriber.onLevel = onLevel
+    }
+
+    func assistantSetTranscriptHandler(_ onTranscript: @escaping (String) -> Void) {
+        assistantTranscriptHandler = onTranscript
+    }
 
     /// The Assistant opened: build the mic engine now (in the background) so its first recording starts at once,
     /// even when dictation is off.
@@ -357,36 +378,70 @@ final class NVoiceController: NSObject, ObservableObject {
 
     /// Starts recording for the Assistant panel. Levels go to `onLevel` instead of the dictation overlay.
     /// `vocabulary`: names the Assistant expects to hear (projects, spaces, panes, agents, tools), as speech hints.
-    func assistantStart(vocabulary: [String] = [], onLevel: @escaping (Float) -> Void) async throws {
+    func assistantStart(vocabulary: [String] = [], onTranscript: ((String) -> Void)? = nil,
+                        shouldStart: () -> Bool = { true },
+                        onLevel: @escaping (Float) -> Void) async throws {
         guard !transcriber.isRecording, !busy else { throw TranscriberError.micUnavailable("dictation is in use") }
         if !assistantPrepared {
             // Dictation may be off: permissions, mic choice and speech models aren't set up yet.
             guard await Transcriber.requestPermissions() else { throw TranscriberError.micDenied }
             useChosenMic()
-            for id in profiles.activeLocaleIDs { try await transcriber.ensureModel(localeID: id) }
             assistantPrepared = true
         }
+        let localeIDs = profiles.activeLocaleIDs
+        if assistantModelLocales != localeIDs {
+            for id in localeIDs { try await transcriber.ensureModel(localeID: id) }
+            assistantModelLocales = localeIDs
+        }
+        // Permissions/model downloads suspend: a dictation may have started while we waited.
+        guard !transcriber.isRecording, !busy else { throw TranscriberError.micUnavailable("dictation is in use") }
+        // The final callback can claim ownership atomically with starting capture (there is no await below).
+        guard shouldStart() else { throw CancellationError() }
         transcriber.onLevel = onLevel
-        // Speech engines take a limited list of hints: the Assistant's names first, then the personal dictionary.
-        var hints: [String] = []
-        for h in vocabulary + profiles.contextualStrings where !h.isEmpty && !hints.contains(h) { hints.append(h) }
+        // Keep the speaker and full vocabulary for corrections even when Apple's 100 hints are exhausted.
+        let profile = profiles.active
+        let hints = ProfileStore.recognitionHints(personal: profiles.contextualStrings, vocabulary: vocabulary)
+        assistantProfile = profile
+        assistantVocabulary = vocabulary
+        let token = UUID()
+        assistantTranscriptToken = token
+        assistantTranscriptHandler = onTranscript
+        let report: ((String) -> Void)? = onTranscript == nil ? nil : { [weak self] text in
+            guard let self, self.assistantTranscriptToken == token else { return }
+            self.assistantTranscriptHandler?(text)
+        }
         do {
-            try transcriber.start(localeIDs: profiles.activeLocaleIDs, contextualStrings: Array(hints.prefix(100)))
+            try transcriber.start(localeIDs: localeIDs, contextualStrings: hints, onTranscript: report)
         } catch {
+            assistantProfile = nil
+            assistantVocabulary = []
+            assistantTranscriptToken = nil
+            assistantTranscriptHandler = nil
             restoreOverlayLevels()
             throw error
         }
     }
 
     /// Stops the Assistant's recording and returns what was said (and in which language).
-    func assistantStop() async throws -> (text: String, localeID: String) {
+    func assistantStop(cleanTranscript: (String) -> String = { $0 }) async throws -> (text: String, localeID: String) {
         // Before waiting for the transcript: a late restore would steal the levels of the Assistant's next recording.
         restoreOverlayLevels()
+        let profile = assistantProfile
+        let vocabulary = assistantVocabulary
+        assistantProfile = nil
+        assistantVocabulary = []
+        assistantTranscriptToken = nil
+        assistantTranscriptHandler = nil
         let r = try await transcriber.stop()
-        return (r.text, r.localeID)
+        // Discard wake-listening background and speaker echo before applying/counting personal corrections.
+        return (profiles.personalize(cleanTranscript(r.text), profile: profile, vocabulary: vocabulary), r.localeID)
     }
 
     func assistantCancel() {
+        assistantProfile = nil
+        assistantVocabulary = []
+        assistantTranscriptToken = nil
+        assistantTranscriptHandler = nil
         transcriber.cancel()
         restoreOverlayLevels()
     }
@@ -398,16 +453,20 @@ final class NVoiceController: NSObject, ObservableObject {
     // MARK: Dictation flow
 
     private func startDictation() {
-        guard isOn, !transcriber.isRecording, !busy, let overlay else { return }
+        guard isOn, !busy, let overlay else { return }
+        onDictationWillStart?()
+        guard !transcriber.isRecording else { return }
         resetWork?.cancel()
         targetApp = NSWorkspace.shared.frontmostApplication
         enhanceThisTime = settings.enhanceEnabled || hotkey.shiftHeld
         do {
-            try transcriber.start(localeIDs: profiles.activeLocaleIDs, contextualStrings: profiles.contextualStrings)
+            try transcriber.start(localeIDs: profiles.activeLocaleIDs,
+                                  contextualStrings: ProfileStore.recognitionHints(personal: profiles.contextualStrings))
         } catch {
             show(error: error.localizedDescription)
             return
         }
+        dictationRecording = true
         recordingStart = Date()
         overlay.model.resetLevels()
         overlay.model.enhance = enhanceThisTime
@@ -422,7 +481,7 @@ final class NVoiceController: NSObject, ObservableObject {
         guard settings.duckAudio else { return }
         let level = Float(settings.duckLevel)
         let w = DispatchWorkItem { [weak self] in
-            guard let self, self.transcriber.isRecording else { return }
+            guard let self, self.dictationRecording else { return }
             AudioDucker.duck(to: level)
         }
         duckWork = w
@@ -435,6 +494,8 @@ final class NVoiceController: NSObject, ObservableObject {
     }
 
     private func cancelDictation(_ reason: String = "cancelled") {
+        guard dictationRecording else { return }
+        dictationRecording = false
         Diagnostics.log(String(format: "dictation cancelled (%@) after %.1f s", reason,
                                Date().timeIntervalSince(recordingStart ?? Date())))
         restoreOtherAudio()
@@ -444,7 +505,8 @@ final class NVoiceController: NSObject, ObservableObject {
     }
 
     private func finishDictation() {
-        guard transcriber.isRecording else { return }
+        guard dictationRecording, transcriber.isRecording else { return }
+        dictationRecording = false
         restoreOtherAudio()
         if hotkey.shiftHeld { enhanceThisTime = true }
         // Very short taps are accidental.
@@ -528,7 +590,7 @@ final class NVoiceController: NSObject, ObservableObject {
     private func scheduleIdle(after s: TimeInterval) {
         resetWork?.cancel()
         let w = DispatchWorkItem { [weak self] in
-            guard let self, !self.transcriber.isRecording, !self.busy else { return }
+            guard let self, !self.dictationRecording, !self.busy else { return }
             self.setPhase(.idle)
         }
         resetWork = w

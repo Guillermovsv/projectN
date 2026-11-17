@@ -60,6 +60,10 @@ final class AssistantController: NSObject, ObservableObject {
     @Published var speechSpeed: Double { didSet { d.set(speechSpeed, forKey: "assistant.speed") } }
     /// In conversation mode the mic stays open while it answers: start talking and it stops to listen to you.
     @Published var bargeIn: Bool { didSet { d.set(bargeIn, forKey: "assistant.bargeIn") } }
+    @Published var wakeWordEnabled: Bool {
+        didSet { d.set(wakeWordEnabled, forKey: "assistant.wakeWord"); updateWakeListening() }
+    }
+    @Published private(set) var wakeWordStatus = "Off"
 
     private let d = UserDefaults.standard
     private weak var store: Store?
@@ -116,6 +120,9 @@ final class AssistantController: NSObject, ObservableObject {
     private var spokenTurn = ""
     /// This turn began by interrupting an answer: what was being said, to remove from the transcript.
     private var echoText: String?
+    private let wakeListener = AssistantWakeListener()
+    private var wakeCapture = false
+    private var lastPartial = ""
 
     override init() {
         speakReplies = d.object(forKey: "assistant.speak") as? Bool ?? true
@@ -133,6 +140,7 @@ final class AssistantController: NSObject, ObservableObject {
         speechSpeed = d.object(forKey: "assistant.speed") as? Double ?? 1.05
         floating = d.object(forKey: "assistant.floating") as? Bool ?? false
         bargeIn = d.object(forKey: "assistant.bargeIn") as? Bool ?? true
+        wakeWordEnabled = d.object(forKey: "assistant.wakeWord") as? Bool ?? true
         super.init()
         synth.delegate = self
     }
@@ -140,6 +148,56 @@ final class AssistantController: NSObject, ObservableObject {
     func attach(store: Store, harness: AgentHarness, panel: RightPanelModel, nav: NavigationModel) {
         self.store = store; self.harness = harness; self.panel = panel; self.nav = nav
         harness.observe("assistant") { [weak self] task, event in self?.taskEvent(task, event) }
+        configureWakeListening()
+    }
+
+    private func configureWakeListening() {
+        // Unit tests must never request permission or activate a microphone.
+        guard !AppHome.isTestProcess else { return }
+        wakeListener.canListen = { [weak self] in
+            guard let self else { return false }
+            return self.orb.phase == .idle && !self.micOpen && !self.streaming && !self.transcribing
+                && !self.isSpeaking && (!self.conversation || !self.handsFree)
+        }
+        wakeListener.vocabulary = { [weak self] in self?.vocabulary() ?? [] }
+        wakeListener.onStatus = { [weak self] in self?.wakeWordStatus = $0 }
+        wakeListener.onWake = { [weak self] prompt, floor in self?.wokeUp(prompt: prompt, floor: floor) }
+        NVoiceController.shared.onDictationWillStart = { [weak self] in self?.wakeListener.pause() }
+        updateWakeListening()
+    }
+
+    private func updateWakeListening() {
+        guard store != nil, !AppHome.isTestProcess else { return }
+        wakeListener.setEnabled(wakeWordEnabled)
+    }
+
+    /// Adopt the wake recording, including any prompt spoken immediately after “Hey N”.
+    private func wokeUp(prompt: String, floor: Float) {
+        Diagnostics.log("assistant: woke on Hey N")
+        relisten?.cancel()
+        listenGen += 1
+        let gen = listenGen
+        micOpen = true
+        wakeCapture = true
+        conversation = true
+        emptyTurns = 0
+        echoText = nil
+        lastPartial = ""
+        vad = AssistantVAD()
+        vad.silenceToEnd = silenceSeconds
+        vad.giveUpAfter = 12
+        if !prompt.isEmpty { vad.startSpeaking(floor: min(floor, 0.2)) }
+        lastLevelAt = Date()
+        orb.phase = .listening
+        NVoiceController.shared.assistantSetLevelHandler { [weak self] in self?.heard(level: $0, gen: gen) }
+        NVoiceController.shared.assistantSetTranscriptHandler { [weak self] in self?.heardPartial($0, gen: gen) }
+        if floating {
+            FloatingAssistant.shared.show()
+        } else {
+            panel?.show(.assistant)
+            NSApp.activate(ignoringOtherApps: true)
+            NSApp.windows.first(where: { $0.canBecomeMain })?.makeKeyAndOrderFront(nil)
+        }
     }
 
     // MARK: Listening
@@ -183,6 +241,7 @@ final class AssistantController: NSObject, ObservableObject {
     func stopAll(reason: String? = nil) {
         if let reason, orb.phase != .idle { Diagnostics.log("assistant: stopped (\(reason))") }
         conversation = false
+        wakeListener.pause()
         watchingBargeIn = false
         echoText = nil
         relisten?.cancel()
@@ -200,6 +259,9 @@ final class AssistantController: NSObject, ObservableObject {
     /// `auto`: conversation mode opening the mic again after an answer.
     func startListening(auto: Bool = false) {
         guard !isListening else { return }
+        wakeListener.pause()
+        wakeCapture = false
+        lastPartial = ""
         relisten?.cancel()
         echoText = nil
         if watchingBargeIn { watchingBargeIn = false; endTurn() }
@@ -218,7 +280,10 @@ final class AssistantController: NSObject, ObservableObject {
         micOp { [weak self] in
             guard let self, gen == self.listenGen else { return }
             do {
-                try await NVoiceController.shared.assistantStart(vocabulary: self.vocabulary()) { [weak self] l in self?.heard(level: l, gen: gen) }
+                try await NVoiceController.shared.assistantStart(vocabulary: self.vocabulary(),
+                    onTranscript: { [weak self] in self?.heardPartial($0, gen: gen) },
+                    shouldStart: { [weak self] in self?.listenGen == gen && self?.isListening == true }
+                ) { [weak self] l in self?.heard(level: l, gen: gen) }
                 self.micOpen = true
             } catch {
                 Diagnostics.log("assistant: mic didn't start — \(error.localizedDescription)")
@@ -237,7 +302,7 @@ final class AssistantController: NSObject, ObservableObject {
     /// What you're likely to name, so speech recognition gets it right: "Claude" instead of "cloud",
     /// "Solar Devs" instead of "solar debs".
     func vocabulary() -> [String] {
-        var out = ["Claude", "Claude Code", "Codex", "Cursor", "Opus", "Sonnet", "Haiku", "Fable", "terminal", "ProjectN"]
+        var out = ["Claude", "Claude Code", "Codex", "Cursor", "Opus", "Sonnet", "Haiku", "Fable", "terminal", "ProjectN", "NVoice"]
         guard let store else { return out }
         out += store.state.projects.map(\.name)
         out += store.state.workspaces.filter { !$0.agentHost }.map(\.name)
@@ -267,6 +332,7 @@ final class AssistantController: NSObject, ObservableObject {
     /// Drops the current turn: late audio, transcripts and errors from it are ignored, and the mic is closed.
     private func endTurn() {
         listenGen += 1
+        wakeCapture = false
         transcribing = false
         micOp { [weak self] in self?.closeMic() }
     }
@@ -299,12 +365,31 @@ final class AssistantController: NSObject, ObservableObject {
         }
     }
 
+    private func heardPartial(_ text: String, gen: Int) {
+        guard gen == listenGen else { return }
+        if watchingBargeIn {
+            if bargeIn, AssistantBargeIn.isStopRequest(text, spoken: spokenTurn) { bargedIn() }
+            return
+        }
+        guard isListening else { return }
+        // The wake phrase isn't the prompt. Wait for the user even if they pause after saying the name.
+        let speech = wakeCapture ? (AssistantWakeCommand.prompt(in: text) ?? "") : text
+        let key = speech.folded.split(whereSeparator: { !$0.isLetter && !$0.isNumber }).joined(separator: " ")
+        guard !key.isEmpty, key != lastPartial else { return }
+        lastPartial = key
+        vad.recognizedSpeech()
+    }
+
     /// You finished talking (pause, or a click): transcribe and answer.
     func stopListening() {
         guard isListening else { return }
         orb.phase = .thinking
         transcribing = true
         let gen = listenGen
+        let fromWake = wakeCapture
+        let echo = echoText
+        wakeCapture = false
+        echoText = nil
         micOp { [weak self] in
             guard let self else { return }
             guard self.micOpen else {
@@ -315,16 +400,20 @@ final class AssistantController: NSObject, ObservableObject {
             let t0 = Date()
             do {
                 // Bounded: a transcript that never comes must not leave the Assistant on "Thinking".
-                let r = try await Self.within(12) { try await NVoiceController.shared.assistantStop() }
+                let r = try await Self.within(12) {
+                    try await NVoiceController.shared.assistantStop { raw in
+                        var text = fromWake ? (AssistantWakeCommand.prompt(in: raw) ?? "") : raw
+                        if let echo {
+                            let clean = AssistantBargeIn.stripEcho(text, spoken: echo)
+                            if clean != text { Diagnostics.log("assistant: removed its own voice from the start of what it heard") }
+                            text = clean
+                        }
+                        return text
+                    }
+                }
                 guard gen == self.listenGen else { return }
                 self.transcribing = false
-                var text = r.text.trimmingCharacters(in: .whitespacesAndNewlines)
-                if let echo = self.echoText {
-                    self.echoText = nil
-                    let raw = text
-                    text = AssistantBargeIn.stripEcho(text, spoken: echo)
-                    if text != raw { Diagnostics.log("assistant: removed its own voice from the start of what it heard") }
-                }
+                let text = r.text.trimmingCharacters(in: .whitespacesAndNewlines)
                 Diagnostics.log(String(format: "assistant: heard \"%@\" (transcribed in %.1f s)", String(text.prefix(140)), Date().timeIntervalSince(t0)))
                 if text.isEmpty { self.heardNothing(); return }
                 self.emptyTurns = 0
@@ -460,8 +549,8 @@ final class AssistantController: NSObject, ObservableObject {
         case .repeatLast:
             if let r = lastReply { say(r.text, r.lang) } else { reply(L("Aún no he dicho nada.", "I haven't said anything yet."), lang) }
         case .help:
-            reply(L("Puedo abrir proyectos y espacios, abrir varios paneles de Claude, Codex, Cursor o terminal con el modelo y el esfuerzo que digas y con un prompt para empezar, mandarle prompts a paneles abiertos, pedirle trabajo a tus agentes y decirte qué está corriendo. Por ejemplo: abre tres Claude en Opus 5.5 low que revisen el login; dile a Ada que corra los tests.",
-                    "I can open projects and spaces, open several Claude, Codex, Cursor or terminal panes with the model and effort you say and a prompt to start on, send prompts to open panes, hand work to your agents and tell you what's running. Try: open three Claude in Opus 5.5 low to review the login; tell Ada to run the tests."), lang)
+            reply(L("Puedo abrir proyectos y espacios, abrir varios paneles de Claude, Codex, Cursor o terminal con el modelo y el esfuerzo que digas y con un prompt para empezar, cerrar paneles abiertos o cambiar su modelo y esfuerzo, mandarles prompts, pedirle trabajo a tus agentes y decirte qué está corriendo. Por ejemplo: abre tres Claude en Opus 5.5 low que revisen el login; dile a Ada que corra los tests.",
+                    "I can open projects and spaces, open several Claude, Codex, Cursor or terminal panes with the model and effort you say and a prompt to start on, close open panes or change their model and effort, send them prompts, hand work to your agents and tell you what's running. Try: open three Claude in Opus 5.5 low to review the login; tell Ada to run the tests."), lang)
         case .status:
             reply(statusText(lang), lang)
         case .pending:
@@ -513,6 +602,8 @@ final class AssistantController: NSObject, ObservableObject {
             }
             reply(live.count == 1 ? L("Se lo mandé a \(names.first ?? "ese panel").", "Sent it to \(names.first ?? "that pane").")
                                   : L("Se lo mandé a \(live.count) paneles.", "Sent it to \(live.count) panes."), lang)
+        case .controlPanes(let target, let settings):
+            controlPanes(target: target, settings: settings, lang: lang)
         case .showPanel(let tab):
             panel?.show(tab)
             reply(tab.label + ".", lang)
@@ -573,6 +664,65 @@ final class AssistantController: NSObject, ObservableObject {
         if opened.count < r.count { text += L(" No cupieron más.", " No room for more.") }
         if r.effort != nil, effort == nil { text += L(" Ese esfuerzo no aplica a este modelo; usé el de siempre.", " That effort doesn't apply to this model; used the default.") }
         reply(text, lang)
+    }
+
+    /// Validate the entire request before touching any session. The existing Store controls own restarts.
+    private func controlPanes(target: String, settings: String?, lang: AssistantLang) {
+        guard let store else { return }
+        func L(_ es: String, _ en: String) -> String { lang == .es ? es : en }
+        let panes = paneList().compactMap { item -> AssistantCommands.ControlPane? in
+            guard let (space, pane) = store.pane(item.ref.paneID, in: item.ref.workspaceID),
+                  pane.tool == .claude || pane.tool == .codex, !pane.isAgentPane else { return nil }
+            return .init(ref: item.ref, title: item.title, tool: pane.tool,
+                         inCurrentSpace: space.id == store.selectedSpace?.id)
+        }
+        let focused = store.selectedWorkspace.flatMap { w in
+            store.selectedSpace?.focusedPaneID.map { Store.PaneRef(workspaceID: w.id, paneID: $0) }
+        }
+        let refs = AssistantCommands.controlTargets(target, panes: panes, focused: focused, last: lastOpened)
+        guard !refs.isEmpty, refs.allSatisfy({ r in panes.contains { $0.ref == r } }) else {
+            reply(L("No encontré un panel único. Di su nombre exacto, el panel actual o todos los Claude o Codex de este espacio.",
+                    "I couldn't identify the panes. Say an exact pane name, the focused pane, or all Claude or Codex panes in this space."), lang)
+            return
+        }
+        var updates: [(Store.PaneRef, LaunchOptions)] = []
+        if let settings {
+            for ref in refs {
+                guard let (_, pane) = store.pane(ref.paneID, in: ref.workspaceID) else { return }
+                let current = LaunchCatalog.explicit(pane.launchOptions, tool: pane.tool, settings: store.settings)
+                // First parse against every possible effort, then check the selected model's supported levels.
+                guard var options = AssistantCommands.controlOptions(settings,
+                    choices: LaunchCatalog.modelChoices(for: pane.tool, settings: store.settings),
+                    efforts: ["minimal", "low", "medium", "high", "xhigh", "max"], current: current) else {
+                    reply(L("Modelo o esfuerzo no reconocido para \(store.paneTitle(pane)). No cambié ningún panel.",
+                            "Unrecognized model or effort for \(store.paneTitle(pane)). No panes were changed."), lang); return
+                }
+                let allowed = LaunchCatalog.efforts(for: pane.tool, model: options.model, settings: store.settings)
+                if let e = options.effort, !allowed.contains(e) {
+                    // A model-only change follows the composer's fallback for an incompatible inherited effort.
+                    let explicitEffort = AssistantCommands.effort(in: AssistantCommands.normalize(settings), allowed: [])
+                    guard explicitEffort == nil else {
+                        reply(L("Ese modelo no admite ese esfuerzo. No cambié ningún panel.",
+                                "That model doesn't support that effort. No panes were changed."), lang); return
+                    }
+                    options.effort = allowed.contains("medium") ? "medium" : allowed.first
+                }
+                updates.append((ref, options))
+            }
+        }
+        if settings == nil {
+            refs.forEach { store.closePane($0.paneID, in: $0.workspaceID) }
+            lastOpened.removeAll { refs.contains($0) }
+            reply(L("Cerré \(refs.count) paneles.", "Closed \(refs.count) panes."), lang)
+        } else {
+            var applied = 0
+            for (ref, options) in updates {
+                store.setLaunchOptions(options, pane: ref.paneID, in: ref.workspaceID)
+                if store.pane(ref.paneID, in: ref.workspaceID)?.1.launchOptions == options { applied += 1 }
+            }
+            reply(L("Configuración aplicada en \(applied) de \(refs.count) paneles.",
+                    "Settings applied to \(applied) of \(refs.count) panes."), lang)
+        }
     }
 
     /// Every open pane by name, the current workspace's first.
@@ -803,6 +953,17 @@ final class AssistantController: NSObject, ObservableObject {
             }
             let names = refs.map { r in panes.first { $0.ref == r }?.title ?? "?" }
             intent = refs.isEmpty ? nil : .sendToPanes(refs, names: names, prompt: prompt)
+        case "close_pane", "configure_pane":
+            guard let target = a.pane?.nonEmpty else { return }
+            if a.kind == "configure_pane" {
+                let settings = [a.model, a.effort].compactMap { $0?.nonEmpty }.joined(separator: " ")
+                guard !settings.isEmpty else { return }
+                // Always report the actual result, including invalid settings or cancelled restarts.
+                perform(.controlPanes(target: target, settings: settings), lang: lang)
+            } else {
+                perform(.controlPanes(target: target, settings: nil), lang: lang)
+            }
+            return
         case "show_panel": intent = a.tab.flatMap { RightPanelModel.Tab(rawValue: $0) }.map { .showPanel($0) }
         case "home": intent = .home
         case "cancel_agent": intent = agent.map { .cancelAgent(id: $0.id, name: $0.name) }
@@ -864,6 +1025,7 @@ final class AssistantController: NSObject, ObservableObject {
     func say(_ text: String, _ lang: AssistantLang) {
         let clean = AssistantCommands.spoken(text, limit: 600)
         guard !clean.isEmpty else { settle(); return }
+        wakeListener.pause()
         if isListening {
             // Something to report (an agent finished…) while the mic is open: the mic would hear it and take it
             // for you. If you're mid-sentence it stays in the conversation unspoken; otherwise listen again after.
@@ -888,7 +1050,7 @@ final class AssistantController: NSObject, ObservableObject {
 
     /// While it answers in a conversation, keep the mic open: talking over the answer stops it and becomes your turn.
     private func watchForBargeIn() {
-        guard bargeIn, conversation, handsFree, !watchingBargeIn, !isListening, !transcribing else { return }
+        guard bargeIn, !watchingBargeIn, !isListening, !transcribing else { return }
         watchingBargeIn = true
         bargeDetector = AssistantBargeIn()
         listenGen += 1
@@ -896,7 +1058,10 @@ final class AssistantController: NSObject, ObservableObject {
         micOp { [weak self] in
             guard let self, gen == self.listenGen, self.watchingBargeIn else { return }
             do {
-                try await NVoiceController.shared.assistantStart { [weak self] l in self?.micLevel(l, gen: gen) }
+                try await NVoiceController.shared.assistantStart(vocabulary: self.vocabulary(),
+                    onTranscript: { [weak self] in self?.heardPartial($0, gen: gen) },
+                    shouldStart: { [weak self] in self?.listenGen == gen && self?.watchingBargeIn == true }
+                ) { [weak self] l in self?.micLevel(l, gen: gen) }
                 self.micOpen = true
             } catch {
                 Diagnostics.log("assistant: can't listen for interruptions — \(error.localizedDescription)")
@@ -911,7 +1076,7 @@ final class AssistantController: NSObject, ObservableObject {
     private func micLevel(_ l: Float, gen: Int) {
         guard gen == listenGen else { return }
         guard watchingBargeIn else { heard(level: l, gen: gen); return }
-        if bargeDetector.push(l) { bargedIn() }
+        if bargeIn, bargeDetector.push(l) { bargedIn() }
     }
 
     /// You started talking over the answer: it stops, and the recording already running becomes your turn
@@ -919,15 +1084,18 @@ final class AssistantController: NSObject, ObservableObject {
     private func bargedIn() {
         Diagnostics.log("assistant: interrupted — you talked over the answer")
         watchingBargeIn = false
+        wakeCapture = false
+        lastPartial = ""
         echoText = spokenTurn
         relisten?.cancel()
         stopSpeaking()
         cancelAI()
         conversation = true
         emptyTurns = 0
+        let room = min(vad.noiseFloor, bargeDetector.quiet)
         vad = AssistantVAD()
         vad.silenceToEnd = silenceSeconds
-        vad.startSpeaking(floor: bargeDetector.quiet)
+        vad.startSpeaking(floor: room)
         lastLevelAt = Date()
         orb.phase = .listening
     }
@@ -937,7 +1105,8 @@ final class AssistantController: NSObject, ObservableObject {
     func stopSpeaking() {
         queued.removeAll()
         speechCheck?.cancel()
-        if synth.isSpeaking { synth.stopSpeaking(at: .immediate) }
+        // isSpeaking can lag while an utterance is queued: always cancel pending playback as well.
+        synth.stopSpeaking(at: .immediate)
     }
 
     /// Safety net for a "finished" callback that never comes (it happens with some voices): once the synthesizer
@@ -1049,7 +1218,7 @@ struct AssistantVAD {
     var giveUpAfter: TimeInterval = 7
     var maxLength: TimeInterval = 45
     /// How long the background level is measured before speech can be detected.
-    static let calibration: TimeInterval = 0.4
+    static let calibration: TimeInterval = 0.2
     private var began: Date?
     private var calibrating: [(level: Float, at: Date)] = []
     private var calibrated = false
@@ -1059,6 +1228,14 @@ struct AssistantVAD {
     private var lastLoud = Date.distantPast
 
     init() {}
+
+    var noiseFloor: Float { floor }
+
+    /// A changing live transcript confirms speech even when a quiet voice falls below the volume gate.
+    mutating func recognizedSpeech(now: Date = Date()) {
+        heardSpeech = true
+        lastLoud = now
+    }
 
     /// Listening picks up mid-sentence (you interrupted an answer): already speaking, in a room at `floor`.
     mutating func startSpeaking(floor f: Float, now: Date = Date()) {
@@ -1071,9 +1248,9 @@ struct AssistantVAD {
     }
 
     /// Speech starts above this…
-    private var startLevel: Float { max(0.3, floor + 0.18) }
+    private var startLevel: Float { max(0.18, floor + 0.1) }
     /// …and goes on while above this.
-    private var keepLevel: Float { max(0.22, floor + 0.1) }
+    private var keepLevel: Float { max(0.12, floor + 0.06) }
 
     mutating func push(_ level: Float, now: Date = Date()) -> Result {
         if began == nil { began = now }
@@ -1084,9 +1261,10 @@ struct AssistantVAD {
             // The quiet moments are the room: even someone who starts talking at once pauses between syllables.
             // A low percentile, not the minimum: the first buffers of a starting mic can be pure silence.
             let sorted = calibrating.map(\.level).sorted()
-            floor = sorted[min(sorted.count - 1, sorted.count / 5)]
+            // Even a short calibration must ignore the input unit's first zero buffer.
+            floor = sorted[min(sorted.count - 1, max(1, sorted.count / 5))]
             calibrated = true
-            for s in calibrating.dropLast() { loudness(s.level, at: s.at) }
+            for s in calibrating.dropLast() { loudness(s.level, at: s.at, learnFloor: false) }
             calibrating = []
         }
         loudness(level, at: now)
@@ -1095,7 +1273,7 @@ struct AssistantVAD {
         return t > giveUpAfter ? .nothingSaid : .listening
     }
 
-    private mutating func loudness(_ level: Float, at now: Date) {
+    private mutating func loudness(_ level: Float, at now: Date, learnFloor: Bool = true) {
         if level > (heardSpeech ? keepLevel : startLevel) {
             loudRun += 1
             if loudRun >= 2 { heardSpeech = true }       // two buffers in a row (~40 ms): not a click
@@ -1103,7 +1281,7 @@ struct AssistantVAD {
         } else {
             loudRun = 0
             // Before you speak, follow the room: down quickly, up slowly.
-            if !heardSpeech { floor += (level - floor) * (level < floor ? 0.3 : 0.02) }
+            if !heardSpeech, learnFloor { floor += (level - floor) * (level < floor ? 0.3 : 0.02) }
         }
     }
 }
@@ -1113,10 +1291,10 @@ struct AssistantVAD {
 /// With headphones there is no echo and any speech counts.
 struct AssistantBargeIn {
     /// The very start of the answer is ignored: the mic may still carry the end of your last sentence.
-    static let settle: TimeInterval = 0.5
-    var minLevel: Float = 0.45
-    var margin: Float = 0.15
-    var holdFor: TimeInterval = 0.3
+    static let settle: TimeInterval = 0.15
+    var minLevel: Float = 0.18
+    var margin: Float = 0.1
+    var holdFor: TimeInterval = 0.12
     private var began: Date?
     /// What the speakers put into the mic: follows peaks quickly, decays slowly.
     private(set) var echo: Float = 0
@@ -1129,29 +1307,49 @@ struct AssistantBargeIn {
 
     /// True once you're talking over the answer.
     mutating func push(_ l: Float, now: Date = Date()) -> Bool {
-        if began == nil { began = now }
+        if began == nil {
+            began = now
+            echo = l
+        }
         quiet = min(quiet, l)
         let t = now.timeIntervalSince(began!)
+        // A new sound after a gap must earn its own hold time; stale candidates cannot interrupt.
+        if let ll = lastLoud, now.timeIntervalSince(ll) > 0.3 { loudSince = nil; lastLoud = nil }
         if t >= Self.settle, l > max(minLevel, echo + margin) {
             if loudSince == nil { loudSince = now }
             lastLoud = now
             return now.timeIntervalSince(loudSince!) >= holdFor
         }
         // Short dips between syllables don't restart the count.
-        if let ll = lastLoud, now.timeIntervalSince(ll) > 0.15 { loudSince = nil; lastLoud = nil }
         if loudSince == nil { echo += (l - echo) * (l > echo ? 0.5 : 0.04) }
         return false
     }
 
     /// The start of a turn that interrupted an answer may be the answer itself, heard through the speakers:
-    /// leading words that were just spoken are dropped (two or more in a row — one word like "no" may be yours).
+    /// Drop only a contiguous phrase from the answer. Sharing unrelated words with the answer isn't echo.
     static func stripEcho(_ heard: String, spoken: String) -> String {
         func norm(_ w: Substring) -> String { String(w).folded.trimmingCharacters(in: .punctuationCharacters.union(.symbols)) }
-        let said = Set(spoken.split(whereSeparator: \.isWhitespace).map(norm).filter { !$0.isEmpty })
+        let said = spoken.split(whereSeparator: \.isWhitespace).map(norm).filter { !$0.isEmpty }
         let words = heard.split(whereSeparator: \.isWhitespace)
-        var i = 0
-        while i < words.count, said.contains(norm(words[i])) { i += 1 }
-        guard i >= 2 || (i == words.count && i > 0) else { return heard }
-        return words[i...].joined(separator: " ")
+        let normalized = words.map(norm)
+        var matched = 0
+        for start in said.indices {
+            var count = 0
+            while count < words.count, start + count < said.count, normalized[count] == said[start + count] { count += 1 }
+            matched = max(matched, count)
+        }
+        guard matched >= 2 else { return heard }
+        return words.dropFirst(matched).joined(separator: " ")
+    }
+
+    /// A quiet explicit interruption is also recognized from live text. Words in our own answer cannot fire it.
+    static func isStopRequest(_ heard: String, spoken: String) -> Bool {
+        let stops: Set<String> = ["stop", "wait", "quiet", "silence", "espera", "detente", "para", "callate", "silencio"]
+        func words(_ text: String) -> [String] {
+            text.folded.split(whereSeparator: { !$0.isLetter }).map(String.init)
+        }
+        let remaining = words(stripEcho(heard, spoken: spoken))
+        let said = Set(words(spoken))
+        return remaining.suffix(3).contains { stops.contains($0) && !said.contains($0) }
     }
 }

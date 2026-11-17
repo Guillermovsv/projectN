@@ -122,22 +122,55 @@ final class ProfileStore: ObservableObject {
         return Array(Set(p.dictionary + p.rules.map(\.replacement))).sorted()
     }
 
-    /// Applies correction rules, then fixes the capitalization of dictionary terms.
-    func personalize(_ text: String) -> String {
+    /// Apple's hints are a soft bias, limited to 100 phrases. Reserve room for both personal words and
+    /// the current app context; duplicate spellings must not consume that budget.
+    static func recognitionHints(personal: [String], vocabulary: [String] = []) -> [String] {
+        func unique(_ values: [String]) -> [String] {
+            var seen = Set<String>()
+            return values.compactMap { value in
+                let phrase = value.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+                guard !phrase.isEmpty, seen.insert(phrase.lowercased()).inserted else { return nil }
+                return phrase
+            }
+        }
+        let personal = unique(personal)
+        let context = unique(vocabulary)
+        let reserved = min(25, context.count)
+        let personalCount = min(personal.count, 100 - reserved)
+        // Deduplicate after reserving slots: a context word also found late in a large personal dictionary
+        // must still get a hint, rather than being excluded from both parts of the budget.
+        return Array(unique(Array(personal.prefix(personalCount)) + context
+            + Array(personal.dropFirst(personalCount))).prefix(100))
+    }
+
+    struct Personalization {
+        let text: String
+        let usedRules: [UUID]
+    }
+
+    /// Pure transformation shared by dictation and Assistant turns, including hints Apple ignored.
+    static func personalized(_ text: String, profile: Profile, vocabulary: [String] = []) -> Personalization {
         var out = text
         var used: [UUID] = []
         // Longer phrases first so "for v marketing" wins over "marketing".
-        for rule in active.rules.sorted(by: { $0.heard.count > $1.heard.count }) {
-            let replaced = Self.replaceWholeWords(rule.heard, with: rule.replacement, in: out)
+        for rule in profile.rules.sorted(by: { $0.heard.count > $1.heard.count }) {
+            let replaced = replaceWholeWords(rule.heard, with: rule.replacement, in: out)
             if replaced != out { used.append(rule.id); out = replaced }
         }
-        // Dictionary terms: fixes capitalization and catches sound-alike misspellings
-        // ("4B marketing" → "4vmarketing") that the speech engine produced despite the hint.
-        out = DictionaryMatcher.apply(terms: active.dictionary, to: out)
-        if !used.isEmpty {
-            update { p in for i in p.rules.indices where used.contains(p.rules[i].id) { p.rules[i].uses += 1 } }
+        out = DictionaryMatcher.apply(terms: profile.dictionary + vocabulary, to: out)
+        return Personalization(text: out, usedRules: used)
+    }
+
+    /// Applies correction rules, then fixes the capitalization of dictionary terms.
+    func personalize(_ text: String, profile: Profile? = nil, vocabulary: [String] = []) -> String {
+        let speaker = profile ?? active
+        let result = Self.personalized(text, profile: speaker, vocabulary: vocabulary)
+        if !result.usedRules.isEmpty {
+            update(speaker.id) { p in
+                for i in p.rules.indices where result.usedRules.contains(p.rules[i].id) { p.rules[i].uses += 1 }
+            }
         }
-        return out
+        return result.text
     }
 
     static func replaceWholeWords(_ phrase: String, with replacement: String, in text: String) -> String {

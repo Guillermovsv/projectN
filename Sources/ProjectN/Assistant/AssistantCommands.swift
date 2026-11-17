@@ -25,6 +25,8 @@ enum AssistantIntent: Equatable {
     case newPane(PaneRequest)
     /// A prompt typed into panes that already exist ("dile a Ada que …", "diles a todos que …").
     case sendToPanes([Store.PaneRef], names: [String], prompt: String)
+    /// Existing panes only; settings text is validated against each pane's catalog before execution.
+    case controlPanes(target: String, settings: String?)
     case showPanel(RightPanelModel.Tab)
     case askAgent(id: UUID, name: String, instruction: String)
     case cancelAgent(id: UUID, name: String)
@@ -86,6 +88,8 @@ enum AssistantCommands {
             }
         }
 
+        if let control = paneControl(f) { return control }
+
         // Panes first, so a prompt that mentions spaces or projects stays part of the prompt:
         // "abre 5 claude en opus 5.5 low que …", "nueva terminal", "lanza codex en blog".
         let paneVerbs = ["abre", "abrir", "nuevo", "nueva", "nuevos", "nuevas", "lanza", "lanzar", "inicia", "arranca",
@@ -143,6 +147,69 @@ enum AssistantCommands {
             }
         }
         return .unknown(raw)
+    }
+
+    /// Deliberately separate from new-pane parsing so changes never create a replacement pane.
+    static func paneControl(_ text: String) -> AssistantIntent? {
+        if let r = text.range(of: #"^(?:close|cierra|cerrar)\s+"#, options: .regularExpression) {
+            return .controlPanes(target: String(text[r.upperBound...]), settings: nil)
+        }
+        guard let verb = text.range(of: #"^(?:change|set|switch|cambia|cambiar|ajusta)\s+"#, options: .regularExpression) else { return nil }
+        let rest = String(text[verb.upperBound...])
+        guard let separator = rest.range(of: #"\s+(?:to|a|en)\s+"#, options: .regularExpression) else { return nil }
+        var target = String(rest[..<separator.lowerBound])
+        target = target.replacingOccurrences(of: #"^(?:(?:el|the)\s+)?(?:model|modelo|effort|esfuerzo)\b(?:\s+(?:of|de))?\s*"#, with: "", options: .regularExpression)
+        target = target.replacingOccurrences(of: #"\s+(?:model|modelo|effort|esfuerzo)$"#, with: "", options: .regularExpression)
+        let settings = String(rest[separator.upperBound...])
+        return .controlPanes(target: target.isEmpty ? "focused" : target, settings: settings)
+    }
+
+    struct ControlPane {
+        var ref: Store.PaneRef
+        var title: String
+        var tool: Tool
+        var inCurrentSpace: Bool
+    }
+
+    /// Exact names only for actions that close or reconfigure sessions. Tool groups stay in this space.
+    static func controlTargets(_ target: String, panes: [ControlPane], focused: Store.PaneRef?, last: [Store.PaneRef]) -> [Store.PaneRef] {
+        var t = misheard(normalize(target))
+        t = t.replacingOccurrences(of: #"^(?:(?:el|la|los|las|the)\s+)?(?:(?:panel|pane)\s+)?"#, with: "", options: .regularExpression)
+        if ["focused", "focused pane", "current", "current pane", "this pane", "actual", "enfocado", "este panel"].contains(t) {
+            return focused.map { [$0] } ?? []
+        }
+        if ["last", "last pane", "ultimo", "ultimo panel"].contains(t) { return Array(last.suffix(1)).filter { r in panes.contains { $0.ref == r } } }
+        if ["all", "todos", "all of them", "todos ellos"].contains(t) { return last.filter { r in panes.contains { $0.ref == r } } }
+        let names = panes.filter { normalize($0.title) == t }
+        if !names.isEmpty { return names.count == 1 ? names.map(\.ref) : [] }
+        let group = t.replacingOccurrences(of: #"^(?:all|todos|todas)(?:\s+(?:the|los|las))?\s+"#, with: "", options: .regularExpression)
+            .replacingOccurrences(of: #"\s+(?:panes|paneles)$"#, with: "", options: .regularExpression)
+        guard let tool = [("claude", Tool.claude), ("claudes", .claude), ("codex", .codex)].first(where: { $0.0 == group })?.1 else { return [] }
+        let hits = panes.filter { $0.inCurrentSpace && $0.tool == tool }
+        let plural = group == "claudes" || t.hasPrefix("all ") || t.hasPrefix("todos ") || t.hasPrefix("todas ")
+        return hits.count == 1 || plural ? hits.map(\.ref) : []
+    }
+
+    /// Reject unknown words instead of silently applying only the recognized part of a setting.
+    static func controlOptions(_ text: String, choices: [LaunchCatalog.Choice], efforts: [String], current: LaunchOptions) -> LaunchOptions? {
+        var rest = digitize(normalize(text))
+        var options = current
+        var changed = false
+        if let (value, phrase) = model(in: rest, choices) {
+            options.model = value
+            rest = rest.replacingOccurrences(of: phrase, with: " ")
+            changed = true
+        }
+        let fillers = #"\b(?:model|modelo|effort|esfuerzo|reasoning|razonamiento|level|nivel|with|con|and|y|on|in|en|at|a|to|el|the)\b"#
+        rest = rest.replacingOccurrences(of: fillers, with: " ", options: .regularExpression)
+            .split(separator: " ").joined(separator: " ")
+        if !rest.isEmpty {
+            // Matching the whole remaining phrase prevents 'high nonsense' from becoming 'high'.
+            guard let e = effortWords.first(where: { $0.0 == rest })?.1, efforts.contains(e) else { return nil }
+            options.effort = e
+            changed = true
+        }
+        return changed ? options : nil
     }
 
     private static let goVerbs = ["abre", "abrir", "ve a", "ve al", "vete a", "ir a", "vamos a", "cambia", "cambiate", "cambiame",

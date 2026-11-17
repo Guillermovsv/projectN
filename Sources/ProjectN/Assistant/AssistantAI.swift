@@ -51,6 +51,8 @@ enum AssistantAI {
         ACTION {"do":"agents_view"}
         ACTION {"do":"new_pane","tool":"claude|codex|cursor|terminal","project":"<name, optional>","count":<1-16, optional>,"model":"<optional>","effort":"<optional>","prompt":"<first message, optional>"}
         ACTION {"do":"send_to_pane","pane":"<pane name from the snapshot, or last (the pane you opened last), or all (every pane you opened last)>","prompt":"<message to type into it>"}
+        ACTION {"do":"close_pane","pane":"<exact pane name, focused, last, all, all Claude, or all Codex>"}
+        ACTION {"do":"configure_pane","pane":"<same targets as close_pane>","model":"<optional model from snapshot>","effort":"<optional effort>"}
         ACTION {"do":"show_panel","tab":"files|activity|browser"}
         ACTION {"do":"home"}
         ACTION {"do":"ask_agent","agent":"<agent name>","project":"<name, optional>","instruction":"<clear task for the agent>"}
@@ -66,6 +68,14 @@ enum AssistantAI {
         add one new_pane per task. For a terminal, prompt is a shell command. To give work to a pane that is already open, use
         send_to_pane with its name. When the user asks for panes/terminals by name ("five Claudes", "a Codex that…") use
         new_pane/send_to_pane, not ask_agent; use ask_agent when they name an agent or don't ask for a pane.
+        For existing panes, close_pane closes their sessions; configure_pane changes model and/or effort using the app controls.
+        Use these actions for closing or changing settings, never new_pane, ask_agent or send_to_pane.
+        Exact pane names may refer to any workspace; duplicate names require clarification. focused means the focused pane
+        in the current space; last means the last pane you opened; all means the panes you opened last.
+        all Claude and all Codex target only the current space. A bare Claude or Codex target requires exactly one match there.
+        Only ordinary Claude and Codex panes can be closed or configured this way, not agent-task panes.
+        Claude changes model/effort live. Codex restarts and resumes; a busy session asks for confirmation in the app.
+        The app validates settings and reports the actual outcome. Do not claim settings have already been changed.
         For work on code (fix, build, review, write…), use ask_agent with the best-suited agent and a well-written instruction.
         The request comes from speech recognition, so names are often slightly off ("cloud" or "code" for Claude,
         "solar debs" for Solar Devs, "aire dinamica" for Airedinamica, "doctor Sergio" for dr-sergio): map them to the closest
@@ -86,7 +96,8 @@ enum AssistantAI {
                     let state = store.needsInputIDs.contains(p.id) ? "needs input" : (store.runtimes[p.id]?.isRunning == true ? "running" : "stopped")
                     let launch = p.tool == .terminal ? "" : ", " + [LaunchCatalog.modelLabel(p.model ?? "", tool: p.tool), p.effort ?? ""]
                         .filter { !$0.isEmpty }.joined(separator: " ")
-                    return "\(store.paneTitle(p)) (\(p.tool.label)\(launch), \(store.project(p.projectID)?.name ?? "?"), \(state))"
+                    let focused = s.id == store.selectedSpace?.id && p.id == s.focusedPaneID ? " [focused]" : ""
+                    return "\(store.paneTitle(p))\(focused) (\(p.tool.label)\(launch), \(store.project(p.projectID)?.name ?? "?"), \(state))"
                 }
                 let sel = s.id == store.state.ui.selectedSpaceID ? " [current]" : ""
                 return "  - \(s.name)\(sel): " + (panes.joined(separator: "; ").nonEmpty ?? "empty")

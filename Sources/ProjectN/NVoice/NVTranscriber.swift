@@ -79,11 +79,11 @@ final class Transcriber {
         return l
     }
 
-    static func makeModule(locale: Locale) -> DictationTranscriber {
+    static func makeModule(locale: Locale, liveResults: Bool = false) -> DictationTranscriber {
         DictationTranscriber(locale: locale,
                              contentHints: [],
                              transcriptionOptions: [.punctuation],
-                             reportingOptions: [],
+                             reportingOptions: liveResults ? [.volatileResults] : [],
                              attributeOptions: [.transcriptionConfidence])
     }
 
@@ -103,7 +103,8 @@ final class Transcriber {
 
     /// Starts recording. With more than one locale (e.g. English + Spanish), every language transcribes the
     /// same audio in parallel and the most confident result wins — automatic language detection per dictation.
-    func start(localeIDs: [String], contextualStrings: [String] = [], inputDevice: AudioInputDevice? = nil) throws {
+    func start(localeIDs: [String], contextualStrings: [String] = [], inputDevice: AudioInputDevice? = nil,
+               onTranscript: ((String) -> Void)? = nil) throws {
         guard !isRecording else { return }
         guard AVCaptureDevice.authorizationStatus(for: .audio) == .authorized else { throw TranscriberError.micDenied }
         let ids = localeIDs.reduce(into: [String]()) { if !$0.contains($1) { $0.append($1) } }
@@ -163,7 +164,8 @@ final class Transcriber {
             var lanes: [Lane] = []
             var firstError: Error?
             for (i, id) in ids.enumerated() {
-                do { lanes.append(try await Lane.make(localeID: id, primary: i == 0, micFormat: micFormat, contextualStrings: contextualStrings)) }
+                do { lanes.append(try await Lane.make(localeID: id, primary: i == 0, micFormat: micFormat,
+                                                     contextualStrings: contextualStrings, onTranscript: onTranscript)) }
                 catch { firstError = firstError ?? error }
             }
             guard !lanes.isEmpty else { throw firstError ?? TranscriberError.noAudioFormat }
@@ -202,9 +204,10 @@ final class Transcriber {
             self.format = format; self.converter = converter; self.input = input; self.collector = collector
         }
 
-        static func make(localeID: String, primary: Bool, micFormat: AVAudioFormat, contextualStrings: [String]) async throws -> Lane {
+        static func make(localeID: String, primary: Bool, micFormat: AVAudioFormat, contextualStrings: [String],
+                         onTranscript: ((String) -> Void)? = nil) async throws -> Lane {
             let locale = try await Transcriber.resolveLocale(localeID)
-            let module = Transcriber.makeModule(locale: locale)
+            let module = Transcriber.makeModule(locale: locale, liveResults: onTranscript != nil)
             guard let format = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [module], considering: micFormat) else {
                 throw TranscriberError.noAudioFormat
             }
@@ -220,7 +223,12 @@ final class Transcriber {
             let (stream, cont) = AsyncStream<AnalyzerInput>.makeStream()
             let collector = Task { () -> (String, Double, Int) in
                 var text = "", confSum = 0.0, confChars = 0
-                for try await r in module.results where r.isFinal {
+                for try await r in module.results {
+                    if let onTranscript {
+                        let current = text + String(r.text.characters)
+                        await MainActor.run { onTranscript(current) }
+                    }
+                    guard r.isFinal else { continue }
                     text += String(r.text.characters)
                     for run in r.text.runs {
                         if let c = run.transcriptionConfidence {

@@ -13,6 +13,11 @@ struct SidebarView: View {
     @State private var renaming: RenameTarget?
     @State private var confirmDelete: Workspace?
     @State private var editProjects: IDBox?
+    @State private var showAllWorkspaces = false
+    @State private var showAllProjects = false
+
+    private let workspaceLimit = 5
+    private let projectLimit = 8
 
     var body: some View {
         VStack(spacing: 0) {
@@ -86,6 +91,10 @@ struct SidebarView: View {
     private var workspacesSection: some View {
         VStack(alignment: .leading, spacing: 2) {
             SectionHeader(title: "Workspaces") {
+                if !showAllWorkspaces && visibleWorkspaces.count < store.state.workspaces.count {
+                    Button("Show All (\(store.state.workspaces.count))") { showAllWorkspaces = true }
+                        .buttonStyle(.plain).font(.caption2).help("Show all workspaces")
+                }
                 Button { openNewWorkspace([]) } label: { Image(systemName: "plus") }
                     .buttonStyle(.hover)
                     .help("New workspace")
@@ -95,7 +104,7 @@ struct SidebarView: View {
                     .font(.callout).foregroundStyle(.tertiary)
                     .padding(.horizontal, 8).padding(.vertical, 4)
             }
-            ForEach(store.state.workspaces) { w in
+            ForEach(visibleWorkspaces) { w in
                 workspaceRow(w)
                 if w.expanded {
                     ForEach(w.spaces) { s in spaceRow(s, in: w) }
@@ -180,6 +189,10 @@ struct SidebarView: View {
         VStack(alignment: .leading, spacing: 2) {
             SectionHeader(title: "Projects", collapsed: !store.state.ui.projectsExpanded,
                           onToggle: { store.state.ui.projectsExpanded.toggle() }) {
+                if !showAllProjects && visibleProjects.count < store.state.projects.count {
+                    Button("Show All (\(store.state.projects.count))") { showAllProjects = true }
+                        .buttonStyle(.plain).font(.caption2).help("Show all projects")
+                }
                 Button { nav.showAddFromGitHub = true } label: { Image(systemName: "arrow.triangle.branch") }
                     .buttonStyle(.hover)
                     .help("Add project from GitHub (⇧⌘O)")
@@ -193,7 +206,7 @@ struct SidebarView: View {
                         .font(.callout).foregroundStyle(.tertiary)
                         .padding(.horizontal, 8).padding(.vertical, 4)
                 }
-                ForEach(store.state.projects) { p in
+                ForEach(visibleProjects) { p in
                     SidebarRow(isSelected: false, indent: 0) {
                         Image(systemName: p.exists ? "folder" : "exclamationmark.triangle")
                             .frame(width: 16)
@@ -227,6 +240,37 @@ struct SidebarView: View {
     }
 
     private var footer: some View { SidebarFooter() }
+
+    private var activeWorkspaceIDs: Set<UUID> {
+        Set(store.state.workspaces.filter { workspace in
+            workspace.id == store.state.ui.selectedWorkspaceID || workspace.agentHost ||
+            store.runningCount(in: workspace) > 0 ||
+            workspace.spaces.contains(where: { store.spaceNeedsInput($0) })
+        }.map(\.id))
+    }
+
+    private var visibleWorkspaces: [Workspace] {
+        let ordered = store.state.workspaces.sorted { ($0.lastOpened ?? .distantPast) > ($1.lastOpened ?? .distantPast) }
+        guard !showAllWorkspaces, ordered.count > workspaceLimit else { return ordered }
+        let keep = Set(ordered.prefix(workspaceLimit).map(\.id)).union(activeWorkspaceIDs)
+        return ordered.filter { keep.contains($0.id) }
+    }
+
+    private var visibleProjects: [Project] {
+        let projects = store.state.projects
+        guard !showAllProjects, projects.count > projectLimit else { return projects }
+        let workspaces = store.state.workspaces
+        func recency(_ project: Project) -> Date {
+            let workspaceDates = workspaces.filter { $0.projectIDs.contains(project.id) }.compactMap(\.lastOpened)
+            let paneDates = workspaces.flatMap(\.spaces).flatMap(\.panes)
+                .filter { $0.projectID == project.id }.map(\.createdAt)
+            return (workspaceDates + paneDates).max() ?? .distantPast
+        }
+        let ordered = projects.sorted { recency($0) > recency($1) }
+        let activeProjectIDs = Set(workspaces.filter { activeWorkspaceIDs.contains($0.id) }.flatMap(\.projectIDs))
+        let keep = Set(ordered.prefix(projectLimit).map(\.id)).union(activeProjectIDs)
+        return projects.filter { keep.contains($0.id) }
+    }
 
     private func openNewWorkspace(_ preselect: Set<UUID>) {
         newWorkspacePreselect = preselect

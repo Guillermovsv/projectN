@@ -222,6 +222,30 @@ While ProjectN is open, **hold fn anywhere, talk, release** — the text is past
 - First run: allow **Microphone**, **Input Monitoring** and **Accessibility** for ProjectN. `build.sh` signs with a stable local identity (`ProjectN Local Signing` if present, or `SIGN_IDENTITY=…`) so these grants survive rebuilds.
 - Requires macOS 26+ (Apple's on-device `DictationTranscriber`).
 
+## Assistant voice and “Hey N”
+
+Say **“Hey N”** to open the Assistant, then give your prompt. You can also say it in one breath: “Hey N, open Codex in this project.” Wake listening is enabled by default; switch it off in **Settings → Assistant → Listening → Wake with “Hey N”**. Its status appears beside the setting.
+
+Wake listening uses the existing Apple on-device recognizer and NVoice microphone while ProjectN is open, including when the Assistant is hidden. It keeps the microphone active while waiting, discards ambient audio rather than saving it to history, and pauses for regular dictation and spoken replies. The recording transfers directly into the prompt so words immediately after the wake command are retained. Microphone permission and the chosen language's speech assets are required.
+
+The Assistant applies the same saved corrections and dictionary matching as dictation, including during interruptions. Personal terms and app names share Apple's 100-phrase recognition-hint budget; all dictionary entries remain available for matching afterward. To resolve an ambiguous everyday word, add an explicit **heard → replacement** correction in NVoice's People & Words settings.
+
+With **Interrupt by talking** enabled, speaking over an answer stops its playback and starts your turn, even when conversation mode is off. Quiet “stop”, “wait”, “espera” and “detente” requests are also checked in live recognition. Headphones help distinguish your voice from speaker echo. The pause setting still controls when your spoken turn ends.
+
+## Assistant pane controls
+
+The Assistant (voice or typed commands, in English or Spanish) can close ordinary Claude/Codex panes and change their model or effort:
+
+- “Close Ada” / “Cierra el panel Ada”.
+- “Close all Codex panes” / “Cierra todos los Claude”.
+- “Change Ada to Opus 5.5 low” / “Cambia Ada a Sonnet con esfuerzo alto”.
+- “Set Ada effort to high” / “Cambia el esfuerzo de Ada a bajo”.
+- “Set model to Sonnet” changes the focused pane. “Close last” closes the last pane opened by the Assistant.
+
+Names must match a single pane exactly, including across spaces and workspaces. Tool groups (“all Codex”, “todos los Claude”) apply to the **current space**; a singular tool name requires one matching pane there. “All” by itself means the panes the Assistant opened last. Agent-task panes remain managed through the Agents view.
+
+Models must appear in the app's catalog; efforts must be supported by the selected model. Invalid requests leave every pane unchanged. A model-only change adjusts an incompatible inherited effort as the Model menu does. Permissions are preserved. Claude changes live; Codex restarts and resumes the conversation, with the existing confirmation if it is working. The Assistant reports how many panes accepted the settings, including cancelled restarts. Closing stops and removes the pane just like its close button.
+
 ## The app's own directory: `~/.projectn`
 
 ```

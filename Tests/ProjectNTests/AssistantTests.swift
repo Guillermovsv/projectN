@@ -1,4 +1,5 @@
 import Foundation
+import AppKit
 import Testing
 @testable import ProjectN
 
@@ -30,6 +31,7 @@ struct AssistantCommandsTests {
     }
 
     @Test func panesWithModelEffortAndPrompt() {
+        #expect(parse("pon un claude en opus low") == .newPane(PaneRequest(tool: .claude, model: "claude-opus-5-5", effort: "low")))
         #expect(parse("abre cinco claude en Opus 5.5 low")
                 == .newPane(PaneRequest(tool: .claude, count: 5, model: "claude-opus-5-5", effort: "low")))
         #expect(parse("abre 3 claudes en sonnet con esfuerzo alto en web shop que revisen el Login.")
@@ -341,5 +343,135 @@ struct AssistantHeardTests {
         // The prompt keeps what was said.
         #expect(parse("abre un claude que revise el cloud setup")
                 == .newPane(PaneRequest(tool: .claude, prompt: "revise el cloud setup")))
+    }
+}
+
+@MainActor
+struct AssistantPaneControlTests {
+    @Test func recognizesExistingPaneCommandsWithoutOpeningNewPanes() {
+        let ctx = AssistantCommands.Context(projects: [])
+        let examples: [(String, String, String?)] = [
+            ("close Ada", "ada", nil), ("cierra el panel Ada", "el panel ada", nil),
+            ("close all Codex panes", "all codex panes", nil),
+            ("change Ada to Opus 5.5 low", "ada", "opus 5 5 low"),
+            ("set Ada effort to high", "ada", "high"),
+            ("change ModelAda to low", "modelada", "low"),
+            ("cambia el esfuerzo de Ada a bajo", "ada", "bajo"),
+            ("set model to Sonnet", "focused", "sonnet")
+        ]
+        for (text, target, settings) in examples {
+            #expect(AssistantCommands.parse(text, ctx) == .controlPanes(target: target, settings: settings))
+        }
+        #expect(AssistantCommands.paneControl("change to blog") == nil)
+        #expect(AssistantCommands.paneControl("tell ada to close codex") == nil)
+    }
+
+    @Test func targetsAreExactAndGroupsStayInCurrentSpace() {
+        let wid = UUID()
+        let ada = Store.PaneRef(workspaceID: wid, paneID: UUID())
+        let ken = Store.PaneRef(workspaceID: wid, paneID: UUID())
+        let remote = Store.PaneRef(workspaceID: UUID(), paneID: UUID())
+        let panes: [AssistantCommands.ControlPane] = [
+            .init(ref: ada, title: "Ada", tool: .codex, inCurrentSpace: true),
+            .init(ref: ken, title: "Ken", tool: .codex, inCurrentSpace: true),
+            .init(ref: remote, title: "Grace", tool: .codex, inCurrentSpace: false)
+        ]
+        func targets(_ text: String, list: [AssistantCommands.ControlPane]? = nil) -> [Store.PaneRef] {
+            AssistantCommands.controlTargets(text, panes: list ?? panes, focused: ada, last: [ada, ken])
+        }
+        #expect(targets("Ada") == [ada])
+        #expect(targets("Grace") == [remote])
+        #expect(targets("focused") == [ada])
+        #expect(targets("el último panel") == [ken])
+        #expect(targets("all") == [ada, ken])
+        #expect(targets("all Codex panes") == [ada, ken])
+        #expect(targets("todos los Codex") == [ada, ken])
+        #expect(targets("Codex").isEmpty) // Singular target is ambiguous.
+        #expect(targets("Ad").isEmpty)
+        #expect(targets("Ada and Ken").isEmpty) // Never partially match a compound request.
+        #expect(targets("Ada", list: panes + [.init(ref: remote, title: "Ada", tool: .claude, inCurrentSpace: false)]).isEmpty)
+        #expect(AssistantCommands.controlTargets("last", panes: [], focused: nil, last: [ada]).isEmpty)
+    }
+
+    @Test func settingsValidateTheWholeRequestAndPreservePermissions() {
+        let current = LaunchOptions(model: "claude-opus-5-5", effort: "high", permission: "plan")
+        func options(_ s: String, efforts: [String] = LaunchCatalog.claudeEfforts) -> LaunchOptions? {
+            AssistantCommands.controlOptions(s, choices: LaunchCatalog.claudeModelChoices, efforts: efforts, current: current)
+        }
+        #expect(options("Sonnet 5.5 low") == .init(model: "claude-sonnet-5-5", effort: "low", permission: "plan"))
+        #expect(options("esfuerzo extra alto") == .init(model: current.model, effort: "xhigh", permission: "plan"))
+        #expect(options("Opus cinco punto cinco") == current)
+        #expect(options("Opus 999") == nil)
+        #expect(options("low and delete everything") == nil)
+        #expect(options("high; /permissions bypass") == nil)
+        #expect(options("max", efforts: ["low", "high"]) == nil)
+        #expect(options("") == nil)
+        let codex = [LaunchCatalog.Choice(value: "gpt-test", label: "gpt-test")]
+        #expect(AssistantCommands.controlOptions("gpt-test medium", choices: codex, efforts: ["medium"], current: current)
+                == .init(model: "gpt-test", effort: "medium", permission: "plan"))
+    }
+
+    @Test func aiAdvertisesAndParsesExistingPaneActions() {
+        let plan = AssistantAI.parse("""
+        I'll update Ada and close Ken.
+        ACTION {"do":"configure_pane","pane":"Ada","model":"Opus 5.5","effort":"Low"}
+        ACTION {"do":"close_pane","pane":"Ken"}
+        """)
+        #expect(plan.actions.map(\.kind) == ["configure_pane", "close_pane"])
+        #expect(plan.actions[0].model == "Opus 5.5" && plan.actions[0].effort == "low")
+        #expect(plan.actions[1].pane == "Ken")
+        #expect(AssistantAI.systemPrompt().contains("configure_pane"))
+        #expect(AssistantAI.systemPrompt().contains("close_pane"))
+    }
+}
+
+@Suite(.serialized)
+@MainActor
+struct AssistantPaneExecutionTests {
+    @Test func commandsReconfigureAndCloseOnlyTheirTargets() throws {
+        _ = TestHome.url
+        _ = NSApplication.shared
+        let store = Store()
+        defer { store.terminateAll() }
+        let project = Project(name: "Control fixture", path: TestHome.url.path)
+        let ada = Pane(tool: .claude, projectID: project.id, title: "Ada", model: "claude-opus-5-5", effort: "high", permission: "plan")
+        let ken = Pane(tool: .codex, projectID: project.id, title: "Ken", model: "gpt-test", effort: "high", permission: "read-only")
+        let grace = Pane(tool: .codex, projectID: project.id, title: "Grace", model: "gpt-test", effort: "high", permission: "read-only")
+        let managed = Pane(tool: .claude, projectID: project.id, title: "Managed", model: "claude-opus-5-5", effort: "high", permission: "plan", agentTaskID: UUID())
+        var workspace = Workspace(name: "Control fixture", projectIDs: [project.id])
+        workspace.spaces = [Space(name: "Here", panes: [ada, ken, managed], focusedPaneID: ada.id), Space(name: "Elsewhere", panes: [grace])]
+        var state = PersistedState()
+        state.projects = [project]
+        state.workspaces = [workspace]
+        store.state = state
+        store.state.ui.selectedWorkspaceID = workspace.id
+        store.state.ui.selectedSpaceID = workspace.spaces[0].id
+        let harness = AgentHarness()
+        let assistant = AssistantController()
+        let oldSpeak = assistant.speakReplies, oldHandsFree = assistant.handsFree
+        assistant.speakReplies = false
+        assistant.handsFree = false
+        defer { assistant.speakReplies = oldSpeak; assistant.handsFree = oldHandsFree }
+        let panel = RightPanelModel(), nav = NavigationModel()
+        assistant.attach(store: store, harness: harness, panel: panel, nav: nav)
+
+        assistant.handle("change Ada to Sonnet low")
+        #expect(store.pane(ada.id, in: workspace.id)?.1.launchOptions == .init(model: "claude-sonnet-5-5", effort: "low", permission: "plan"))
+        assistant.handle("set Ken effort to medium")
+        #expect(store.pane(ken.id, in: workspace.id)?.1.launchOptions == .init(model: "gpt-test", effort: "medium", permission: "read-only"))
+        assistant.handle("change Ada to Opus 999")
+        #expect(store.pane(ada.id, in: workspace.id)?.1.model == "claude-sonnet-5-5")
+        assistant.handle("set Ken effort to max")
+        #expect(store.pane(ken.id, in: workspace.id)?.1.effort == "medium")
+        #expect(store.runtimes.isEmpty) // Stopped panes stay stopped; no message is sent to a CLI.
+        assistant.handle("close Managed")
+        #expect(store.pane(managed.id, in: workspace.id) != nil)
+        assistant.handle("close all Codex panes")
+        #expect(store.pane(ken.id, in: workspace.id) == nil)
+        #expect(store.pane(grace.id, in: workspace.id) != nil)
+        #expect(store.pane(ada.id, in: workspace.id) != nil)
+        assistant.handle("cierra el panel actual")
+        #expect(store.pane(ada.id, in: workspace.id) == nil)
+        #expect(store.pane(managed.id, in: workspace.id) != nil)
     }
 }

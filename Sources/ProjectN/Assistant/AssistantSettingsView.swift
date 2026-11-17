@@ -8,17 +8,22 @@ struct AssistantSettingsView: View {
     var body: some View {
         Form {
             Section("Listening") {
+                Toggle("Wake with “Hey N”", isOn: $assistant.wakeWordEnabled)
+                if assistant.wakeWordEnabled {
+                    Text(assistant.wakeWordStatus).font(.caption).foregroundStyle(.secondary)
+                }
+                Text("Say “Hey N”, then your request, even when the Assistant is closed. While enabled, the microphone listens locally while ProjectN is open. Ambient audio isn't saved. Wake listening pauses during dictation and spoken replies.")
+                    .font(.caption).foregroundStyle(.secondary)
                 Toggle("Listen as soon as the Assistant opens", isOn: $assistant.autoListen)
                 Toggle("Conversation mode — keep listening after each answer", isOn: $assistant.handsFree)
                 Toggle("Interrupt by talking — start speaking and it stops its answer to listen", isOn: $assistant.bargeIn)
-                    .disabled(!assistant.handsFree)
                 LabeledContent("Pause that ends your turn") {
                     HStack {
                         Slider(value: $assistant.silenceSeconds, in: 0.5...2, step: 0.1).frame(width: 200)
                         Text(String(format: "%.1f s", assistant.silenceSeconds)).monospacedDigit().foregroundStyle(.secondary)
                     }
                 }
-                Text("Shorter answers faster; longer gives you time to think mid-sentence. Click the orb (or ⌥⌘A) to stop listening, or while it talks to cut it short and speak. Talking over it works best with headphones; on the Mac's speakers, speak a bit louder than it. Say “gracias” or “eso es todo” to end the conversation. Uses NVoice's languages and microphone.")
+                Text("Shorter answers faster; longer gives you time to think mid-sentence. Click the orb (or ⌥⌘A) to stop listening, or while it talks to cut it short and speak. You can also say “stop”, “wait”, “espera” or “detente”. Interruptions work best with headphones. Say “gracias” or “eso es todo” to end the conversation. Uses NVoice's languages, microphone, dictionary and corrections.")
                     .font(.caption).foregroundStyle(.secondary)
             }
 
