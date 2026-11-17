@@ -323,6 +323,34 @@ final class TerminalSession: NSObject, ObservableObject, LocalProcessTerminalVie
         return true
     }
 
+    /// Keys pressed from the pane's chat box (Return, arrows, Escape) as if typed in the terminal. When a prompt is
+    /// waiting, Return/Escape answer it, so Auto · Complete won't answer it again.
+    func pressFromChatBox(_ keys: [String]) {
+        guard isRunning, !terminated else { return }
+        if keys.last == AutoResponder.enter || keys.last == "\u{1b}", let screen = screenTail(),
+           AutoResponder.pendingPrompt(screen: screen) != nil {
+            noteAnswered(screen, keys: keys.count)
+        }
+        sendKeys(keys)
+    }
+
+    /// Your answer typed in the chat box ("2", "yes", "no"…) given to the prompt on screen with the keys that pick
+    /// it. False when nothing is waiting or the text isn't an answer to it (then it's sent as a message).
+    func answerFromChatBox(_ reply: String) -> Bool {
+        guard isRunning, !terminated, let screen = screenTail(), AutoResponder.pendingPrompt(screen: screen) != nil,
+              let keys = AutoResponder.replyKeys(reply, screen: screen) else { return false }
+        noteAnswered(screen, keys: keys.count)
+        sendKeys(keys)
+        return true
+    }
+
+    private func noteAnswered(_ screen: [String], keys: Int) {
+        guard let d = AutoResponder.decide(screen: screen) else { return }
+        answeredFingerprint = d.fingerprint
+        answeredAt = Date().addingTimeInterval(0.06 * Double(max(0, keys - 1)))
+        pendingFingerprint = nil
+    }
+
     /// Interrupts the agent's current turn (Escape, as you would), e.g. a turn that hung.
     func interrupt() {
         lastAutoAnswer = ("Esc", Date())

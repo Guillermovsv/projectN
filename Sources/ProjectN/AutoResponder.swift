@@ -78,6 +78,72 @@ enum AutoResponder {
         return unwrapped(text, at: line, in: window)
     }
 
+    // MARK: Your answer, typed in the pane's chat box
+
+    /// The keys that give `reply` — typed in a pane's chat box — as the answer to the prompt on screen: an option's
+    /// number ("2"), its label or the start of it ("yes", "sí", "no", "allow"), or a key a Cursor menu names ("y",
+    /// "n", "esc"). Typing a number and Return in the terminal would only confirm the highlighted option, so this
+    /// moves to the chosen one first. nil when nothing is waiting or the text isn't an answer (it's then sent as a
+    /// normal message).
+    static func replyKeys(_ reply: String, screen: [String]) -> [String]? {
+        guard let window = window(screen) else { return nil }
+        let r = replyKey(reply)
+        guard !r.isEmpty, r.count <= 60 else { return nil }
+        if inlineYesNoDecision(window) != nil {
+            if yesReplies.contains(r) { return ["y", enter] }
+            if noReplies.contains(r) { return ["n", enter] }
+            return nil
+        }
+        if let menu = findMenu(window) { return pick(r, from: menu.block, current: menu.current) }
+        if let hint = findKeyHintMenu(window) {
+            let offered = Set((hint.first...hint.last).flatMap { hintKeys(window[$0]) ?? [] })
+            var key = r
+            if yesReplies.contains(r) { key = "y" } else if noReplies.contains(r) { key = offered.contains("n") ? "n" : "esc" }
+            guard offered.contains(key), let code = keyCodes[key] ?? (key.count == 1 ? key : nil) else { return nil }
+            return [code]
+        }
+        if let plain = findPlainMenu(window) { return pick(r, from: plain.options, current: plain.current) }
+        return nil
+    }
+
+    private static let yesReplies: Set<String> = ["y", "yes", "yeah", "yep", "ok", "okay", "sure", "s", "si", "claro", "dale", "va"]
+    private static let noReplies: Set<String> = ["n", "no", "nope", "nah", "cancel", "cancelar", "cancela"]
+    private static let keyCodes: [String: String] = ["esc": "\u{1b}", "escape": "\u{1b}", "tab": "\t",
+                                                     "shift+tab": "\u{1b}[Z", "enter": enter, "return": enter]
+
+    /// Lowercased, without accents, surrounding spaces or a closing ".", "!".
+    private static func replyKey(_ s: String) -> String {
+        var t = s.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        while let c = t.last, ".!¡".contains(c) { t.removeLast() }
+        return t.trimmingCharacters(in: .whitespaces)
+    }
+
+    /// The option chosen by number or label, reached with the arrows from the highlighted one.
+    private static func pick(_ r: String, from options: [Option], current: Option) -> [String]? {
+        let target: Option?
+        if let n = Int(r) {
+            target = options.first { $0.number == n }
+        } else {
+            let wanted = yesReplies.contains(r) ? ["yes", "allow", "approve"]
+                : noReplies.contains(r) ? ["no", "cancel", "deny", "skip"] : [r]
+            // Labels without a trailing key hint: "Allow (y)" → "allow".
+            let labels = options.map { o in
+                (o, replyKey(o.text.replacingOccurrences(of: "\\s*\\([^()]*\\)\\s*$", with: "", options: .regularExpression)))
+            }
+            func starts(_ label: String, _ w: String) -> Bool {
+                guard label.hasPrefix(w) else { return false }
+                guard let next = label.dropFirst(w.count).first else { return true }
+                return !next.isLetter && !next.isNumber
+            }
+            target = labels.first { wanted.contains($0.1) }?.0
+                ?? labels.first { l in wanted.contains { starts(l.1, $0) } }?.0
+        }
+        guard let target else { return nil }
+        let delta = target.number - current.number
+        return Array(repeating: delta > 0 ? down : up, count: abs(delta)) + [enter]
+    }
+
     /// A long question wraps on screen ("Allow the violet-caribou-…-elementor MCP server to run tool
     /// "elementor-manage-" / "elements"?"): a line that doesn't start a sentence continues the one above.
     static func unwrapped(_ text: String, at line: Int, in window: [String]) -> String {

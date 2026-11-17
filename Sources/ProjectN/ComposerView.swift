@@ -77,6 +77,8 @@ struct ComposerView: View, Equatable {
     @State private var recipients: [Store.PaneRef]
     @State private var hasText: Bool
     @State private var compact = false
+    /// The agent shows a question or a menu and is waiting for your answer.
+    @State private var waiting: Bool
 
     init(state: Store.ComposerState, pane: Pane, workspaceID: UUID, runtime: TerminalSession?) {
         self.state = state
@@ -86,6 +88,7 @@ struct ComposerView: View, Equatable {
         _attachments = State(initialValue: state.attachments)
         _recipients = State(initialValue: state.recipients)
         _hasText = State(initialValue: !state.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        _waiting = State(initialValue: runtime?.needsInput ?? false)
     }
 
     static func == (lhs: Self, rhs: Self) -> Bool {
@@ -101,7 +104,7 @@ struct ComposerView: View, Equatable {
             ComposerEditor(state: state, placeholder: placeholder, focusTrigger: focusTrigger,
                         onSubmit: send, onAt: { showMentions = true },
                         onFocus: { focused = true; store.focusPane(pane.id, in: workspaceID) },
-                        onBlur: { focused = false })
+                        onBlur: { focused = false }, onKey: promptKey)
                 .frame(height: PromptInput.height(lines: 4))
                 .popover(isPresented: $showMentions, arrowEdge: .top) { mentionPicker }
             // Full controls when there's room; icon-only model/effort/permission menus when the pane is narrow.
@@ -134,19 +137,51 @@ struct ComposerView: View, Equatable {
         .onReceive(state.$text.map { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }.removeDuplicates()) { hasText = $0 }
         .onReceive(state.$attachments.removeDuplicates()) { attachments = $0 }
         .onReceive(state.$recipients.removeDuplicates()) { recipients = $0 }
+        .onReceive(waitingChanges) { waiting = $0 }
+    }
+
+    private var waitingChanges: AnyPublisher<Bool, Never> {
+        guard let runtime else { return Just(false).eraseToAnyPublisher() }
+        return runtime.$activity.map { if case .needsInput = $0 { return true } else { return false } }
+            .removeDuplicates().eraseToAnyPublisher()
     }
 
     private var placeholder: String {
-        recipients.isEmpty
-            ? "Message \(pane.tool.label)… (@ to tag)"
-            : "Message to \(recipients.count == 1 ? "1 agent" : "\(recipients.count) agents")…"
+        if !recipients.isEmpty { return "Message to \(recipients.count == 1 ? "1 agent" : "\(recipients.count) agents")…" }
+        if waiting { return "Answer: ⏎ confirms · 1, 2… or yes / no · ↑↓ choose · esc cancels" }
+        return "Message \(pane.tool.label)… (@ to tag)"
     }
 
-    private var canSend: Bool { hasText || !attachments.isEmpty }
+    /// Answering the agent's prompt from here: an empty Return is Return in the terminal.
+    private var answersPrompt: Bool { waiting && !hasText && attachments.isEmpty && recipients.isEmpty }
+
+    private var canSend: Bool { hasText || !attachments.isEmpty || answersPrompt }
 
     private func send() {
-        guard !state.isEmpty else { return }
+        if state.isEmpty {
+            // ⏎ in an empty box is ⏎ in the terminal: it confirms the highlighted option, continues a
+            // "press Enter" screen. You no longer have to click into the terminal for that.
+            if state.recipients.isEmpty { runtime?.pressFromChatBox([AutoResponder.enter]) }
+            return
+        }
+        // "2", "yes", "no"… typed while the agent waits for an answer pick that option (pasting "2" and pressing
+        // Return would only confirm the highlighted one). Anything else is sent as a message.
+        if state.recipients.isEmpty, state.attachments.isEmpty, let runtime, runtime.answerFromChatBox(state.text) {
+            state.text = ""
+            return
+        }
         store.sendComposer(paneID: pane.id, in: workspaceID)
+    }
+
+    /// ↑ ↓ and Esc in an empty box move through / cancel the agent's menu while it waits for an answer.
+    private func promptKey(_ key: PromptInput.Key) -> Bool {
+        guard state.text.isEmpty, state.recipients.isEmpty, let runtime, runtime.needsInput else { return false }
+        switch key {
+        case .up: runtime.pressFromChatBox([AutoResponder.up])
+        case .down: runtime.pressFromChatBox([AutoResponder.down])
+        case .escape: runtime.pressFromChatBox(["\u{1b}"])
+        }
+        return true
     }
 
     // MARK: Chips
@@ -222,7 +257,9 @@ struct ComposerView: View, Equatable {
             .hoverHighlight(cornerRadius: 14, inset: 2)
             .disabled(!canSend)
             .keyboardShortcut(.return, modifiers: [.command])
-            .help(state.recipients.isEmpty ? "Send to \(pane.tool.label) (⏎ · ⇧⏎ for a new line)" : "Send to tagged agents (⏎ · ⇧⏎ for a new line)")
+            .help(!state.recipients.isEmpty ? "Send to tagged agents (⏎ · ⇧⏎ for a new line)"
+                  : answersPrompt ? "Press Return in \(pane.tool.label) (confirms the highlighted option)"
+                  : "Send to \(pane.tool.label) (⏎ · ⇧⏎ for a new line)")
         }
         .font(.callout)
         .foregroundStyle(.secondary)
@@ -298,10 +335,11 @@ private struct ComposerEditor: View {
     let onAt: () -> Void
     let onFocus: () -> Void
     let onBlur: () -> Void
+    let onKey: (PromptInput.Key) -> Bool
 
     var body: some View {
         PromptInput(text: $state.text, placeholder: placeholder, lines: 4, focusTrigger: focusTrigger,
-                    onSubmit: onSubmit, onAt: onAt, onFocus: onFocus, onBlur: onBlur)
+                    onSubmit: onSubmit, onAt: onAt, onFocus: onFocus, onBlur: onBlur, onKey: onKey)
     }
 }
 

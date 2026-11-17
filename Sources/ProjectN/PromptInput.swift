@@ -4,6 +4,9 @@ import SwiftUI
 /// Multi-line chat input: Return sends, ⇧⏎ / ⌥⏎ insert a new line at the cursor.
 /// Fixed height (`lines` tall, longer text scrolls) so the terminal above never resizes while you type.
 struct PromptInput: NSViewRepresentable {
+    /// Keys the owner may take instead of the text view (true = handled).
+    enum Key { case up, down, escape }
+
     @Binding var text: String
     var placeholder: String
     var lines: Int = 4
@@ -12,6 +15,7 @@ struct PromptInput: NSViewRepresentable {
     var onAt: () -> Void
     var onFocus: () -> Void
     var onBlur: () -> Void = {}
+    var onKey: (Key) -> Bool = { _ in false }
 
     static let fontSize: CGFloat = 13
     static func height(lines: Int) -> CGFloat {
@@ -87,6 +91,9 @@ struct PromptInput: NSViewRepresentable {
                 tv.insertText("\n", replacementRange: tv.selectedRange())
                 return true
             }
+            if sel == #selector(NSResponder.moveUp(_:)) { return parent.onKey(.up) }
+            if sel == #selector(NSResponder.moveDown(_:)) { return parent.onKey(.down) }
+            if sel == #selector(NSResponder.cancelOperation(_:)) { return parent.onKey(.escape) }
             return false
         }
     }
