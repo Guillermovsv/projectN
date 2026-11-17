@@ -481,7 +481,7 @@ final class NVoiceController: NSObject, ObservableObject {
             guard let self, self.assistantTranscriptToken == token else { return }
             self.assistantTranscriptHandler?(locale, text)
         }
-        return (ProfileStore.recognitionHints(personal: profiles.contextualStrings, vocabulary: vocabulary), report)
+        return (ProfileStore.recognitionHints(personal: profiles.contextualStrings, vocabulary: vocabulary, reserve: 60), report)
     }
 
     private func assistantClearTranscript() {

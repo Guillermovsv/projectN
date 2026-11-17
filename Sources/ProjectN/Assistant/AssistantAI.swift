@@ -47,7 +47,7 @@ enum AssistantAI {
         ACTION {"do":"open_project","project":"<name>"}
         ACTION {"do":"new_space","project":"<name, optional>"}
         ACTION {"do":"open_workspace","workspace":"<workspace name>"}
-        ACTION {"do":"goto_space","n":<1-based number in the current workspace>}   (or "space":"<space name>" instead of n)
+        ACTION {"do":"goto_space","n":<1-based number in the current workspace>}   (or "space":"<space name>","workspace":"<its workspace>" instead of n; any workspace)
         ACTION {"do":"agents_view"}
         ACTION {"do":"new_pane","tool":"claude|codex|cursor|terminal","project":"<name, optional>","count":<1-16, optional>,"model":"<optional>","effort":"<optional>","prompt":"<first message, optional>"}
         ACTION {"do":"send_to_pane","pane":"<pane name from the snapshot, or last (the pane you opened last), or all (every pane you opened last)>","prompt":"<message to type into it>"}
@@ -78,9 +78,11 @@ enum AssistantAI {
         The app validates settings and reports the actual outcome. Do not claim settings have already been changed.
         For work on code (fix, build, review, write…), use ask_agent with the best-suited agent and a well-written instruction.
         The request comes from speech recognition, so names are often slightly off ("cloud" or "code" for Claude,
-        "solar debs" for Solar Devs, "aire dinamica" for Airedinamica, "doctor Sergio" for dr-sergio): map them to the closest
-        name in the snapshot. "This space" / "here" means the current space, where new panes open anyway.
-        If something is ambiguous, ask and add no actions.
+        "solar debs" for Solar Devs, "aire dinamica" for Airedinamica, "doctor Sergio" for dr-sergio, "aseo cap" for SEO Core App,
+        "bible boys" for Vibevoice): map them to the name in the snapshot that sounds most like it, using "How names are said".
+        The user often says "espacio" for a workspace. "This space" / "here" means the current space, where new panes open anyway.
+        If two names are equally close, ask which one (say both names) and add no actions. If none is close, say so and name
+        the closest ones.
         """
     }
 
@@ -115,6 +117,7 @@ enum AssistantAI {
             out.append("Codex models: \(codex.joined(separator: ", ")) (efforts: \(LaunchCatalog.efforts(for: .codex, model: nil, settings: store.settings).joined(separator: ", ")))")
         }
         if let panel { out.append("Right panel: " + (panel.visible ? panel.tab.label : "hidden")) }
+        if let said = spokenNames(store) { out.append(said) }
         if let harness {
             let agents = harness.profiles.filter(\.enabled).map { a in
                 "\(a.name) — \(a.role)" + (a.worksOutsideProjects ? " (coordinator)" : "")
@@ -129,6 +132,23 @@ enum AssistantAI {
             if !recent.isEmpty { out.append("Recent agent tasks (newest first):\n" + recent.joined(separator: "\n")) }
         }
         return out.joined(separator: "\n")
+    }
+
+    /// "Vibevoice ← Vibe Voice, bible boys": how names are said (split as spoken, and what the user confirmed before).
+    @MainActor
+    static func spokenNames(_ store: Store, learned: [AssistantAliases.Alias]? = nil) -> String? {
+        let learned = learned ?? AssistantAliases.shared.all
+        let ws = store.state.workspaces.filter { !$0.agentHost }
+        var seen = Set<String>()
+        let names = (store.state.projects.map { ($0.id, $0.name) } + ws.map { ($0.id, $0.name) }
+            + ws.flatMap(\.spaces).filter { !AssistantCommands.isNumberedSpace($0.name) }.map { ($0.id, $0.name) })
+            .filter { seen.insert($0.1.folded).inserted }
+        let lines = names.compactMap { id, name -> String? in
+            let heard = learned.filter { $0.id == id || $0.name.folded == name.folded }.map(\.heard)
+            let forms = SpokenNames.forms(name) + heard
+            return forms.isEmpty ? nil : "\(name) ← " + forms.map { "\"\($0)\"" }.joined(separator: ", ")
+        }
+        return lines.isEmpty ? nil : "How names are said (heard → name):\n" + lines.joined(separator: "\n")
     }
 
     /// Reads the model's reply: spoken text followed by `ACTION {json}` lines. Also accepts a single

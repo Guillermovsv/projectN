@@ -124,7 +124,8 @@ final class ProfileStore: ObservableObject {
 
     /// Apple's hints are a soft bias, limited to 100 phrases. Reserve room for both personal words and
     /// the current app context; duplicate spellings must not consume that budget.
-    static func recognitionHints(personal: [String], vocabulary: [String] = []) -> [String] {
+    /// `reserve`: slots kept for `vocabulary` (the Assistant keeps more: names are what it navigates by).
+    static func recognitionHints(personal: [String], vocabulary: [String] = [], reserve: Int = 25) -> [String] {
         func unique(_ values: [String]) -> [String] {
             var seen = Set<String>()
             return values.compactMap { value in
@@ -135,7 +136,7 @@ final class ProfileStore: ObservableObject {
         }
         let personal = unique(personal)
         let context = unique(vocabulary)
-        let reserved = min(25, context.count)
+        let reserved = min(max(0, min(reserve, 100)), context.count)
         let personalCount = min(personal.count, 100 - reserved)
         // Deduplicate after reserving slots: a context word also found late in a large personal dictionary
         // must still get a hint, rather than being excluded from both parts of the budget.

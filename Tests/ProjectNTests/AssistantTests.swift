@@ -539,3 +539,178 @@ struct AssistantPaneExecutionTests {
         #expect(store.pane(managed.id, in: workspace.id) != nil)
     }
 }
+
+/// Real phrases from a session where the AI was off and dictation got the names wrong (2026-11-17 log).
+@MainActor
+struct AssistantSoundsLikeTests {
+    let names = ["SEO Core App", "NUEVO 4vmarketing", "NVoice", "Client Finder", "dr-sergio", "Florina", "projectN",
+                 "HR-System", "Ralero", "Airedinamica", "y carpeta", "Hotel system", "Canal de Youtube", "Solar Devs", "Vibevoice"]
+    let projects: [Project]
+    let crm = (id: UUID(), name: "CRM 4VMarketing")
+    let nuevo = UUID()
+    let videos = (id: UUID(), name: "Videos")
+    let donald = Store.PaneRef(workspaceID: UUID(), paneID: UUID())
+    let katherine = Store.PaneRef(workspaceID: UUID(), paneID: UUID())
+
+    init() {
+        _ = TestHome.url
+        projects = names.map { Project(name: $0, path: "/tmp/\($0)") }
+    }
+
+    func ctx(learned: [AssistantAliases.Alias] = []) -> AssistantCommands.Context {
+        // projectN is open; Videos lives in NUEVO 4vmarketing.
+        AssistantCommands.Context(projects: projects, workspaces: [crm], spaces: [(UUID(), "Space 2")],
+                                  otherSpaces: [(UUID(), "Space 1", nuevo), (videos.id, videos.name, nuevo)],
+                                  learned: learned, panes: [(donald, "Donald"), (katherine, "Katherine")])
+    }
+    func parse(_ s: String, learned: [AssistantAliases.Alias] = []) -> AssistantIntent { AssistantCommands.parse(s, ctx(learned: learned)) }
+    func project(_ name: String) -> Project { projects.first { $0.name == name }! }
+    func options(_ i: AssistantIntent) -> [String] {
+        if case .didYouMean(_, let o) = i { return o.compactMap(\.placeName) }
+        return []
+    }
+
+    @Test func namesThatSoundRightGoStraightThere() {
+        #expect(parse("Vamos al espacio de Bible Boys") == .openProject(project("Vibevoice")))
+        #expect(parse("ve a vibe voice") == .openProject(project("Vibevoice")))
+        #expect(parse("abre el proyecto Ralero") == .openProject(project("Ralero")))
+    }
+
+    @Test func namesThatOnlySoundCloseAreAskedFirst() {
+        #expect(options(parse("Vamos al espacio de Boys")).contains("Vibevoice"))
+        #expect(options(parse("Necesito que vayas al proyecto aseo CAP")).first == "SEO Core App")
+        #expect(options(parse("Vamos al espacio de Athens")).contains("Agents"))
+        // Nothing like it: say so instead of "not a command".
+        #expect(parse("ve a Zanzíbar") == .didYouMean(heard: "zanzibar", options: []))
+        // Without "ve a…", random words are never taken for a name.
+        #expect(parse("Yeah") == .unknown("Yeah"))
+        #expect(parse("Sí") == .unknown("Sí"))
+        if case .unknown = parse("how do I connect Slack?") {} else { Issue.record("expected unknown") }
+    }
+
+    @Test func confirmedNamesAreLearned() {
+        let vibe = project("Vibevoice")
+        let learned = [AssistantAliases.Alias(heard: "boys", id: vibe.id, name: vibe.name)]
+        #expect(parse("Vamos al espacio de Boys", learned: learned) == .openProject(vibe))
+        #expect(parse("boys", learned: learned) == .openProject(vibe))
+    }
+
+    @Test func answersToDidYouMean() {
+        let vibe = AssistantIntent.openProject(project("Vibevoice")), nv = AssistantIntent.openProject(project("NVoice"))
+        #expect(AssistantCommands.pick("Sí", from: [vibe]) == vibe)
+        #expect(AssistantCommands.pick("sí, ese", from: [vibe]) == vibe)
+        #expect(AssistantCommands.pick("yes", from: [vibe]) == vibe)
+        #expect(AssistantCommands.pick("sí", from: [nv, vibe]) == nil)
+        #expect(AssistantCommands.pick("el segundo", from: [nv, vibe]) == vibe)
+        #expect(AssistantCommands.pick("Vibevoice", from: [nv, vibe]) == vibe)
+        #expect(AssistantCommands.pick("vibe voice", from: [nv, vibe]) == vibe)
+        #expect(AssistantCommands.pick("no", from: [vibe]) == nil)
+        #expect(AssistantCommands.isNo("No, gracias"))
+        #expect(!AssistantCommands.isNo("sí"))
+    }
+
+    @Test func spacesOfOtherWorkspaces() {
+        #expect(parse("ve a Videos") == .selectSpace(id: videos.id, name: "Videos", workspaceID: nuevo))
+        #expect(parse("vamos al espacio de vídeos") == .selectSpace(id: videos.id, name: "Videos", workspaceID: nuevo))
+    }
+
+    @Test func listsWhatExists() {
+        #expect(parse("Lista los espacios") == .list(.spaces))
+        #expect(parse("¿Qué proyectos tengo?") == .list(.projects))
+        #expect(parse("list the workspaces") == .list(.workspaces))
+        #expect(parse("¿cuáles son mis espacios de trabajo?") == .list(.workspaces))
+        #expect(parse("qué paneles hay abiertos") == .list(.panes))
+        #expect(parse("dime los agentes") == .list(.agents))
+        #expect(parse("quiero ver los proyectos") == .list(.projects))
+        // A question about them is for the AI.
+        if case .list = parse("qué proyectos tienen tests fallando") { Issue.record("not a list request") }
+    }
+
+    @Test func askedPolitely() {
+        #expect(parse("Necesito que vayas al proyecto Florina") == .openProject(project("Florina")))
+        #expect(parse("¿Puedes ir a Solar Devs, por favor?") == .openProject(project("Solar Devs")))
+        #expect(parse("quiero ir a Ralero") == .openProject(project("Ralero")))
+        #expect(parse("Can you go to Florina please") == .openProject(project("Florina")))
+        #expect(parse("¿Me puedes llevar al proyecto Ralero?") == .openProject(project("Ralero")))
+        #expect(parse("quiero un Codex") == .newPane(PaneRequest(tool: .codex)))
+        #expect(parse("Necesito que abras dos Claude que revisen el login")
+                == .newPane(PaneRequest(tool: .claude, count: 2, prompt: "revisen el login")))
+        #expect(AssistantCommands.stripPreamble("Oye, quiero que le digas a Ada que corra los Tests") == "dile a Ada que corra los Tests")
+    }
+
+    @Test func stopWords() {
+        #expect(parse("Alto") == .stopSpeaking)
+        #expect(parse("detente") == .stopSpeaking)
+    }
+
+    @Test func promptsToPanesSaidOtherWays() {
+        #expect(parse("En Donald quiero que le mandes este prompt, crea o modifica las partes de contexto")
+                == .sendToPanes([donald], names: ["Donald"], prompt: "crea o modifica las partes de contexto"))
+        #expect(parse("mándale a Donald este prompt: revisa el README")
+                == .sendToPanes([donald], names: ["Donald"], prompt: "revisa el README"))
+        // Sounds the same, spelled differently.
+        #expect(parse("dile a Catherine que corra los tests")
+                == .sendToPanes([katherine], names: ["Katherine"], prompt: "corra los tests"))
+        // A prompt that only starts with an article stays whole.
+        #expect(parse("dile a Donald el login falla en Safari")
+                == .sendToPanes([donald], names: ["Donald"], prompt: "el login falla en Safari"))
+    }
+
+    @Test func soundsLikeKeys() {
+        #expect(SoundsLike.key("vibevoice") == SoundsLike.key("vibe voice"))
+        #expect(SoundsLike.key("katherine") == SoundsLike.key("catherine"))
+        #expect(SoundsLike.similarity("bible boys", "vibevoice") >= 0.75)
+        #expect(SoundsLike.similarity("ralero", "florina") < 0.5)
+        #expect(SoundsLike.similarity("cap", "app") == 0)
+    }
+
+    @Test func spokenFormsOfNames() {
+        let words: Set<String> = ["vibe", "voice", "hotel", "system", "client", "finder"]
+        func forms(_ n: String) -> [String] { SpokenNames.forms(n, isWord: words.contains) }
+        #expect(forms("Vibevoice") == ["Vibe voice"])
+        #expect(forms("projectN") == ["project N"])
+        #expect(forms("NVoice") == ["N Voice"])
+        #expect(forms("HR-System") == ["HR System"])
+        #expect(forms("CRM 4VMarketing") == ["CRM 4 V Marketing"])
+        #expect(forms("Florina") == [])
+        #expect(forms("Hotel system") == [])
+    }
+
+    @Test func assistantHintsKeepRoomForNames() {
+        let personal = (1...90).map { "term\($0)" }
+        let names = (1...50).map { "name\($0)" }
+        let hints = ProfileStore.recognitionHints(personal: personal, vocabulary: names, reserve: 60)
+        #expect(hints.count == 100)
+        #expect(names.allSatisfy(hints.contains))
+    }
+
+    @Test func didYouMeanThenYesGoesThereAndLearns() {
+        _ = NSApplication.shared
+        let store = Store()
+        defer { store.terminateAll() }
+        let vibe = Project(name: "Vibevoice", path: TestHome.url.path)
+        let nvoice = Project(name: "NVoice", path: TestHome.url.path)
+        var state = PersistedState()
+        state.projects = [vibe, nvoice]
+        state.workspaces = [Workspace(name: "Vibevoice", projectIDs: [vibe.id]), Workspace(name: "NVoice", projectIDs: [nvoice.id])]
+        store.state = state
+        let assistant = AssistantController()
+        let old = (assistant.speakReplies, assistant.handsFree, assistant.useAI)
+        assistant.speakReplies = false; assistant.handsFree = false; assistant.useAI = false
+        defer { assistant.speakReplies = old.0; assistant.handsFree = old.1; assistant.useAI = old.2 }
+        let harness = AgentHarness(), panel = RightPanelModel(), nav = NavigationModel()
+        assistant.attach(store: store, harness: harness, panel: panel, nav: nav)
+
+        assistant.handle("Vamos al espacio de Boys")
+        #expect(assistant.log.last?.text.hasPrefix("¿") == true)
+        #expect(store.state.ui.selectedWorkspaceID == nil)
+        assistant.handle("Vibevoice")
+        #expect(store.selectedWorkspace?.name == "Vibevoice")
+        // Learned: next time it goes straight there.
+        store.goHome()
+        assistant.handle("Vamos al espacio de Boys")
+        #expect(store.selectedWorkspace?.name == "Vibevoice")
+        assistant.handle("lista los proyectos")
+        #expect(assistant.log.last?.text == "Tus 2 proyectos: Vibevoice y NVoice.")
+    }
+}

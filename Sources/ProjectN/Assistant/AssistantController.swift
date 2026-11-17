@@ -100,6 +100,8 @@ final class AssistantController: ObservableObject {
     private var lastReply: (text: String, lang: AssistantLang)?
     /// "Which project?" asked for an agent request: the next answer picks it.
     private var pendingAgent: (agentID: UUID, instruction: String, candidates: [Project], lang: AssistantLang)?
+    /// "¿Quisiste decir Vibevoice?": where each answer goes, and what was heard (learned when you say yes).
+    private var pendingChoice: (heard: String, options: [AssistantIntent], lang: AssistantLang)?
     private var aiTask: Task<Void, Never>?
     /// Turns in a row where nothing intelligible was heard (conversation mode stops after two).
     private var emptyTurns = 0
@@ -439,17 +441,81 @@ final class AssistantController: ObservableObject {
     }
 
     /// What you're likely to name, so speech recognition gets it right: "Claude" instead of "cloud",
-    /// "Solar Devs" instead of "solar debs".
+    /// "Solar Devs" instead of "solar debs", "Vibe Voice" (how Vibevoice is said) instead of "Bible Boys".
+    /// Places first: they're what dictation most often gets wrong.
     func vocabulary() -> [String] {
-        var out = ["Claude", "Claude Code", "Codex", "Cursor", "Opus", "Sonnet", "Haiku", "Fable", "terminal", "ProjectN", "NVoice"]
-        guard let store else { return out }
-        out += store.state.projects.map(\.name)
-        out += store.state.workspaces.filter { !$0.agentHost }.map(\.name)
-        out += (store.selectedWorkspace?.spaces ?? []).map(\.name).filter { !$0.hasPrefix("Space ") }
+        let tools = ["Claude", "Claude Code", "Codex", "Cursor", "Opus", "Sonnet", "Haiku", "Fable", "terminal", "ProjectN", "NVoice"]
+        guard let store else { return tools }
+        let ws = store.state.workspaces.filter { !$0.agentHost }
+        let places = store.state.projects.map(\.name) + ws.map(\.name)
+            + ws.flatMap(\.spaces).map(\.name).filter { !AssistantCommands.isNumberedSpace($0) }
+        var out = places + places.flatMap { SpokenNames.forms($0) }
         out += (harness?.profiles ?? []).filter(\.enabled).map(\.name)
         out += paneList().map(\.title)
+        out += tools
         var seen = Set<String>()
         return out.filter { !$0.isEmpty && seen.insert($0.folded).inserted }
+    }
+
+    /// Spaces of the workspaces that aren't open (the open one's are in the context already).
+    private func otherSpaces() -> [(id: UUID, name: String, workspaceID: UUID)] {
+        guard let store else { return [] }
+        let cur = store.selectedWorkspace?.id
+        return store.state.workspaces.filter { !$0.agentHost && $0.id != cur }.flatMap { w in w.spaces.map { ($0.id, $0.name, w.id) } }
+    }
+
+    /// How a place is named when asking "¿Quisiste decir …?".
+    private func placeLabel(_ intent: AssistantIntent, _ lang: AssistantLang) -> String {
+        switch intent {
+        case .agentsView: return lang == .es ? "la vista de agentes" : "the Agents view"
+        case .selectSpace(_, let name, let wid?):
+            guard let w = store?.workspace(wid) else { return name }
+            return lang == .es ? "\(name) de \(w.name)" : "\(name) in \(w.name)"
+        default: return intent.placeName ?? ""
+        }
+    }
+
+    /// "Lista los espacios": the names, said so you know what to ask for.
+    private func listText(_ kind: AssistantListKind, _ lang: AssistantLang) -> String {
+        guard let store, let harness else { return "" }
+        func L(_ es: String, _ en: String) -> String { lang == .es ? es : en }
+        func join(_ xs: [String]) -> String {
+            guard let last = xs.last else { return "" }
+            return xs.count == 1 ? last : xs.dropLast().joined(separator: ", ") + L(" y ", " and ") + last
+        }
+        let ws = store.state.workspaces.filter { !$0.agentHost }
+        let cur = store.selectedWorkspace
+        switch kind {
+        case .projects:
+            let names = store.state.projects.map(\.name)
+            return names.isEmpty ? L("Aún no tienes proyectos.", "You have no projects yet.")
+                : L("Tus \(names.count) proyectos: ", "Your \(names.count) projects: ") + join(names) + "."
+        case .workspaces:
+            let names = ws.map(\.name)
+            return names.isEmpty ? L("Aún no tienes workspaces.", "You have no workspaces yet.")
+                : L("Tus \(names.count) workspaces: ", "Your \(names.count) workspaces: ") + join(names) + "."
+        case .spaces:
+            var parts: [String] = []
+            if let cur { parts.append(L("En \(cur.name): ", "In \(cur.name): ") + join(cur.spaces.map(\.name)) + ".") }
+            let named = ws.filter { $0.id != cur?.id }.flatMap { w in
+                w.spaces.filter { !AssistantCommands.isNumberedSpace($0.name) }.map { L("\($0.name) de \(w.name)", "\($0.name) in \(w.name)") }
+            }
+            if !named.isEmpty { parts.append(L("Espacios con nombre: ", "Named spaces: ") + join(named) + ".") }
+            let others = ws.filter { $0.id != cur?.id }.map(\.name)
+            if !others.isEmpty { parts.append(L(cur == nil ? "Workspaces: " : "Otros workspaces: ", cur == nil ? "Workspaces: " : "Other workspaces: ") + join(others) + ".") }
+            return parts.isEmpty ? L("Aún no hay espacios.", "There are no spaces yet.") : parts.joined(separator: " ")
+        case .panes:
+            let panes = ws.flatMap { w in w.spaces.flatMap { s in s.panes.map { p in
+                "\(store.paneTitle(p)) (\(p.tool.label)\(w.id == cur?.id ? "" : L(", en \(w.name)", ", in \(w.name)")))"
+            } } }
+            guard !panes.isEmpty else { return L("No hay paneles abiertos.", "No panes are open.") }
+            let shown = panes.count <= 12 ? join(panes) : panes.prefix(10).joined(separator: ", ") + L(" y \(panes.count - 10) más", " and \(panes.count - 10) more")
+            return L("\(panes.count) \(panes.count == 1 ? "panel" : "paneles"): ", "\(panes.count) \(panes.count == 1 ? "pane" : "panes"): ") + shown + "."
+        case .agents:
+            let names = harness.profiles.filter(\.enabled).map(\.name)
+            return names.isEmpty ? L("No tienes agentes activos.", "You have no active agents.")
+                : L("Tus agentes: ", "Your agents: ") + join(names) + "."
+        }
     }
 
     /// A new turn: transcribe what you say from now on (plus `preroll` seconds already heard).
@@ -911,6 +977,23 @@ final class AssistantController: ObservableObject {
             }
         }
 
+        // Answering "¿Quisiste decir …?".
+        if let choice = pendingChoice {
+            pendingChoice = nil
+            if let pick = AssistantCommands.pick(text, from: choice.options) {
+                if let id = pick.placeID, let name = pick.placeName {
+                    AssistantAliases.shared.learn(heard: choice.heard, id: id, name: name)
+                    Diagnostics.log("assistant: learned \"\(choice.heard)\" → \(name)")
+                }
+                perform(pick, lang: choice.lang)
+                return
+            }
+            if AssistantCommands.isNo(text) {
+                reply(lang == .es ? "Vale." : "Okay.", lang)
+                return
+            }
+        }
+
         lastOpened = lastOpened.filter { store.pane($0.paneID, in: $0.workspaceID) != nil }
         var models: [Tool: [LaunchCatalog.Choice]] = [
             .claude: LaunchCatalog.claudeModelChoices,
@@ -922,6 +1005,8 @@ final class AssistantController: ObservableObject {
             projects: store.state.projects,
             workspaces: store.state.workspaces.filter { !$0.agentHost }.map { ($0.id, $0.name) },
             spaces: store.selectedWorkspace?.spaces.map { ($0.id, $0.name) } ?? [],
+            otherSpaces: otherSpaces(),
+            learned: AssistantAliases.shared.all,
             agents: harness.profiles,
             panes: paneList(),
             lastOpened: lastOpened,
@@ -930,8 +1015,14 @@ final class AssistantController: ObservableObject {
                       .codex: LaunchCatalog.efforts(for: .codex, model: nil, settings: store.settings)])
         let intent = AssistantCommands.parse(text, ctx)
         let kind = Mirror(reflecting: intent).children.first?.label ?? "\(intent)"
-        Diagnostics.log("assistant: request → \(kind == "unknown" ? (useAI ? "AI (\(aiProvider.rawValue) \(aiModel))" : "not a command, AI is OFF") : kind)")
-        if case .unknown = intent, useAI {
+        // A name that only sounds close: the AI (when on) decides with the whole picture; without it, ask.
+        var toAI = false
+        switch intent {
+        case .unknown, .didYouMean: toAI = useAI
+        default: break
+        }
+        Diagnostics.log("assistant: request → \(toAI ? "AI (\(aiProvider.rawValue) \(aiModel))" : kind == "unknown" ? "not a command, AI is OFF" : kind)")
+        if toAI {
             askAI(text, lang: lang)
         } else {
             perform(intent, lang: lang)
@@ -954,8 +1045,8 @@ final class AssistantController: ObservableObject {
         case .repeatLast:
             if let r = lastReply { say(r.text, r.lang) } else { reply(L("Aún no he dicho nada.", "I haven't said anything yet."), lang) }
         case .help:
-            reply(L("Puedo abrir proyectos y espacios, abrir varios paneles de Claude, Codex, Cursor o terminal con el modelo y el esfuerzo que digas y con un prompt para empezar, cerrar paneles abiertos o cambiar su modelo y esfuerzo, mandarles prompts, pedirle trabajo a tus agentes y decirte qué está corriendo. Por ejemplo: abre tres Claude en Opus 5.5 low que revisen el login; dile a Ada que corra los tests.",
-                    "I can open projects and spaces, open several Claude, Codex, Cursor or terminal panes with the model and effort you say and a prompt to start on, close open panes or change their model and effort, send them prompts, hand work to your agents and tell you what's running. Try: open three Claude in Opus 5.5 low to review the login; tell Ada to run the tests."), lang)
+            reply(L("Puedo abrir proyectos y espacios, abrir varios paneles de Claude, Codex, Cursor o terminal con el modelo y el esfuerzo que digas y con un prompt para empezar, cerrar paneles abiertos o cambiar su modelo y esfuerzo, mandarles prompts, pedirle trabajo a tus agentes, decirte qué está corriendo y leerte los nombres de tus proyectos, espacios o paneles. Por ejemplo: abre tres Claude en Opus 5.5 low que revisen el login; dile a Ada que corra los tests.",
+                    "I can open projects and spaces, open several Claude, Codex, Cursor or terminal panes with the model and effort you say and a prompt to start on, close open panes or change their model and effort, send them prompts, hand work to your agents, tell you what's running and read you the names of your projects, spaces or panes. Try: open three Claude in Opus 5.5 low to review the login; tell Ada to run the tests."), lang)
         case .status:
             reply(statusText(lang), lang)
         case .pending:
@@ -976,11 +1067,30 @@ final class AssistantController: ObservableObject {
                 reply(L("Primero abre un proyecto.", "Open a project first."), lang); return
             }
             reply(L("Nuevo espacio: \(s.name).", "New space: \(s.name)."), lang)
-        case .selectSpace(let id, let name):
+        case .selectSpace(let id, let name, let wid):
             showWorkspaces()
-            guard let w = store.selectedWorkspace else { return }
-            store.selectSpace(id, in: w.id)
-            reply(L("Espacio \(name).", "Space \(name)."), lang)
+            guard let w = wid ?? store.selectedWorkspace?.id, store.space(id, in: w) != nil else {
+                reply(L("Ese espacio ya no existe.", "That space doesn't exist anymore."), lang); return
+            }
+            store.selectSpace(id, in: w)
+            let where_ = wid.flatMap { store.workspace($0)?.name }.map { L(" en \($0)", " in \($0)") } ?? ""
+            reply(L("Espacio \(name)\(where_).", "Space \(name)\(where_)."), lang)
+        case .list(let kind):
+            reply(listText(kind, lang), lang)
+        case .didYouMean(let heard, let options):
+            guard !options.isEmpty else {
+                reply(L("No encontré «\(heard)». Di «lista los espacios» o «lista los proyectos» para oír los nombres.",
+                        "I couldn't find “\(heard)”. Say “list the spaces” or “list the projects” to hear the names."), lang)
+                return
+            }
+            pendingChoice = (heard, options, lang)
+            let names = options.map { placeLabel($0, lang) }
+            if names.count == 1 {
+                reply(L("¿Quisiste decir \(names[0])?", "Did you mean \(names[0])?"), lang)
+            } else {
+                let list = names.dropLast().joined(separator: ", ") + L(" o ", " or ") + names[names.count - 1]
+                reply(L("¿Cuál? \(list).", "Which one? \(list)."), lang)
+            }
         case .agentsView:
             if let nav, nav.settingsOpen, let panel { nav.closeSettings(panel: panel) }
             nav?.switchMode(.agents)
@@ -1325,9 +1435,20 @@ final class AssistantController: ObservableObject {
         case "new_space": intent = .newSpace(project)
         case "goto_space":
             if let n = a.n { intent = .gotoSpace(n) }
-            else if let name = a.space, let w = store.selectedWorkspace,
-                    let id = AssistantCommands.bestNames(in: AssistantCommands.normalize(name), w.spaces.map { (key: $0.id, names: [$0.name]) }).first,
-                    let sp = w.spaces.first(where: { $0.id == id }) { intent = .selectSpace(id: sp.id, name: sp.name) }
+            else if let name = a.space {
+                // The named workspace's spaces, else the open one's, else any workspace's.
+                let ws = store.state.workspaces.filter { !$0.agentHost }
+                let named = a.workspace.flatMap { n in
+                    AssistantCommands.bestNames(in: AssistantCommands.normalize(n), ws.map { (key: $0.id, names: [$0.name]) }).first
+                }
+                let order = ws.filter { $0.id == named } + ws.filter { $0.id == store.selectedWorkspace?.id && $0.id != named }
+                    + ws.filter { $0.id != named && $0.id != store.selectedWorkspace?.id }
+                intent = order.lazy.compactMap { w -> AssistantIntent? in
+                    guard let id = AssistantCommands.bestNames(in: AssistantCommands.normalize(name), w.spaces.map { (key: $0.id, names: [$0.name]) }).first,
+                          let sp = w.spaces.first(where: { $0.id == id }) else { return nil }
+                    return .selectSpace(id: sp.id, name: sp.name, workspaceID: w.id)
+                }.first
+            }
             else { intent = nil }
         case "open_workspace":
             let ws = store.state.workspaces.filter { !$0.agentHost }
@@ -1523,7 +1644,7 @@ final class AssistantController: ObservableObject {
         speakingMeter = nil
     }
 
-    func clear() { log.removeAll(); lastReply = nil; pendingAgent = nil; liveUserEntryID = nil; lastHeard = nil }
+    func clear() { log.removeAll(); lastReply = nil; pendingAgent = nil; pendingChoice = nil; liveUserEntryID = nil; lastHeard = nil }
 
     // MARK: Voices
 

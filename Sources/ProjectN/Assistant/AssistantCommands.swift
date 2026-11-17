@@ -13,8 +13,13 @@ enum AssistantIntent: Equatable {
     case home
     case openProject(Project)
     case openWorkspace(id: UUID, name: String)
-    /// A space of the open workspace, by its name ("ve a Videos").
-    case selectSpace(id: UUID, name: String)
+    /// A space by its name ("ve a Videos"); `workspaceID` nil means the open workspace.
+    case selectSpace(id: UUID, name: String, workspaceID: UUID? = nil)
+    /// "lista los espacios", "¿qué proyectos tengo?": the names, read out.
+    case list(AssistantListKind)
+    /// A name that only sounds like what was heard: ask before going ("¿Quisiste decir Vibevoice?").
+    /// No options: nothing sounds like it.
+    case didYouMean(heard: String, options: [AssistantIntent])
     /// The Agents view (⌃⌘2).
     case agentsView
     case newSpace(Project?)
@@ -36,6 +41,29 @@ enum AssistantIntent: Equatable {
 
 enum AssistantLang: String { case es, en }
 
+enum AssistantListKind: Equatable { case projects, workspaces, spaces, panes, agents }
+
+extension AssistantIntent {
+    /// The name of the place a navigation intent goes to.
+    var placeName: String? {
+        switch self {
+        case .openProject(let p): return p.name
+        case .openWorkspace(_, let name), .selectSpace(_, let name, _): return name
+        case .agentsView: return "Agents"
+        default: return nil
+        }
+    }
+
+    /// The project, workspace or space it goes to (what a confirmed alias points at).
+    var placeID: UUID? {
+        switch self {
+        case .openProject(let p): return p.id
+        case .openWorkspace(let id, _), .selectSpace(let id, _, _): return id
+        default: return nil
+        }
+    }
+}
+
 /// "abre cinco Claude en Opus 5.5 low en web shop que revisen el login"
 struct PaneRequest: Equatable {
     var tool: Tool
@@ -54,6 +82,10 @@ enum AssistantCommands {
         var workspaces: [(id: UUID, name: String)] = []
         /// Spaces of the open workspace.
         var spaces: [(id: UUID, name: String)] = []
+        /// Spaces of the other workspaces, so "ve a Videos" works from anywhere.
+        var otherSpaces: [(id: UUID, name: String, workspaceID: UUID)] = []
+        /// What you said before for a name and confirmed ("bible boys" → Vibevoice).
+        var learned: [AssistantAliases.Alias] = []
         var agents: [AgentProfile] = []
         /// Open panes by name, for "dile a Ada que …".
         var panes: [(ref: Store.PaneRef, title: String)] = []
@@ -65,11 +97,13 @@ enum AssistantCommands {
     }
 
     static func parse(_ raw: String, _ ctx: Context) -> AssistantIntent {
-        let text = stripWake(raw.trimmingCharacters(in: .whitespacesAndNewlines))
+        // "Necesito que vayas al proyecto X" → "ve al proyecto X": the command itself, whichever way it was asked.
+        let text = stripPreamble(stripWake(raw.trimmingCharacters(in: .whitespacesAndNewlines)))
         let f = misheard(normalize(text))
         guard !f.isEmpty else { return .unknown(raw) }
 
-        if matchesAny(f, exact: ["stop", "para", "silencio", "callate", "calla", "basta", "shh", "quiet", "shut up", "ya"]) { return .stopSpeaking }
+        if matchesAny(f, exact: ["stop", "para", "silencio", "callate", "calla", "basta", "shh", "quiet", "shut up", "ya",
+                                 "alto", "detente", "espera", "para ya", "ya basta", "wait", "stop it"]) { return .stopSpeaking }
         if matchesAny(f, exact: ["gracias", "muchas gracias", "eso es todo", "es todo", "nada mas", "adios", "hasta luego",
                                  "listo gracias", "ok gracias", "thanks", "thank you", "thats all", "that s all", "bye", "goodbye"]) { return .endConversation }
         if has(f, ["ayuda", "help", "que puedes hacer", "what can you do", "comandos", "commands"]) { return .help }
@@ -96,6 +130,7 @@ enum AssistantCommands {
                          "crea", "crear", "open", "new", "launch", "start", "add", "create", "agrega", "pon", "dame", "give me"]
         if startsWithAny(f, paneVerbs), let r = paneRequest(text, ctx) { return .newPane(r) }
 
+        if let kind = listRequest(f) { return .list(kind) }
         if has(f, ["pendiente", "pendientes", "necesita", "necesitan", "needs input", "needs me", "waiting", "esperando", "aprobacion", "approval"]) { return .pending }
         if has(f, ["estado", "status", "que esta corriendo", "que hay corriendo", "whats running", "what is running", "resumen", "summary", "como va", "como van", "how is it going"]) { return .status }
         if matchesAny(f, exact: ["inicio", "home", "overview", "vista general", "ve al inicio", "go home"]) { return .home }
@@ -127,6 +162,12 @@ enum AssistantCommands {
         // "solar debs" → Solar Devs, "doctor sergio" → dr-sergio, "seo app" → SEO Core App.
         let named = startsWithAny(f, goVerbs) || has(f, ["proyecto", "project", "workspace", "espacio", "space"])
         let lead = stripLead(f)
+        // What you confirmed before for a name ("bible boys" → Vibevoice) counts as its name.
+        if let alias = ctx.learned.sorted(by: { $0.heard.count > $1.heard.count }).first(where: { SlackRouter.containsPhrase(lead, $0.heard) }),
+           named || Self.coversMost(lead, alias.heard),
+           let place = places(ctx).first(where: { $0.intent.placeID == alias.id }) {
+            return place.intent
+        }
         if named || lead.split(separator: " ").count <= 4 {
             let hits = projects(in: lead, ctx.projects)
             // Without a verb, only when what you said is basically just the name ("Hotel system").
@@ -140,13 +181,208 @@ enum AssistantCommands {
                named || Self.coversMost(lead, normalize(w.name)) {
                 return .openWorkspace(id: w.id, name: w.name)
             }
-            let spaces = ctx.spaces.filter { !normalize($0.name).hasPrefix("space ") && !normalize($0.name).hasPrefix("espacio ") }
+            let spaces = ctx.spaces.filter { !isNumberedSpace($0.name) }
             if let id = bestNames(in: lead, spaces.map { (key: $0.id, names: [$0.name]) }).first,
                let s = spaces.first(where: { $0.id == id }), named || Self.coversMost(lead, normalize(s.name)) {
                 return .selectSpace(id: s.id, name: s.name)
             }
+            // Spaces of the other workspaces: "ve a Videos" from anywhere.
+            let others = ctx.otherSpaces.filter { !isNumberedSpace($0.name) }
+            if let id = bestNames(in: lead, others.map { (key: $0.id, names: [$0.name]) }).first,
+               let s = others.first(where: { $0.id == id }), named || Self.coversMost(lead, normalize(s.name)) {
+                return .selectSpace(id: s.id, name: s.name, workspaceID: s.workspaceID)
+            }
         }
+        // Nothing spelled like it: maybe something that sounds like it ("Bible Boys" → Vibevoice).
+        if let guess = soundsLikePlace(lead, ctx, named: named) { return guess }
+        if named, !lead.isEmpty, lead.split(separator: " ").count <= 3 { return .didYouMean(heard: lead, options: []) }
         return .unknown(raw)
+    }
+
+    /// "Space 1", "Espacio 2": a default name nobody says (spaces are reached by number).
+    static func isNumberedSpace(_ name: String) -> Bool {
+        let n = normalize(name)
+        return n.range(of: #"^(?:space|espacio) \d+$"#, options: .regularExpression) != nil
+    }
+
+    // MARK: Answering "¿Quisiste decir …?"
+
+    /// Your answer to "¿Quisiste decir …?": yes (when there was one option), "el segundo", or one of the names.
+    static func pick(_ answer: String, from options: [AssistantIntent]) -> AssistantIntent? {
+        let f = normalize(stripWake(answer))
+        let words = f.split(separator: " ").map(String.init)
+        guard let first = words.first, !options.isEmpty, !isNo(answer) else { return nil }
+        let yes: Set<String> = ["si", "yes", "yeah", "yep", "claro", "correcto", "exacto", "dale", "ok", "okay", "sale", "va",
+                                "andale", "sure", "right", "correct", "exactly", "eso", "ese", "esa", "simon", "aja", "afirmativo"]
+        if options.count == 1, yes.contains(first) { return options[0] }
+        let ordinals: [(Set<String>, Int)] = [
+            (["primero", "primera", "primer", "first", "uno", "una", "one", "1"], 0),
+            (["segundo", "segunda", "second", "dos", "two", "2"], 1),
+            (["tercero", "tercera", "tercer", "third", "tres", "three", "3"], 2),
+        ]
+        if words.count <= 3 {
+            for (set, i) in ordinals where words.contains(where: set.contains) && options.indices.contains(i) { return options[i] }
+            if words.contains(where: { ["ultimo", "ultima", "last"].contains($0) }) { return options.last }
+        }
+        let names = options.indices.map { i -> (key: Int, names: [String]) in
+            (i, options[i] == .agentsView ? ["agents", "agentes", "vista de agentes", "agents view"] : [options[i].placeName ?? ""])
+        }
+        let hits = bestNames(in: f, names)
+        if hits.count == 1 { return options[hits[0]] }
+        let sounds = names.filter { c in c.names.contains { SoundsLike.similarity(f, canonical($0)) >= 0.75 } }
+        return sounds.count == 1 ? options[sounds[0].key] : nil
+    }
+
+    static func isNo(_ answer: String) -> Bool {
+        let f = normalize(stripWake(answer))
+        guard let first = f.split(separator: " ").first.map(String.init) else { return false }
+        return ["no", "nope", "ninguno", "ninguna", "neither", "none", "cancel", "cancela", "olvidalo", "nada", "nah"].contains(first)
+            || ["forget it", "never mind", "nevermind"].contains(f)
+    }
+
+    // MARK: Places by sound
+
+    /// Somewhere you can go by name, with the other ways it's written or was said before.
+    struct Place {
+        var intent: AssistantIntent
+        var names: [String]
+    }
+
+    /// Projects, workspaces (not the ones that are just a project), named spaces of every workspace and the Agents view.
+    static func places(_ ctx: Context) -> [Place] {
+        func learned(_ id: UUID) -> [String] { ctx.learned.filter { $0.id == id }.map(\.heard) }
+        var out = ctx.projects.map { p in
+            Place(intent: .openProject(p), names: [p.name, URL(fileURLWithPath: p.path).lastPathComponent] + learned(p.id))
+        }
+        let projectNames = Set(ctx.projects.map { normalize($0.name) })
+        out += ctx.workspaces.filter { !projectNames.contains(normalize($0.name)) }.map { w in
+            Place(intent: .openWorkspace(id: w.id, name: w.name), names: [w.name] + learned(w.id))
+        }
+        out += ctx.spaces.filter { !isNumberedSpace($0.name) }.map { s in
+            Place(intent: .selectSpace(id: s.id, name: s.name), names: [s.name] + learned(s.id))
+        }
+        out += ctx.otherSpaces.filter { !isNumberedSpace($0.name) }.map { s in
+            Place(intent: .selectSpace(id: s.id, name: s.name, workspaceID: s.workspaceID), names: [s.name] + learned(s.id))
+        }
+        out.append(Place(intent: .agentsView, names: ["agents", "agentes"]))
+        return out
+    }
+
+    /// A place whose name sounds like what was said. Sure (and asked for with "ve a…", "abre…") → go there;
+    /// close but not sure → ask which; nothing close → nil.
+    static func soundsLikePlace(_ lead: String, _ ctx: Context, named: Bool) -> AssistantIntent? {
+        let said = canonical(lead)
+        let words = said.split(separator: " ").map(String.init).filter { !stopwords.contains($0) }
+        guard !words.isEmpty, words.count <= (named ? 5 : 3) else { return nil }
+        let whole = words.joined(separator: " ")
+        // What was said, and each stretch of it ("ve a vibe voice ahora" → "vibe voice").
+        var stretches: [String] = []
+        for len in 1...words.count {
+            for i in 0...(words.count - len) { stretches.append(words[i..<(i + len)].joined(separator: " ")) }
+        }
+        var scored: [(intent: AssistantIntent, score: Double)] = []
+        for place in places(ctx) {
+            var best = 0.0
+            for name in place.names.map(canonical) where !name.isEmpty {
+                for s in stretches {
+                    best = max(best, SoundsLike.similarity(s, name))
+                    // A part of the name said on its own ("boys" for Vibevoice): only ever a suggestion.
+                    if s == whole { best = max(best, 0.6 * SoundsLike.partial(s, of: name)) }
+                }
+            }
+            if best >= 0.5 { scored.append((place.intent, best)) }
+        }
+        scored.sort { $0.score > $1.score }
+        guard let top = scored.first else { return nil }
+        let close = scored.filter { $0.score >= top.score - 0.1 }.prefix(3).map(\.intent)
+        if named, top.score >= 0.75, close.count == 1 { return top.intent }
+        // Said without "ve a…": only a name it really sounds like, and asked first.
+        if !named, top.score < 0.75 { return nil }
+        return .didYouMean(heard: lead, options: Array(close))
+    }
+
+    /// "lista los espacios", "¿qué proyectos tengo?", "list the workspaces": what to list, when that's all that was asked.
+    static func listRequest(_ f: String) -> AssistantListKind? {
+        let kinds: [(String, AssistantListKind)] = [
+            ("espacios de trabajo", .workspaces), ("areas de trabajo", .workspaces), ("workspaces", .workspaces),
+            ("proyectos", .projects), ("projects", .projects), ("espacios", .spaces), ("spaces", .spaces),
+            ("paneles", .panes), ("panes", .panes), ("terminales", .panes), ("terminals", .panes),
+            ("agentes", .agents), ("agents", .agents),
+        ]
+        guard let (word, kind) = kinds.first(where: { SlackRouter.containsPhrase(f, $0.0) }) else { return nil }
+        // Nothing else may be asked: "¿qué proyectos tienen tests fallando?" is a question for the AI.
+        let filler: Set<String> = ["lista", "listame", "enumera", "enumerame", "dime", "di", "nombra", "nombrame", "lee", "leeme",
+                                   "muestrame", "ensename", "cuales", "son", "que", "hay", "tengo", "tenemos", "tienes", "existen",
+                                   "los", "las", "mis", "tus", "todos", "todas", "nombres", "de", "del", "abiertos", "abiertas",
+                                   "list", "tell", "me", "show", "read", "name", "what", "which", "are", "there", "do", "i", "have",
+                                   "the", "my", "all", "names", "of", "open", "please", "por", "favor"]
+        let rest = f.replacingOccurrences(of: word, with: " ").split(separator: " ").map(String.init)
+        guard rest.contains(where: { ["lista", "listame", "enumera", "enumerame", "dime", "di", "nombra", "nombrame", "lee", "leeme",
+                                     "muestrame", "ensename", "cuales", "que", "hay", "list", "tell", "show", "read", "name",
+                                     "what", "which"].contains($0) }),
+              rest.allSatisfy(filler.contains) else { return nil }
+        return kind
+    }
+
+    // MARK: Asked politely
+
+    /// Imperatives for the ways a request is asked: "que vayas", "puedes ir", "quiero abrir" → "ve", "abre".
+    private static let imperatives: [String: String] = [
+        "ir": "ve", "irte": "ve", "irnos": "vamos", "vayas": "ve", "vaya": "ve", "vayamos": "vamos",
+        "abrir": "abre", "abras": "abre", "abra": "abre", "abrirme": "abre",
+        "cambiar": "cambia", "cambies": "cambia", "cambiarte": "cambia", "cambiarme": "cambia", "cambiarnos": "cambia",
+        "pasar": "pasa", "pases": "pasa", "pasarte": "pasa", "pasarme": "pasa", "pasarnos": "pasa",
+        "llevar": "llevame", "lleves": "llevame", "llevarme": "llevame", "llevarnos": "llevame",
+        "mostrar": "muestrame", "muestres": "muestrame", "mostrarme": "muestrame", "ensenar": "muestrame",
+        "ensenes": "muestrame", "ensenarme": "muestrame", "ver": "muestrame",
+        "seleccionar": "selecciona", "selecciones": "selecciona",
+        "lanzar": "lanza", "lances": "lanza", "crear": "crea", "crees": "crea", "cerrar": "cierra", "cierres": "cierra",
+        "iniciar": "inicia", "inicies": "inicia", "arrancar": "arranca", "arranques": "arranca",
+        "agregar": "agrega", "agregues": "agrega", "poner": "pon", "pongas": "pon",
+        "mandar": "manda", "mandes": "manda", "mandarle": "mandale", "mandarles": "mandales",
+        "enviar": "envia", "envies": "envia", "enviarle": "enviale", "enviarles": "enviales",
+        "decir": "dile", "digas": "dile", "decirle": "dile", "decirles": "diles",
+        "pedir": "pidele", "pidas": "pidele", "pedirle": "pidele", "pedirles": "pideles",
+        "escribir": "escribe", "escribas": "escribe", "escribirle": "escribele", "escribirles": "escribeles",
+        "listar": "lista", "listes": "lista", "enumerar": "enumera", "enumeres": "enumera",
+        "cancelar": "cancela", "canceles": "cancela", "detener": "deten", "detengas": "deten",
+        "repetir": "repite", "repitas": "repite",
+    ]
+
+    /// "Necesito que vayas al proyecto X", "¿puedes abrir un Claude…?", "quiero un Codex", "can you go to X, please"
+    /// → "ve al proyecto X", "abre un Claude…", "dame un Codex", "go to X". The rest keeps its casing (it may be a prompt).
+    static func stripPreamble(_ text: String) -> String {
+        let folded = text.folded
+        let src = folded.count == text.count ? text : folded
+        let polite = #"^[\s¿¡]*(?:(?:por favor|porfa|please|oye|mira|bueno|entonces|ahora|ahorita|y)[\s,]+)*"#
+        let spanish = #"(?:(?:yo\s+)?(?:necesito|quiero|quisiera|me gustaria)\s+(?:que\s+)?|(?:me\s+|tu\s+)?(?:puedes|podrias|pudieras|podras)\s+)"#
+            + #"(?:(me|le|les|nos|te)\s+)?([\p{L}]+)"#
+        let english = #"(?:(?:can|could|would|will)\s+you\s+(?:please\s+)?|i\s+(?:want|need|would like)\s+(?:you\s+)?to\s+|i'?d like (?:you\s+)?to\s+|please\s+)"#
+        var out = src
+        if let m = folded.firstMatch(of: try! Regex(polite + spanish)) {
+            let end = folded.distance(from: folded.startIndex, to: m.range.upperBound)
+            let clitic = m.output[1].substring.map(String.init)
+            let verb = String(m.output[2].substring ?? "")
+            let rest = String(src.dropFirst(end))
+            if var imperative = imperatives[verb] {
+                // "que me lleves", "que le digas": the pronoun is already in the imperative; "que les digas" → "diles".
+                if clitic == "les", imperative.hasSuffix("le") { imperative += "s" }
+                out = imperative + rest
+            } else if ["un", "una", "uno", "unos", "unas", "otro", "otra", "dos", "tres", "cuatro", "cinco"].contains(verb),
+                      folded.range(of: polite + #"(?:yo\s+)?(?:necesito|quiero|quisiera)\s+(?:un|una|uno|unos|unas|otro|otra|dos|tres|cuatro|cinco)\b"#,
+                                   options: .regularExpression) != nil {
+                // "quiero un Claude" → "dame un Claude".
+                out = "dame " + verb + rest
+            } else {
+                return text
+            }
+        } else if let m = folded.firstMatch(of: try! Regex(polite + english)) {
+            out = String(src.dropFirst(folded.distance(from: folded.startIndex, to: m.range.upperBound)))
+        } else if let m = folded.firstMatch(of: try! Regex(polite)), !m.range.isEmpty {
+            out = String(src.dropFirst(folded.distance(from: folded.startIndex, to: m.range.upperBound)))
+        }
+        return out.replacingOccurrences(of: #"(?i)[\s,]*(?:por favor|porfa|please)[\s.!?]*$"#, with: "", options: .regularExpression)
+            .trimmingCharacters(in: .whitespaces)
     }
 
     /// Deliberately separate from new-pane parsing so changes never create a replacement pane.
@@ -212,14 +448,14 @@ enum AssistantCommands {
         return changed ? options : nil
     }
 
-    private static let goVerbs = ["abre", "abrir", "ve a", "ve al", "vete a", "ir a", "vamos a", "cambia", "cambiate", "cambiame",
+    private static let goVerbs = ["abre", "abrir", "ve a", "ve al", "vete a", "ir a", "vamos a", "vamonos a", "llevame", "cambia", "cambiate", "cambiame",
                                   "pasa a", "pasate a", "llevame a", "muestrame", "selecciona", "open", "go to", "switch", "change",
                                   "show me", "take me to", "move to", "jump to", "select"]
 
     /// Drops the leading verb and filler ("cambia al proyecto …", "switch to the …") so only the name is left.
     static func stripLead(_ f: String) -> String {
         var t = f
-        let filler = #"^(?:(?:abre|abrir|ve|vete|ir|vamos|cambia|cambiate|cambiame|pasa|pasate|llevame|muestrame|selecciona|open|go|switch|change|show|take|move|jump|select|me|a|al|to|the|el|la|los|las|de|del|over|on|en|proyecto|project|workspace|espacio|space)\s+)+"#
+        let filler = #"^(?:(?:abre|abrir|ve|vete|ir|vamos|vamonos|cambia|cambiate|cambiame|pasa|pasate|llevame|muestrame|selecciona|open|go|switch|change|show|take|move|jump|select|me|a|al|to|the|el|la|los|las|de|del|over|on|en|proyecto|project|workspace|espacio|space)\s+)+"#
         if let r = t.range(of: filler, options: .regularExpression) { t.removeSubrange(r) }
         return t.trimmingCharacters(in: .whitespaces)
     }
@@ -341,8 +577,13 @@ enum AssistantCommands {
     private static func paneMessage(_ text: String, _ ctx: Context) -> AssistantIntent? {
         guard !ctx.panes.isEmpty || !ctx.lastOpened.isEmpty else { return nil }
         let folded = text.folded
-        let lead = #"^(?:dile|diles|pidele|pideles|escribele|escribeles|escribe|mandale|mandales|manda|enviale|enviales|envia|tell|ask|send|write)\s+(?:al?\s+|to\s+)?(?:(?:el|la|the)\s+)?(?:(?:panel|pane|terminal)\s+)?"#
-        guard let l = folded.range(of: lead, options: .regularExpression) else { return nil }
+        let sendVerb = #"(?:dile|diles|pidele|pideles|escribele|escribeles|escribe|mandale|mandales|manda|enviale|enviales|envia|tell|ask|send|write)"#
+        let lead = "^" + sendVerb + #"\s+(?:al?\s+|to\s+)?(?:(?:el|la|the)\s+)?(?:(?:panel|pane|terminal)\s+)?"#
+        // "En Donald, quiero que le mandes este prompt: …", "a Ada dile que …", "in Ken, tell it to …"
+        let at = #"^(?:en|a|al|para|in|to|for)\s+(?:(?:el|la|the)\s+)?(?:(?:panel|pane|terminal)\s+)?"#
+        let l = folded.range(of: lead, options: .regularExpression) ?? folded.range(of: at, options: .regularExpression)
+        guard let l else { return nil }
+        let verbFirst = folded.range(of: lead, options: .regularExpression) != nil
         let rest = folded[l.upperBound...]
         func said(_ w: String) -> Bool {
             guard rest.hasPrefix(w) else { return false }
@@ -359,16 +600,42 @@ enum AssistantCommands {
             refs = [last]; used = w.count
         } else if let p = ctx.panes.sorted(by: { $0.title.count > $1.title.count }).first(where: { said($0.title.folded) }) {
             refs = [p.ref]; used = p.title.folded.count
+        } else if let (p, n) = paneSoundingLike(rest, ctx.panes) {
+            refs = [p.ref]; used = n
         }
         guard !refs.isEmpty else { return nil }
-        let after = rest.dropFirst(used)
-        guard let glue = after.range(of: #"^\s*[,:]?\s*(?:que\s+|to\s+)?"#, options: .regularExpression) else { return nil }
+        var after = rest.dropFirst(used)
+        if !verbFirst {
+            // The verb comes after the name: "En Donald quiero que le mandes …".
+            let verb = #"^\s*[,:]?\s*(?:(?:quiero|necesito)\s+que\s+)?(?:(?:le|les)\s+)?(?:mandes|envies|escribas|digas|pidas|pongas|pases|pegues|mandale|manda|enviale|envia|escribele|escribe|dile|di|pidele|pide|ponle|pon|pasale|pasa|pegale|pega|send|tell|ask|write|give)\b(?:\s+(?:it|him|her|them))?"#
+            guard let v = after.range(of: verb, options: .regularExpression) else { return nil }
+            after = after[v.upperBound...]
+        }
+        // "… este prompt: …", "… el mensaje, …": only when it introduces the text.
+        let glueRE = #"^\s*[,:]?\s*(?:(?:(?:este|esta|el|la|un|una|this|the|a)\s+)?(?:prompt|mensaje|texto|tarea|instruccion|message|text|task)\s*(?=[,:.]|que\b|to\b)[,:.]?\s*)?(?:que\s+|to\s+)?"#
+        guard let glue = after.range(of: glueRE, options: .regularExpression) else { return nil }
         let offset = folded.distance(from: folded.startIndex, to: glue.upperBound)
         let src = folded.count == text.count ? text : folded
         let prompt = String(src.dropFirst(offset)).trimmingCharacters(in: .whitespacesAndNewlines)
         guard !prompt.isEmpty else { return nil }
         let names = refs.map { r in ctx.panes.first { $0.ref == r }?.title ?? "?" }
         return .sendToPanes(refs, names: names, prompt: prompt)
+    }
+
+    /// The open pane whose name sounds the same as the first words of `rest` ("Catherine" for Katherine):
+    /// the pane and how many characters of `rest` its name took. Only when exactly one pane sounds like it.
+    static func paneSoundingLike(_ rest: Substring, _ panes: [(ref: Store.PaneRef, title: String)]) -> ((ref: Store.PaneRef, title: String), Int)? {
+        var hits: [((ref: Store.PaneRef, title: String), Int)] = []
+        for p in panes {
+            let n = normalize(p.title).split(separator: " ").count
+            guard n > 0, let r = rest.range(of: #"^\p{L}+(?:\s+\p{L}+){0,\#(n - 1)}"#, options: .regularExpression) else { continue }
+            let words = String(rest[r])
+            let key = SoundsLike.key(normalize(p.title))
+            if key.count >= 4, SoundsLike.key(normalize(words)) == key {
+                hits.append((p, rest.distance(from: rest.startIndex, to: r.upperBound)))
+            }
+        }
+        return hits.count == 1 ? hits[0] : nil
     }
 
     private static func askAgent(_ text: String, _ agents: [AgentProfile]) -> AssistantIntent? {

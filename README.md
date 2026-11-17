@@ -229,7 +229,17 @@ Say **“Hey N”** to open the Assistant, then give your prompt. You can also s
 
 Wake listening works in two stages, like a smart speaker. While ProjectN is open the microphone stays on, but the audio only goes to a light sound matcher that compares it with your recordings (MFCC features and dynamic time warping, on this Mac). Nothing is transcribed. When something sounds like “Hey N”, Apple's on-device recognizer transcribes the last ~2 seconds plus what follows to confirm it. If it confirms, that recording moves straight into the prompt, so words right after the wake command are kept. Otherwise the transcript is dropped within 3 seconds. Only your recordings are saved (`hey-n-samples.json` in the ProjectN home). If it wakes when it shouldn't, lower **Sensitivity**; if it misses you, raise it or add recordings (up to 6 are kept). It pauses for regular dictation and spoken replies. Microphone permission and the chosen language's speech assets are required.
 
-The Assistant applies the same saved corrections and dictionary matching as dictation, including during interruptions. Personal terms and app names share Apple's 100-phrase recognition-hint budget; all dictionary entries remain available for matching afterward. To resolve an ambiguous everyday word, add an explicit **heard → replacement** correction in NVoice's People & Words settings.
+The Assistant applies the same saved corrections and dictionary matching as dictation, including during interruptions. Personal terms and app names share Apple's 100-phrase recognition-hint budget; in the Assistant, up to 60 of those go to ProjectN's names (projects, workspaces, named spaces of every workspace, how they're said — “Vibe Voice” for Vibevoice, “project N” for projectN — agents and open panes) and the rest to your personal terms. All dictionary entries remain available for matching afterward. To resolve an ambiguous everyday word, add an explicit **heard → replacement** correction in NVoice's People & Words settings.
+
+### Names, even when dictation gets them wrong
+
+The Assistant finds projects, workspaces and spaces by name without the AI, and it doesn't need the exact spelling:
+
+- **By sound.** Names are compared by how they sound in Spanish or English (b/v, c/k/s, i/y, silent h…), not only by letters: “Vamos al espacio de Bible Boys” opens **Vibevoice**. Spaces of every workspace count, not just the open one (“ve a Videos” from anywhere).
+- **Asks when it isn't sure.** If what you said only sounds close (“Boys”, “aseo cap”), it asks “¿Quisiste decir Vibevoice?” or “¿Cuál? NVoice o Vibevoice”. Answer “sí”, “el segundo” or the name. With the AI on, the AI makes that call instead, with the same names and spoken forms in its snapshot.
+- **Learns what you confirm.** After you say yes, what it heard goes straight to that place next time (`assistant-names.json` in the ProjectN home; only the Assistant uses it, never dictation).
+- **Says what exists.** “Lista los espacios”, “¿qué proyectos tengo?”, “list the workspaces”, “qué paneles hay abiertos”, “dime los agentes” read the names out. If a name isn't found at all, it says so instead of “not a command”.
+- **However you ask.** “Necesito que vayas al proyecto Florina”, “¿puedes ir a Solar Devs, por favor?”, “quiero un Codex”, “En Donald, quiero que le mandes este prompt: …”, and “alto” to stop. Pane names match by sound too (“Catherine” → Katherine) when sending a prompt; closing and reconfiguring still need the exact name.
 
 ### How a conversation works
 
