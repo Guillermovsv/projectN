@@ -9,7 +9,8 @@ enum AssistantWakeCommand {
     static func prompt(in transcript: String) -> String? {
         let text = transcript as NSString
         guard let match = phrase.matches(in: transcript, range: NSRange(location: 0, length: text.length)).last else { return nil }
-        return text.substring(from: NSMaxRange(match.range))
+        let remainder = text.substring(from: NSMaxRange(match.range))
+        return remainder
             .replacingOccurrences(of: "^(?:\\s|[,!?;:]|\\.(?=\\s|$))+", with: "", options: .regularExpression)
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
