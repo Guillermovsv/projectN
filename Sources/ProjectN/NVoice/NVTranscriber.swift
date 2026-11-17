@@ -20,8 +20,11 @@ enum TranscriberError: LocalizedError {
 
 /// Records from the default mic and transcribes on-device with Apple's DictationTranscriber (macOS 26+).
 final class Transcriber {
-    /// 0…1 audio level, called on the main thread ~20×/s while recording.
+    /// 0…1 audio level, called on the main thread ~10–20×/s while recording.
     var onLevel: ((Float) -> Void)?
+    /// The same level with how long ago (seconds) the end of the audio it measures was captured: the main thread
+    /// can deliver it late, and the Assistant lines it up with what its speaker was playing at that moment.
+    var onLevelAge: ((Float, TimeInterval) -> Void)?
     /// Status messages while downloading speech models.
     var onStatus: ((String) -> Void)?
 
@@ -61,11 +64,14 @@ final class Transcriber {
         get { sinkLock.withLock { sinkStorage } }
         set { sinkLock.withLock { sinkStorage = newValue } }
     }
-    /// The last ~2 s of mic audio while listening for “Hey N”, so a transcription started on a match still hears it.
+    /// The last ~2 s of mic audio while the mic is open without a transcript (“Hey N” listening, the Assistant between
+    /// turns), so a transcription started a moment later still hears the start of what was said.
     private var preroll: [AVAudioPCMBuffer] = []
     private var prerollFrames: AVAudioFramePosition = 0
     private var keepPreroll = false
-    private static let prerollSeconds = 2.0
+    static let prerollSeconds = 2.0
+    /// Gets 16 kHz mono audio while recording (the “Hey N” matcher). Guarded by `sinkLock`.
+    private var monitorStorage: ((AVAudioPCMBuffer) -> Void)?
     private var micFormat: AVAudioFormat?
     private let monitorQueue = DispatchQueue(label: "dev.projectn.nvoice.wake", qos: .userInitiated)
     private var pipelineTask: Task<(String, String), Error>?
@@ -117,11 +123,12 @@ final class Transcriber {
 
     /// Starts recording. With more than one locale (e.g. English + Spanish), every language transcribes the
     /// same audio in parallel and the most confident result wins — automatic language detection per dictation.
-    /// `transcribe: false` opens the mic without transcribing (“Hey N” listening): audio goes only to `onAudio16k`
-    /// (16 kHz mono, on a background queue) until `beginTranscription` is called.
+    /// `transcribe: false` opens the mic without transcribing (“Hey N” listening, the Assistant's conversation): audio
+    /// goes only to `onAudio16k` (16 kHz mono, on a background queue) and the preroll until `beginTranscription`.
+    /// `onTranscript` gets live text with the language it was recognized in.
     func start(localeIDs: [String], contextualStrings: [String] = [], inputDevice: AudioInputDevice? = nil,
-               transcribe: Bool = true, onAudio16k: (([Float]) -> Void)? = nil,
-               onTranscript: ((String) -> Void)? = nil) throws {
+               transcribe: Bool = true, keepPreroll: Bool = false, onAudio16k: (([Float]) -> Void)? = nil,
+               onTranscript: ((String, String) -> Void)? = nil) throws {
         guard !isRecording else { return }
         guard AVCaptureDevice.authorizationStatus(for: .audio) == .authorized else { throw TranscriberError.micDenied }
         let ids = Self.unique(localeIDs)
@@ -130,24 +137,33 @@ final class Transcriber {
         var rawStream: AsyncStream<AVAudioPCMBuffer>?
         var rawCont: AsyncStream<AVAudioPCMBuffer>.Continuation?
         if transcribe { (rawStream, rawCont) = AsyncStream<AVAudioPCMBuffer>.makeStream(bufferingPolicy: .unbounded) }
+        let monitor = onAudio16k.map { Self.monitor(on: monitorQueue, $0) }
         sinkLock.withLock {
             sinkStorage = rawCont
-            keepPreroll = onAudio16k != nil
+            self.keepPreroll = keepPreroll || onAudio16k != nil
             preroll = []; prerollFrames = 0
+            monitorStorage = monitor
         }
-        let monitor = onAudio16k.map { Self.monitor(on: monitorQueue, $0) }
 
-        let tapBlock: AVAudioNodeTapBlock = { [weak self] buffer, _ in
+        let tapBlock: AVAudioNodeTapBlock = { [weak self] buffer, when in
             guard let self else { return }
             if let copy = buffer.copy() as? AVAudioPCMBuffer {
-                self.sinkLock.withLock {
+                let monitor = self.sinkLock.withLock { () -> ((AVAudioPCMBuffer) -> Void)? in
                     self.sinkStorage?.yield(copy)
                     if self.keepPreroll { self.remember(copy) }
+                    return self.monitorStorage
                 }
                 monitor?(copy)
             }
             let level = Self.level(of: buffer)
-            DispatchQueue.main.async { self.onLevel?(level) }
+            let captured: Double? = when.isHostTimeValid
+                ? AVAudioTime.seconds(forHostTime: when.hostTime) + Double(buffer.frameLength) / buffer.format.sampleRate : nil
+            DispatchQueue.main.async {
+                self.onLevel?(level)
+                if let age = self.onLevelAge {
+                    age(level, captured.map { max(0, AVAudioTime.seconds(forHostTime: mach_absolute_time()) - $0) } ?? 0)
+                }
+            }
         }
         // Fast path: the warm engine (~50 ms). If it turns out stale, rebuild once and retry.
         let outcome = worker.run(timeout: Self.startTimeout, work: { [self] () -> Result<(Warm, AVAudioFormat), Error> in
@@ -175,7 +191,7 @@ final class Transcriber {
             (w, micFormat) = try outcome.get()
         } catch {
             rawCont?.finish()
-            sinkLock.withLock { sinkStorage = nil; keepPreroll = false; preroll = []; prerollFrames = 0 }
+            sinkLock.withLock { sinkStorage = nil; self.keepPreroll = false; preroll = []; prerollFrames = 0; monitorStorage = nil }
             prewarm()
             throw error
         }
@@ -197,18 +213,31 @@ final class Transcriber {
         }
     }
 
-    /// Starts transcribing on a mic opened with `transcribe: false`, beginning with the last ~2 s of audio.
-    func beginTranscription(localeIDs: [String], contextualStrings: [String] = [], onTranscript: ((String) -> Void)? = nil) {
+    /// Starts transcribing on a mic opened with `transcribe: false`, beginning with the last `prerollSeconds` of audio
+    /// (at most ~2 s are kept).
+    func beginTranscription(localeIDs: [String], contextualStrings: [String] = [], prerollSeconds: Double = prerollSeconds,
+                            onTranscript: ((String, String) -> Void)? = nil) {
         guard isRecording, pipelineTask == nil, let micFormat else { return }
         let (rawStream, rawCont) = AsyncStream<AVAudioPCMBuffer>.makeStream(bufferingPolicy: .unbounded)
         sinkLock.withLock {
-            for b in preroll { rawCont.yield(b) }
+            // Only the most recent part: older audio may be something else entirely (the Assistant's own answer).
+            var keep: [AVAudioPCMBuffer] = []
+            var frames: AVAudioFramePosition = 0
+            for b in preroll.reversed() {
+                guard Double(frames) < prerollSeconds * b.format.sampleRate else { break }
+                keep.append(b)
+                frames += AVAudioFramePosition(b.frameLength)
+            }
+            for b in keep.reversed() { rawCont.yield(b) }
             sinkStorage = rawCont
         }
         startDate = Date()
         pipelineTask = Self.pipeline(ids: Self.unique(localeIDs), contextualStrings: contextualStrings,
                                      micFormat: micFormat, onTranscript: onTranscript, rawStream)
     }
+
+    /// A transcription is running on the open mic.
+    var isTranscribing: Bool { pipelineTask != nil }
 
     /// Drops the transcription started by `beginTranscription`; the mic stays open.
     func endTranscription() {
@@ -220,6 +249,24 @@ final class Transcriber {
         old?.finish()
         pipelineTask?.cancel()
         pipelineTask = nil
+    }
+
+    /// Ends the transcription started by `beginTranscription` and returns its text; the mic stays open (and keeps
+    /// filling the preroll), so the next transcription can start at once.
+    func finishTranscription() async throws -> (text: String, localeID: String) {
+        guard let pipeline = pipelineTask else { return ("", "") }
+        pipelineTask = nil
+        let old = sinkLock.withLock { () -> AsyncStream<AVAudioPCMBuffer>.Continuation? in
+            defer { sinkStorage = nil }
+            return sinkStorage
+        }
+        old?.finish()
+        return try await pipeline.value
+    }
+
+    /// Stops sending audio to the “Hey N” matcher (the Assistant took over the recording).
+    func stopAudioMonitor() {
+        sinkLock.withLock { monitorStorage = nil }
     }
 
     /// Under `sinkLock`.
@@ -254,15 +301,16 @@ final class Transcriber {
     }
 
     private static func pipeline(ids: [String], contextualStrings: [String], micFormat: AVAudioFormat,
-                                 onTranscript: ((String) -> Void)?, _ rawStream: AsyncStream<AVAudioPCMBuffer>)
+                                 onTranscript: ((String, String) -> Void)?, _ rawStream: AsyncStream<AVAudioPCMBuffer>)
         -> Task<(String, String), Error> {
         // Analyzer setup runs concurrently; mic buffers queue up in rawStream so nothing is lost.
         return Task.detached(priority: .userInitiated) {
             var lanes: [Lane] = []
             var firstError: Error?
             for (i, id) in ids.enumerated() {
+                let live = onTranscript.map { report in { (text: String) in report(id, text) } }
                 do { lanes.append(try await Lane.make(localeID: id, primary: i == 0, micFormat: micFormat,
-                                                     contextualStrings: contextualStrings, onTranscript: onTranscript)) }
+                                                     contextualStrings: contextualStrings, onTranscript: live)) }
                 catch { firstError = firstError ?? error }
             }
             guard !lanes.isEmpty else { throw firstError ?? TranscriberError.noAudioFormat }
@@ -410,6 +458,7 @@ final class Transcriber {
             sinkStorage = nil
             keepPreroll = false
             preroll = []; prerollFrames = 0
+            monitorStorage = nil
         }
         micFormat = nil
         isRecording = false

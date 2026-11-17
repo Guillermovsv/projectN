@@ -106,6 +106,7 @@ struct RightRail: View {
                            active: floats ? assistant.floatingVisible : panel.visible && panel.tab == tab,
                            badge: tab == .activity ? store.needsInputCount : 0,
                            shortcut: "⌥⌘\(i + 1)") {
+                    if tab == .assistant { assistant.userOpened() }
                     if floats { FloatingAssistant.shared.toggle() }
                     else if panel.visible && panel.tab == tab { panel.toggle() } else { panel.show(tab) }
                 }

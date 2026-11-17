@@ -277,6 +277,7 @@ struct AppCommands: Commands {
                 .keyboardShortcut("0", modifiers: [.command, .option])
             ForEach(Array(RightPanelModel.Tab.allCases.enumerated()), id: \.element) { i, tab in
                 Button("Show \(tab.label)") {
+                    if tab == .assistant { assistant.userOpened() }
                     if tab == .assistant && assistant.floating { FloatingAssistant.shared.show() } else { panel.show(tab) }
                 }
                     .keyboardShortcut(KeyEquivalent(Character("\(i + 1)")), modifiers: [.command, .option])

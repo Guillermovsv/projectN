@@ -230,7 +230,18 @@ Wake listening works in two stages, like a smart speaker. While ProjectN is open
 
 The Assistant applies the same saved corrections and dictionary matching as dictation, including during interruptions. Personal terms and app names share Apple's 100-phrase recognition-hint budget; all dictionary entries remain available for matching afterward. To resolve an ambiguous everyday word, add an explicit **heard → replacement** correction in NVoice's People & Words settings.
 
-With **Interrupt by talking** enabled, speaking over an answer stops its playback and starts your turn, even when conversation mode is off. Quiet “stop”, “wait”, “espera” and “detente” requests are also checked in live recognition. Headphones help distinguish your voice from speaker echo. The pause setting still controls when your spoken turn ends.
+### How a conversation works
+
+- **One microphone session per conversation.** Clicking the orb (or ⌥⌘A, or “Hey N”) opens the mic once; it stays open while you talk, while the Assistant thinks and while it answers, and closes when the conversation ends (“gracias”, a click, or ~8 s of silence). A small mic icon next to the status shows it's on. Each turn is transcribed on that open mic, so there's no gap or lost first word between turns.
+- **You see what it hears.** Your words appear in a light bubble as you speak and become the final text when you pause. Click the orb to send right away.
+- **Smarter pauses.** The pause setting is the base; a finished sentence (“…en Blog.”) ends your turn sooner, a trailing “y”, “que”, “and”, “the” gives you a moment more. If you carry on talking right after it decided you were done, it waits for the rest and treats both parts as one request.
+- **Interrupt by talking.** Answers play through the Assistant's own audio player, so it knows exactly what it's saying at every moment. It compares that with the microphone to tell its own voice (from the speakers) from yours. When you talk over an answer, its voice drops at once. When your voice or words that aren't its own confirm it's you, the answer stops and it listens. “Stop”, “wait”, “espera” and “detente” work too. On a MacBook's own speakers and mic, a whole answer produced no false interruptions in testing. Headphones make it even more reliable.
+- **fn always wins.** Pressing your dictation key ends the conversation and gives the microphone to dictation.
+- **Voices.** The most natural installed voice is used by default (Siri voices first; their real names, e.g. Carmen, are shown instead of “Voz 2”). Voices are loaded in advance, so the first answer doesn't wait ~4 s for a Siri voice to load. If only basic voices are installed for a language, Settings › Assistant says so; download a Siri or Premium voice in System Settings › Accessibility › Spoken Content.
+- **Opening the panel doesn't switch the mic on by itself.** “Listen as soon as it opens” applies when you open the Assistant yourself (its rail button, ⌥⌘1, the floating window), not when the panel reappears after Settings.
+- Problems (no microphone audio, the AI not answering) appear as small notes in the conversation instead of being read out; a mic that stops sending audio mid-conversation is reopened automatically.
+
+To check interruptions on your own Mac's speakers: `PROJECTN_LIVE_AUDIO=1 ./scripts/test.sh --filter LiveAudio` (plays ~15 s of speech).
 
 ## Assistant pane controls
 

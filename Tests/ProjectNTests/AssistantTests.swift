@@ -234,23 +234,87 @@ struct AssistantRealtimeTests {
         var b = AssistantBargeIn()
         let t0 = Date()
         func at(_ s: Double) -> Date { t0.addingTimeInterval(s) }
-        // The answer through the speakers: loud-ish and steady, for 3 s — never an interruption.
-        for i in 0..<60 { let r = b.push(i.isMultiple(of: 3) ? 0.5 : 0.55, now: at(Double(i) * 0.05)); #expect(!r) }
+        // The answer through the speakers: the mic hears it ~0.15 below what is played, going up and down with the
+        // words, for 3 s — never an interruption.
+        for i in 0..<60 {
+            let ref: Float = i.isMultiple(of: 4) ? 0.55 : 0.7
+            let r = b.push(mic: ref - 0.15 + (i.isMultiple(of: 3) ? 0.03 : 0), ref: ref, now: at(Double(i) * 0.05))
+            #expect(!r)
+        }
         // A cough: loud but short.
-        do { let r = b.push(0.9, now: at(3.05)); #expect(!r) }
-        do { let r = b.push(0.55, now: at(3.3)); #expect(!r) }
+        do { let r = b.push(mic: 0.9, ref: 0.7, now: at(3.05)); #expect(!r) }
+        do { let r = b.push(mic: 0.55, ref: 0.7, now: at(3.3)); #expect(!r) }
         // You talking over it, with a dip between syllables.
-        do { let r = b.push(0.85, now: at(3.5)); #expect(!r) }
-        do { let r = b.push(0.8, now: at(3.6)); #expect(!r) }
-        do { let r = b.push(0.6, now: at(3.7)); #expect(!r) }
-        do { let r = b.push(0.85, now: at(3.85)); #expect(r) }
+        do { let r = b.push(mic: 0.85, ref: 0.7, now: at(3.5)); #expect(!r) }
+        do { let r = b.push(mic: 0.6, ref: 0.7, now: at(3.55)); #expect(!r) }
+        do { let r = b.push(mic: 0.83, ref: 0.7, now: at(3.6)); #expect(r) }
+    }
+
+    @Test func bargeInFollowsTheAnswersOwnLoudness() {
+        // A loud word of the answer is echo, not you: the mic level is compared with what is being played.
+        var b = AssistantBargeIn()
+        let t0 = Date()
+        for i in 0..<30 { _ = b.push(mic: 0.4, ref: 0.55, now: t0.addingTimeInterval(Double(i) * 0.05)) }
+        for i in 0..<6 {
+            let r = b.push(mic: 0.6, ref: 0.75, now: t0.addingTimeInterval(1.5 + Double(i) * 0.05))
+            #expect(!r)
+        }
+    }
+
+    @Test func bargeInWithHeadphonesHearsAnyVoice() {
+        // Nothing of the answer reaches the mic: it learns that, so ordinary speech interrupts.
+        var b = AssistantBargeIn()
+        let t0 = Date()
+        for i in 0..<40 { _ = b.push(mic: 0.05, ref: 0.8, now: t0.addingTimeInterval(Double(i) * 0.05)) }
+        var fired = false
+        for i in 0..<6 where !fired { fired = b.push(mic: 0.42, ref: 0.8, now: t0.addingTimeInterval(2 + Double(i) * 0.04)) }
+        #expect(fired)
     }
 
     @Test func bargeInWaitsForTheAnswerToStart() {
         var b = AssistantBargeIn()
         let t0 = Date()
         // The tail of your own last sentence right when it starts answering.
-        for i in 0..<8 { let r = b.push(0.9, now: t0.addingTimeInterval(Double(i) * 0.05)); #expect(!r) }
+        for i in 0..<4 { let r = b.push(mic: 0.9, ref: 0.6, now: t0.addingTimeInterval(Double(i) * 0.05)); #expect(!r) }
+    }
+
+    @Test func bargeInRemembersTheRoomBetweenAnswers() {
+        var first = AssistantBargeIn()
+        let t0 = Date()
+        for i in 0..<40 { _ = first.push(mic: 0.5, ref: 0.7, now: t0.addingTimeInterval(Double(i) * 0.05)) }
+        let learned = first.coupling ?? 0
+        #expect(abs(learned - -0.2) < 0.03)
+        // The next answer starts with what the last one taught and still hears you right away.
+        var next = AssistantBargeIn(coupling: learned)
+        for i in 0..<6 { _ = next.push(mic: 0.5, ref: 0.7, now: t0.addingTimeInterval(Double(i) * 0.05)) }
+        var fired = false
+        for i in 0..<6 where !fired { fired = next.push(mic: 0.8, ref: 0.7, now: t0.addingTimeInterval(0.4 + Double(i) * 0.04)) }
+        #expect(fired)
+    }
+
+    @Test func newWordsAreTheOnesTheAnswerDidntSay() {
+        let spoken = "Abrí Claude en Opus como Ada. ¿Algo más?"
+        #expect(AssistantBargeIn.newWords("como Ada algo más", spoken: spoken) == 0)
+        #expect(AssistantBargeIn.newWords("no espera mejor Codex", spoken: spoken) == 4)
+        #expect(AssistantBargeIn.newWords("Opus como Ada no espera", spoken: spoken) == 2)
+        #expect(AssistantBargeIn.newWords("y a", spoken: "") == 0)
+    }
+
+    @Test func turnEndsSoonerAfterAFinishedSentenceAndLaterAfterATrailingWord() {
+        #expect(AssistantVAD.endpoint(after: "Abre Codex en Blog.", base: 1) < 0.8)
+        #expect(AssistantVAD.endpoint(after: "What is running?", base: 1) < 0.8)
+        #expect(AssistantVAD.endpoint(after: "abre Claude y", base: 1) > 1.5)
+        #expect(AssistantVAD.endpoint(after: "open the", base: 1) > 1.5)
+        #expect(AssistantVAD.endpoint(after: "abre Claude", base: 1) == 1)
+        #expect(AssistantVAD.endpoint(after: "", base: 0.9) == 0.9)
+        #expect(AssistantVAD.endpoint(after: "ok.", base: 1) == 1)       // one word with a period isn't a sentence yet
+    }
+
+    @MainActor @Test func repliesAreSpokenSentenceBySentence() {
+        #expect(AssistantController.sentences("Listo, abrí Claude. Ahora está revisando el login. ¿Algo más?")
+                == ["Listo, abrí Claude.", "Ahora está revisando el login.", "¿Algo más?"])
+        #expect(AssistantController.sentences("Ok. Opened 3.5 panes.") == ["Ok. Opened 3.5 panes."])
+        #expect(AssistantController.sentences("") == [])
     }
 
     @Test func stripEchoDropsTheAnswerFromTheStart() {

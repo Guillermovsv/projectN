@@ -15,7 +15,8 @@ struct AssistantView: View {
     var body: some View {
         VStack(spacing: 0) {
             toolbar
-            AssistantOrbButton(orb: assistant.orb, size: inWindow ? 64 : 80, showCaption: true) { assistant.toggleListening() }
+            AssistantOrbButton(orb: assistant.orb, size: inWindow ? 64 : 80, showCaption: true,
+                               canInterrupt: assistant.bargeIn && assistant.micOn) { assistant.toggleListening() }
                 .padding(.top, inWindow ? 0 : 4)
                 .padding(.bottom, 18)
             Divider().opacity(0.5)
@@ -35,7 +36,7 @@ struct AssistantView: View {
                 Text("Assistant").font(.system(size: 12, weight: .semibold))
                     .padding(.leading, 58)   // clear of the close button
             }
-            AssistantStatusPill(orb: assistant.orb, ai: assistant.useAI)
+            AssistantStatusPill(orb: assistant.orb, ai: assistant.useAI, mic: assistant.micOn)
             Spacer(minLength: 4)
             iconToggle(assistant.speakReplies ? "speaker.wave.2.fill" : "speaker.slash",
                        on: assistant.speakReplies, help: assistant.speakReplies ? "Replies are spoken — click to mute" : "Replies are muted — click to speak them") {
@@ -98,7 +99,10 @@ struct AssistantView: View {
                 LazyVStack(alignment: .leading, spacing: 10) {
                     if assistant.log.isEmpty { emptyState }
                     ForEach(assistant.log) { e in
-                        bubble(e).id(e.id)
+                        Group {
+                            if e.notice { noticeRow(e) } else { bubble(e) }
+                        }
+                        .id(e.id)
                     }
                     AssistantThinkingRow(orb: assistant.orb, waiting: assistant.log.last?.fromUser == true)
                         .id("thinking")
@@ -119,8 +123,8 @@ struct AssistantView: View {
 
     private var emptyState: some View {
         VStack(spacing: 12) {
-            Text(Self.spanish ? "Habla cuando quieras: responde cuando haces una pausa. También puedes escribir. (⌥⌘A)"
-                              : "Just talk — it answers when you pause. Or type below. (⌥⌘A)")
+            Text(Self.spanish ? "Haz clic en el orbe (o ⌥⌘A) y habla: responde cuando haces una pausa, y puedes interrumpirlo hablando. También puedes escribir."
+                              : "Click the orb (or ⌥⌘A) and talk — it answers when you pause, and you can talk over it to interrupt. Or type below.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
@@ -163,7 +167,7 @@ struct AssistantView: View {
                     .frame(width: 18, height: 18)
                     .overlay(Image(systemName: "sparkles").font(.system(size: 8, weight: .bold)).foregroundStyle(.white))
             }
-            Text(e.text)
+            Text(e.text + (e.provisional ? " …" : ""))
                 .font(.system(size: 13))
                 .textSelection(.enabled)
                 .foregroundStyle(e.fromUser ? Color.white : Color.primary)
@@ -174,9 +178,23 @@ struct AssistantView: View {
                                            bottomTrailingRadius: e.fromUser ? 4 : 13, topTrailingRadius: 13)
                         .fill(e.fromUser ? AnyShapeStyle(Color.appAccent) : AnyShapeStyle(Color.primary.opacity(0.07)))
                 )
+                // Still being heard: a lighter bubble that fills in as you talk.
+                .opacity(e.provisional ? 0.6 : 1)
+                .animation(.easeOut(duration: 0.12), value: e.text)
             if !e.fromUser { Spacer(minLength: 36) }
         }
         .frame(maxWidth: .infinity, alignment: e.fromUser ? .trailing : .leading)
+    }
+
+    private func noticeRow(_ e: AssistantController.Entry) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 5) {
+            Image(systemName: "exclamationmark.circle").font(.system(size: 10))
+            Text(e.text).font(.system(size: 11)).textSelection(.enabled)
+        }
+        .foregroundStyle(.secondary)
+        .frame(maxWidth: .infinity, alignment: .center)
+        .multilineTextAlignment(.center)
+        .padding(.horizontal, 8)
     }
 
     // MARK: Input
@@ -222,7 +240,7 @@ struct AssistantView: View {
         let kind = id.contains("siri") ? "Siri, natural"
             : v.quality == .premium ? "Premium" : v.quality == .enhanced ? "Enhanced"
             : id.contains("eloquence") || id.contains("speech.synthesis") ? "robotic" : "basic"
-        return "\(v.name) (\(v.language), \(kind))"
+        return "\(AssistantController.displayName(v)) (\(v.language), \(kind))"
     }
 
     private func send() {
@@ -237,11 +255,16 @@ struct AssistantView: View {
 private struct AssistantStatusPill: View {
     @ObservedObject var orb: AssistantOrbModel
     let ai: Bool
+    let mic: Bool
 
     var body: some View {
         HStack(spacing: 5) {
             Circle().fill(color).frame(width: 6, height: 6)
             Text(label).font(.system(size: 11, weight: .medium))
+            if mic {
+                Image(systemName: "mic.fill").font(.system(size: 8)).foregroundStyle(Color(red: 0.2, green: 0.7, blue: 1))
+                    .help("The microphone stays on until this conversation ends (say “gracias”, click the orb, or stay quiet)")
+            }
             if ai && orb.phase == .idle {
                 Image(systemName: "sparkles").font(.system(size: 9)).foregroundStyle(.secondary)
                     .help("Anything the built-in commands don't cover goes to the AI")
@@ -303,6 +326,8 @@ struct AssistantOrbButton: View {
     @ObservedObject var orb: AssistantOrbModel
     var size: CGFloat = 112
     var showCaption = true
+    /// Talking over the answer interrupts it (the mic is open during the answer).
+    var canInterrupt = false
     let action: () -> Void
     @State private var hover = false
 
@@ -392,9 +417,9 @@ struct AssistantOrbButton: View {
     private var caption: String {
         switch orb.phase {
         case .idle: return "Click to talk"
-        case .listening: return "Listening… click to stop"
+        case .listening: return "Listening — pause or click when done"
         case .thinking: return "Thinking… click to stop"
-        case .speaking: return "Speaking… click to stop"
+        case .speaking: return canInterrupt ? "Speaking — talk to interrupt" : "Speaking — click to stop"
         }
     }
 

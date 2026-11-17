@@ -90,13 +90,13 @@ struct AssistantSpeechTests {
         var detector = AssistantBargeIn()
         let start = Date()
         for i in 0..<12 {
-            let interrupted = detector.push(0.03, now: start.addingTimeInterval(Double(i) * 0.025))
+            let interrupted = detector.push(mic: 0.03, ref: 0, now: start.addingTimeInterval(Double(i) * 0.025))
             #expect(!interrupted)
         }
         var stoppedAt: Double?
         for i in 0..<9 {
             let elapsed = Double(i) * 0.025
-            if detector.push(0.32, now: start.addingTimeInterval(0.4 + elapsed)) {
+            if detector.push(mic: 0.32, ref: 0, now: start.addingTimeInterval(0.4 + elapsed)) {
                 stoppedAt = elapsed
                 break
             }
@@ -108,9 +108,9 @@ struct AssistantSpeechTests {
     @Test func isolatedClicksDoNotAccumulateIntoAnInterruption() {
         var detector = AssistantBargeIn()
         let start = Date()
-        for i in 0..<10 { _ = detector.push(0.02, now: start.addingTimeInterval(Double(i) * 0.05)) }
-        let first = detector.push(0.8, now: start.addingTimeInterval(0.6))
-        let second = detector.push(0.8, now: start.addingTimeInterval(1.2))
+        for i in 0..<10 { _ = detector.push(mic: 0.02, ref: 0, now: start.addingTimeInterval(Double(i) * 0.05)) }
+        let first = detector.push(mic: 0.8, ref: 0, now: start.addingTimeInterval(0.6))
+        let second = detector.push(mic: 0.8, ref: 0, now: start.addingTimeInterval(1.2))
         #expect(!first)
         #expect(!second)
     }

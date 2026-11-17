@@ -26,7 +26,7 @@ enum AssistantWakeCommand {
 @MainActor
 final class AssistantWakeListener {
     typealias StartRecording = (@escaping ([Float]) -> Void, @escaping () -> Bool, @escaping (Float) -> Void) async throws -> Void
-    typealias BeginTranscript = ([String], @escaping (String) -> Void) -> Void
+    typealias BeginTranscript = @MainActor ([String], @escaping (String) -> Void) -> Void
     var canListen: () -> Bool = { false }
     var vocabulary: () -> [String] = { [] }
     /// A fresh matcher for each recording; nil until you've recorded your “Hey N”.
@@ -45,8 +45,8 @@ final class AssistantWakeListener {
     private let recordingAvailable: () -> Bool
     private let startRecording: StartRecording
     private let beginTranscript: BeginTranscript
-    private let endTranscript: () -> Void
-    private let cancelRecording: () -> Void
+    private let endTranscript: @MainActor () -> Void
+    private let cancelRecording: @MainActor () -> Void
     static let confirmSeconds: TimeInterval = 3
     static let listeningStatus = "Listening for “Hey N” — sound only, nothing is transcribed"
     static let needsSamplesStatus = "Record your “Hey N” below to turn this on"
@@ -60,10 +60,10 @@ final class AssistantWakeListener {
                                                                            onLevel: level)
          },
          beginTranscript: @escaping BeginTranscript = { vocabulary, transcript in
-             NVoiceController.shared.assistantBeginTranscript(vocabulary: vocabulary, onTranscript: transcript)
+             NVoiceController.shared.assistantBeginTranscript(vocabulary: vocabulary) { _, text in transcript(text) }
          },
-         endTranscript: @escaping () -> Void = { NVoiceController.shared.assistantEndTranscript() },
-         cancelRecording: @escaping () -> Void = { NVoiceController.shared.assistantCancel() }) {
+         endTranscript: @escaping @MainActor () -> Void = { NVoiceController.shared.assistantEndTranscript() },
+         cancelRecording: @escaping @MainActor () -> Void = { NVoiceController.shared.assistantCancel() }) {
         self.recordingAvailable = recordingAvailable
         self.startRecording = startRecording
         self.beginTranscript = beginTranscript
