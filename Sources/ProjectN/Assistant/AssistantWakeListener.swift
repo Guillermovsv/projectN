@@ -32,11 +32,13 @@ final class AssistantWakeListener {
     private var generation = 0
     private var monitor: Task<Void, Never>?
     private var began = Date.distantPast
+    private var lastHeard = Date.distantPast
     private var retryAt = Date.distantPast
     private var levels: [Float] = []
     private let recordingAvailable: () -> Bool
     private let startRecording: StartRecording
     private let cancelRecording: () -> Void
+    private let restartTranscript: () -> Void
     private var status = "Off" {
         didSet { if status != oldValue { onStatus?(status) } }
     }
@@ -45,10 +47,12 @@ final class AssistantWakeListener {
          startRecording: @escaping StartRecording = { vocabulary, transcript, shouldStart, level in
              try await NVoiceController.shared.assistantStart(vocabulary: vocabulary, onTranscript: transcript,
                                                              shouldStart: shouldStart, onLevel: level)
-         }, cancelRecording: @escaping () -> Void = { NVoiceController.shared.assistantCancel() }) {
+         }, cancelRecording: @escaping () -> Void = { NVoiceController.shared.assistantCancel() },
+         restartTranscript: @escaping () -> Void = { NVoiceController.shared.assistantRestartTranscript() }) {
         self.recordingAvailable = recordingAvailable
         self.startRecording = startRecording
         self.cancelRecording = cancelRecording
+        self.restartTranscript = restartTranscript
     }
 
     func setEnabled(_ enabled: Bool) {
@@ -82,8 +86,17 @@ final class AssistantWakeListener {
             if isRecording { pause() }
             return
         }
-        // Bound passive audio/transcript memory. Ambient audio is discarded, never saved to history.
-        if isRecording, Date().timeIntervalSince(began) > 30 { pause() }
+        // Bound passive audio/transcript memory by starting the transcript over — never by closing the mic, which
+        // made the microphone indicator switch off and on every 30 s and could miss a “Hey N” said in the gap.
+        // Restart in a pause in speech so the phrase isn't cut in half. Ambient audio is never saved to history.
+        if isRecording {
+            let age = Date().timeIntervalSince(began)
+            if age > 60 || (age > 30 && Date().timeIntervalSince(lastHeard) > 1.5) {
+                restartTranscript()
+                began = Date()
+            }
+            return
+        }
         guard !isRecording, !starting, Date() >= retryAt,
               recordingAvailable() else { return }
         starting = true
@@ -94,8 +107,9 @@ final class AssistantWakeListener {
             try await startRecording(
                 ["Hey N", "Hey en", "Hey ene"] + vocabulary(),
                 { [weak self] text in
-                    guard let self, self.isRecording, self.generation == token,
-                          let prompt = AssistantWakeCommand.prompt(in: text), self.canListen() else { return }
+                    guard let self, self.isRecording, self.generation == token else { return }
+                    self.lastHeard = Date()
+                    guard let prompt = AssistantWakeCommand.prompt(in: text), self.canListen() else { return }
                     let sorted = self.levels.sorted()
                     let floor = sorted.isEmpty ? 0 : sorted[sorted.count / 5]
                     self.isRecording = false       // the Assistant now owns the running recording

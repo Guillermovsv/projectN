@@ -53,7 +53,20 @@ final class Transcriber {
     private var rebuildAfterRecording = false
     private var configObserver: NSObjectProtocol?
     private var rebuildWork: DispatchWorkItem?
-    private var rawContinuation: AsyncStream<AVAudioPCMBuffer>.Continuation?
+    /// Where the mic tap sends audio. Swappable so the transcription can restart while the mic stays open.
+    private let sinkLock = NSLock()
+    private var sinkStorage: AsyncStream<AVAudioPCMBuffer>.Continuation?
+    private var rawContinuation: AsyncStream<AVAudioPCMBuffer>.Continuation? {
+        get { sinkLock.withLock { sinkStorage } }
+        set { sinkLock.withLock { sinkStorage = newValue } }
+    }
+    private struct PipelineConfig {
+        let ids: [String]
+        let contextualStrings: [String]
+        let micFormat: AVAudioFormat
+        let onTranscript: ((String) -> Void)?
+    }
+    private var pipelineConfig: PipelineConfig?
     private var pipelineTask: Task<(String, String), Error>?
     private var startDate: Date?
     private(set) var isRecording = false
@@ -115,7 +128,7 @@ final class Transcriber {
 
         let tapBlock: AVAudioNodeTapBlock = { [weak self] buffer, _ in
             guard let self else { return }
-            if let copy = buffer.copy() as? AVAudioPCMBuffer { rawCont.yield(copy) }
+            if let copy = buffer.copy() as? AVAudioPCMBuffer { self.rawContinuation?.yield(copy) }
             let level = Self.level(of: buffer)
             DispatchQueue.main.async { self.onLevel?(level) }
         }
@@ -159,8 +172,31 @@ final class Transcriber {
         startDate = Date()
         Diagnostics.log(String(format: "recording started in %.0f ms", Date().timeIntervalSince(t0) * 1000))
 
+        let config = PipelineConfig(ids: ids, contextualStrings: contextualStrings, micFormat: micFormat,
+                                    onTranscript: onTranscript)
+        pipelineConfig = config
+        pipelineTask = Self.pipeline(config, rawStream)
+    }
+
+    /// Starts a fresh transcription on the running recording, without closing the mic: the passive “Hey N”
+    /// listener does this to bound memory instead of turning the mic off and on (the orange dot flickered).
+    func restartTranscription() {
+        guard isRecording, let config = pipelineConfig else { return }
+        let (rawStream, rawCont) = AsyncStream<AVAudioPCMBuffer>.makeStream(bufferingPolicy: .unbounded)
+        let old = rawContinuation
+        rawContinuation = rawCont
+        old?.finish()
+        pipelineTask?.cancel()
+        pipelineTask = Self.pipeline(config, rawStream)
+        startDate = Date()
+    }
+
+    private static func pipeline(_ config: PipelineConfig, _ rawStream: AsyncStream<AVAudioPCMBuffer>)
+        -> Task<(String, String), Error> {
+        let ids = config.ids, micFormat = config.micFormat
+        let contextualStrings = config.contextualStrings, onTranscript = config.onTranscript
         // Analyzer setup runs concurrently; mic buffers queue up in rawStream so nothing is lost.
-        pipelineTask = Task.detached(priority: .userInitiated) {
+        return Task.detached(priority: .userInitiated) {
             var lanes: [Lane] = []
             var firstError: Error?
             for (i, id) in ids.enumerated() {
@@ -172,6 +208,11 @@ final class Transcriber {
 
             for await raw in rawStream {
                 for lane in lanes { lane.feed(raw) }
+            }
+            // Cancelled (or replaced by a restart): nobody wants this transcript.
+            if Task.isCancelled {
+                for lane in lanes { await lane.cancel() }
+                throw CancellationError()
             }
             var results: [LaneResult] = []
             for lane in lanes { results.append(try await lane.finish()) }
@@ -250,6 +291,12 @@ final class Transcriber {
             }
         }
 
+        func cancel() async {
+            input.finish()
+            await analyzer.cancelAndFinishNow()
+            collector.cancel()
+        }
+
         func finish() async throws -> LaneResult {
             input.finish()
             try await analyzer.finalizeAndFinishThroughEndOfInput()
@@ -299,6 +346,7 @@ final class Transcriber {
         if let o = configObserver { NotificationCenter.default.removeObserver(o); configObserver = nil }
         rawContinuation?.finish()
         rawContinuation = nil
+        pipelineConfig = nil
         isRecording = false
         if rebuildAfterRecording { rebuildAfterRecording = false; invalidateEngine(reason: "audio setup changed while recording") }
     }

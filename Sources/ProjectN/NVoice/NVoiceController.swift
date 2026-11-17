@@ -437,6 +437,11 @@ final class NVoiceController: NSObject, ObservableObject {
         return (profiles.personalize(cleanTranscript(r.text), profile: profile, vocabulary: vocabulary), r.localeID)
     }
 
+    /// Keeps the Assistant's mic open but starts its transcript over (passive wake listening).
+    func assistantRestartTranscript() {
+        transcriber.restartTranscription()
+    }
+
     func assistantCancel() {
         assistantProfile = nil
         assistantVocabulary = []
