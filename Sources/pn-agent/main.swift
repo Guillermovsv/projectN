@@ -1,8 +1,9 @@
-// pn-agent — run by agent CLIs that ProjectN starts. Two modes:
+// pn-agent — run by agent CLIs that ProjectN starts. Three modes:
 //
 //   pn-agent hook   Claude Code PreToolUse hook. Reads the tool call (JSON) on stdin, asks ProjectN for a decision
 //                   (which may wait for the orchestrator agent or for you), prints allow / deny / ask.
 //   pn-agent mcp    stdio MCP server exposing ProjectN's agent tools (ask, delegate_task, wait_for_tasks, …).
+//   pn-agent browser  stdio MCP server driving ProjectN's built-in Browser ($PROJECTN_BROWSER_PORT / _TOKEN).
 //
 // Both talk to the running app at 127.0.0.1:$PROJECTN_AGENT_PORT with the task's $PROJECTN_AGENT_TOKEN
 // (environment only, never on the command line). If ProjectN can't be reached, the hook answers "ask",
@@ -13,9 +14,12 @@ import Foundation
 let env = ProcessInfo.processInfo.environment
 
 /// One request/response round trip: a JSON line out, a JSON line back.
+var portVar = "PROJECTN_AGENT_PORT"
+var tokenVar = "PROJECTN_AGENT_TOKEN"
+
 func bridge(_ request: [String: Any]) -> [String: Any]? {
-    guard let portString = env["PROJECTN_AGENT_PORT"], let port = UInt16(portString),
-          let token = env["PROJECTN_AGENT_TOKEN"], !token.isEmpty else { return nil }
+    guard let portString = env[portVar], let port = UInt16(portString),
+          let token = env[tokenVar], !token.isEmpty else { return nil }
     var req = request
     req["token"] = token
     guard var data = try? JSONSerialization.data(withJSONObject: req) else { return nil }
@@ -69,7 +73,7 @@ func runHook() {
 
 // MARK: mcp (newline-delimited JSON-RPC 2.0 over stdio)
 
-func runMCP() {
+func runMCP(name: String = "projectn", instructions: String = "ProjectN agent tools: ask questions, delegate work to other agents, follow their tasks.") {
     while let line = readLine(strippingNewline: true) {
         guard !line.isEmpty, let msg = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any] else { continue }
         let method = msg["method"] as? String ?? ""
@@ -81,8 +85,8 @@ func runMCP() {
         case "initialize":
             result = ["protocolVersion": params["protocolVersion"] as? String ?? "2025-06-18",
                       "capabilities": ["tools": [String: Any]()],
-                      "serverInfo": ["name": "projectn", "version": "1.0"],
-                      "instructions": "ProjectN agent tools: ask questions, delegate work to other agents, follow their tasks."]
+                      "serverInfo": ["name": name, "version": "1.0"],
+                      "instructions": instructions]
         case "ping":
             result = [:]
         case "tools/list":
@@ -91,7 +95,11 @@ func runMCP() {
         case "tools/call":
             let r = bridge(["op": "call", "name": params["name"] as? String ?? "", "arguments": params["arguments"] ?? [:]])
             let text = r?["text"] as? String ?? "ProjectN isn't reachable."
-            result = ["content": [["type": "text", "text": text]], "isError": r == nil || (r?["isError"] as? Bool ?? false)]
+            var content: [[String: Any]] = [["type": "text", "text": text]]
+            if let image = r?["image"] as? String {
+                content.append(["type": "image", "data": image, "mimeType": r?["mimeType"] as? String ?? "image/png"])
+            }
+            result = ["content": content, "isError": r == nil || (r?["isError"] as? Bool ?? false)]
         default:
             error = ["code": -32601, "message": "Method not found: \(method)"]
         }
@@ -104,7 +112,12 @@ func runMCP() {
 switch CommandLine.arguments.dropFirst().first {
 case "hook": runHook()
 case "mcp": runMCP()
+case "browser":
+    portVar = "PROJECTN_BROWSER_PORT"
+    tokenVar = "PROJECTN_BROWSER_TOKEN"
+    runMCP(name: "projectn-browser",
+           instructions: "ProjectN's built-in browser (the panel the user watches). Default browser for opening sites, previewing local servers, testing web apps and searching; use Claude in Chrome only when the user asks for Chrome.")
 default:
-    FileHandle.standardError.write(Data("usage: pn-agent hook | mcp\n".utf8))
+    FileHandle.standardError.write(Data("usage: pn-agent hook | mcp | browser\n".utf8))
     exit(2)
 }

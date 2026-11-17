@@ -560,6 +560,7 @@ struct ToolsSettingsView: View {
                 TextField("Command", text: $store.settings.claudeCommand)
                 TextField("Extra arguments", text: $store.settings.claudeExtraArgs, prompt: Text("e.g. --model opus"))
                 Toggle("Pass ProjectN MCP servers (--mcp-config)", isOn: $store.settings.claudeUseAppMCP)
+                Toggle("Use ProjectN's Browser by default (Claude in Chrome only when you ask)", isOn: $store.settings.claudeUsesBuiltInBrowser)
                 Toggle("Isolate config in \(AppHome.claudeConfigDir.path.abbreviatingWithTilde) (separate login)", isOn: $store.settings.isolateClaudeConfig)
             }
             Section("Codex") {

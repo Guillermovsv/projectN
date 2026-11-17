@@ -43,6 +43,7 @@ enum Launcher {
             parts += LaunchCatalog.claudeArgs(options)
             parts += Shell.split(settings.claudeExtraArgs)
             parts += extraArgs
+            if settings.claudeUsesBuiltInBrowser { BrowserAutomation.applyToClaude(&parts) }
             if let prompt, !prompt.isEmpty { parts += ["--", prompt] }
         case .codex:
             parts = Shell.split(settings.codexCommand)
@@ -120,6 +121,7 @@ enum Launcher {
         env["PROJECTN_MCP_CONFIG"] = AppHome.mcpFile.path
         env["PROJECTN_WORKSPACE"] = workspaceName
         env["PROJECTN_PROJECT"] = project.name
+        for (k, v) in BrowserAutomation.environment() { env[k] = v }
         env["PWD"] = project.path
         // API keys / tokens from Settings → Accounts & Connections (stored in ~/.projectn/secrets.json).
         for (k, v) in Secrets.environment(names: settings.apiKeyNames) { env[k] = v }

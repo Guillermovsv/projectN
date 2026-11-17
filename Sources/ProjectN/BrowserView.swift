@@ -4,7 +4,7 @@ import WebKit
 
 /// A small browser for previewing local dev servers. Keeps one WKWebView alive across tab switches.
 @MainActor
-final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate {
+final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKScriptMessageHandler {
     enum Device: String, CaseIterable, Identifiable {
         case fit, mobile, tablet, desktop
         var id: String { rawValue }
@@ -46,10 +46,13 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate {
     @Published var device: Device { didSet { UserDefaults.standard.set(device.rawValue, forKey: "browserDevice") } }
 
     private var observations: [NSKeyValueObservation] = []
+    /// Console output + uncaught errors of the page (for agents: browser_console). Cleared on each navigation.
+    var consoleLines: [String] = []
 
     override init() {
         let config = WKWebViewConfiguration()
         config.preferences.isElementFullscreenEnabled = true
+        config.userContentController.addUserScript(WKUserScript(source: Self.consoleHookJS, injectionTime: .atDocumentStart, forMainFrameOnly: true))
         webView = WKWebView(frame: .zero, configuration: config)
         webView.allowsBackForwardNavigationGestures = true
         webView.allowsMagnification = true
@@ -58,6 +61,7 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate {
         device = Device(rawValue: UserDefaults.standard.string(forKey: "browserDevice") ?? "") ?? .fit
         super.init()
         webView.navigationDelegate = self
+        config.userContentController.add(self, name: "pnConsole")
         observations = [
             webView.observe(\.estimatedProgress) { [weak self] wv, _ in MainActor.assumeIsolated { self?.progress = wv.estimatedProgress } },
             webView.observe(\.isLoading) { [weak self] wv, _ in MainActor.assumeIsolated { self?.isLoading = wv.isLoading } },
@@ -160,7 +164,63 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate {
         if let u = webView.url ?? URL(string: address) { NSWorkspace.shared.open(u) }
     }
 
+    // MARK: Automation (BrowserAutomation)
+
+    /// Waits until the page stops loading (or `timeout` seconds pass).
+    func waitForLoad(timeout: TimeInterval) async {
+        let deadline = Date().addingTimeInterval(timeout)
+        while webView.isLoading, Date() < deadline {
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+    }
+
+    /// Runs `body` as an async function in the page; `args` become its local variables.
+    func js(_ body: String, _ args: [String: Any]) async throws -> Any? {
+        try await webView.callAsyncJavaScript(body, arguments: args, contentWorld: .page)
+    }
+
+    func screenshotJPEG(maxWidth: CGFloat) async throws -> Data {
+        guard webView.bounds.width > 0, webView.bounds.height > 0 else {
+            throw BrowserAutomation.Failure(description: "The browser panel isn't on screen (is ProjectN's window open?).")
+        }
+        let cfg = WKSnapshotConfiguration()
+        if webView.bounds.width > maxWidth { cfg.snapshotWidth = NSNumber(value: Double(maxWidth)) }
+        let image = try await webView.takeSnapshot(configuration: cfg)
+        guard let tiff = image.tiffRepresentation, let rep = NSBitmapImageRep(data: tiff),
+              let jpeg = rep.representation(using: .jpeg, properties: [.compressionFactor: 0.8]) else {
+            throw BrowserAutomation.Failure(description: "Couldn't encode the screenshot.")
+        }
+        return jpeg
+    }
+
+    private static let consoleHookJS = """
+    (() => {
+      const post = (level, args) => { try {
+        const text = args.map(a => { if (typeof a === 'string') return a; try { return JSON.stringify(a); } catch (e) { return String(a); } }).join(' ');
+        window.webkit.messageHandlers.pnConsole.postMessage(level + ': ' + text.slice(0, 2000));
+      } catch (e) {} };
+      for (const level of ['log', 'info', 'warn', 'error', 'debug']) {
+        const orig = console[level].bind(console);
+        console[level] = (...args) => { post(level, args); orig(...args); };
+      }
+      window.addEventListener('error', e => post('uncaught', [e.message + (e.filename ? ' (' + e.filename + ':' + e.lineno + ')' : '')]));
+      window.addEventListener('unhandledrejection', e => post('unhandled rejection', [e.reason && (e.reason.stack || e.reason.message) || String(e.reason)]));
+    })();
+    """
+
+    nonisolated func userContentController(_ controller: WKUserContentController, didReceive message: WKScriptMessage) {
+        MainActor.assumeIsolated {
+            guard let line = message.body as? String else { return }
+            consoleLines.append(line)
+            if consoleLines.count > 500 { consoleLines.removeFirst(consoleLines.count - 500) }
+        }
+    }
+
     // MARK: WKNavigationDelegate
+
+    nonisolated func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
+        MainActor.assumeIsolated { self.consoleLines.removeAll() }
+    }
 
     nonisolated func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
         MainActor.assumeIsolated { self.fail(error) }

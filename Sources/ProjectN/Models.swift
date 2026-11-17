@@ -225,6 +225,8 @@ struct AppSettings: Codable, Equatable {
     var sleepIdleMinutes: Int = 30
     /// Minutes the Browser tab may be hidden before its page is unloaded (reloaded when shown). 0 = never.
     var browserSuspendMinutes: Int = 10
+    /// Claude sessions get MCP tools for the built-in Browser and are told to use it by default (Chrome only when asked).
+    var claudeUsesBuiltInBrowser: Bool = true
 
     init() {}
 
@@ -255,5 +257,6 @@ struct AppSettings: Codable, Equatable {
         voiceMenuBarIcon = (try? c.decode(Bool.self, forKey: .voiceMenuBarIcon)) ?? d.voiceMenuBarIcon
         sleepIdleMinutes = (try? c.decode(Int.self, forKey: .sleepIdleMinutes)) ?? d.sleepIdleMinutes
         browserSuspendMinutes = (try? c.decode(Int.self, forKey: .browserSuspendMinutes)) ?? d.browserSuspendMinutes
+        claudeUsesBuiltInBrowser = (try? c.decode(Bool.self, forKey: .claudeUsesBuiltInBrowser)) ?? d.claudeUsesBuiltInBrowser
     }
 }
