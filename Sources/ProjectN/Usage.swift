@@ -194,20 +194,34 @@ final class UsageModel: ObservableObject {
 
     /// Claude Code's OAuth access token from the Keychain (also used by ModelCatalog). Never logged.
     nonisolated static func claudeAccessToken() -> String? {
+        // Claude Code may keep several "Claude Code-credentials" items (e.g. one holding only MCP logins);
+        // try the one for this user first, then any, then the plain-file fallback.
+        for account in [NSUserName(), nil] {
+            if let t = claudeToken(fromJSON: keychainRaw(service: "Claude Code-credentials", account: account)) { return t }
+        }
+        let file = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude/.credentials.json")
+        return claudeToken(fromJSON: try? Data(contentsOf: file))
+    }
+
+    nonisolated private static func claudeToken(fromJSON data: Data?) -> String? {
+        guard let data,
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let oauth = obj["claudeAiOauth"] as? [String: Any],
+              let token = oauth["accessToken"] as? String, !token.isEmpty else { return nil }
+        return token
+    }
+
+    nonisolated private static func keychainRaw(service: String, account: String?) -> Data? {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/security")
-        p.arguments = ["find-generic-password", "-s", "Claude Code-credentials", "-w"]
+        p.arguments = ["find-generic-password", "-s", service] + (account.map { ["-a", $0] } ?? []) + ["-w"]
         let out = Pipe()
         p.standardOutput = out
         p.standardError = Pipe()
         do { try p.run() } catch { return nil }
         let data = out.fileHandleForReading.readDataToEndOfFile()
         p.waitUntilExit()
-        guard p.terminationStatus == 0,
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let oauth = obj["claudeAiOauth"] as? [String: Any],
-              let token = oauth["accessToken"] as? String else { return nil }
-        return token
+        return p.terminationStatus == 0 ? data : nil
     }
 
     nonisolated private static func parseISO(_ s: String?) -> Date? {
