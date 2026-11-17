@@ -381,7 +381,61 @@ final class Store: ObservableObject {
     func selectSpace(_ sid: UUID, in wid: UUID) {
         state.ui.selectedWorkspaceID = wid
         state.ui.selectedSpaceID = sid
-        updateWorkspace(wid) { $0.lastOpened = Date(); $0.expanded = true }
+        updateWorkspace(wid) { $0.expanded = true }
+        scheduleRecencyBump(wid)
+    }
+
+    // MARK: Sidebar recency
+    // Clicking a workspace doesn't jump it to the top right away (the list moving under the cursor
+    // is confusing). It moves once you type in it, or after it has stayed selected for a while.
+
+    static let recencySettleDelay: TimeInterval = 10
+    private var pendingRecency: (workspaceID: UUID, work: DispatchWorkItem)?
+    private var recencyKeyMonitor: Any?
+
+    private func scheduleRecencyBump(_ wid: UUID) {
+        if pendingRecency?.workspaceID == wid { return }
+        pendingRecency?.work.cancel()
+        pendingRecency = nil
+        // A workspace that was never opened would sit at the bottom; place it right away.
+        guard workspace(wid)?.lastOpened != nil else { markWorkspaceUsed(wid); return }
+        let work = DispatchWorkItem { [weak self] in
+            MainActor.assumeIsolated { self?.commitPendingRecency() }
+        }
+        pendingRecency = (wid, work)
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.recencySettleDelay, execute: work)
+        installRecencyKeyMonitor()
+    }
+
+    private func commitPendingRecency() {
+        guard let pending = pendingRecency else { return }
+        pending.work.cancel()
+        pendingRecency = nil
+        // Only if it is still the one on screen.
+        if state.ui.selectedWorkspaceID == pending.workspaceID { markWorkspaceUsed(pending.workspaceID) }
+    }
+
+    private func markWorkspaceUsed(_ wid: UUID) {
+        updateWorkspace(wid) { $0.lastOpened = Date() }
+    }
+
+    /// Typing text (not ⌘-shortcuts) while a bump is pending counts as using the workspace.
+    private func installRecencyKeyMonitor() {
+        guard recencyKeyMonitor == nil else { return }
+        recencyKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            if !event.modifierFlags.contains(.command), !(event.characters ?? "").isEmpty {
+                MainActor.assumeIsolated {
+                    guard let self, self.pendingRecency != nil, !self.isTypingInSheet(event) else { return }
+                    self.commitPendingRecency()
+                }
+            }
+            return event
+        }
+    }
+
+    /// Keys typed into a sheet (rename, new workspace…) aren't work in the workspace.
+    private func isTypingInSheet(_ event: NSEvent) -> Bool {
+        event.window?.isSheet == true
     }
 
     /// Enter a workspace: its most recently used (or first) space.

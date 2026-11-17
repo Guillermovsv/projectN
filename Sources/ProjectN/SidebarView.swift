@@ -15,6 +15,7 @@ struct SidebarView: View {
     @State private var editProjects: IDBox?
     @State private var showAllWorkspaces = false
     @State private var showAllProjects = false
+    @AppStorage("sidebar.hideInactiveWorkspaces") private var hideInactive = false
 
     private let workspaceLimit = 5
     private let projectLimit = 8
@@ -91,16 +92,25 @@ struct SidebarView: View {
     private var workspacesSection: some View {
         VStack(alignment: .leading, spacing: 2) {
             SectionHeader(title: "Workspaces") {
-                if !showAllWorkspaces && visibleWorkspaces.count < store.state.workspaces.count {
+                if !hideInactive && !showAllWorkspaces && visibleWorkspaces.count < store.state.workspaces.count {
                     Button("Show All (\(store.state.workspaces.count))") { showAllWorkspaces = true }
                         .buttonStyle(.plain).font(.caption2).help("Show all workspaces")
                 }
+                Button { hideInactive.toggle() } label: {
+                    Image(systemName: hideInactive ? "eye.slash" : "eye")
+                }
+                .buttonStyle(.hover)
+                .help(hideInactive ? "Show inactive workspaces" : "Hide inactive workspaces (only show the open one, running panes or ones waiting for you)")
                 Button { openNewWorkspace([]) } label: { Image(systemName: "plus") }
                     .buttonStyle(.hover)
                     .help("New workspace")
             }
             if store.state.workspaces.isEmpty {
                 Text("No workspaces yet")
+                    .font(.callout).foregroundStyle(.tertiary)
+                    .padding(.horizontal, 8).padding(.vertical, 4)
+            } else if hideInactive && visibleWorkspaces.isEmpty {
+                Text("No active workspaces")
                     .font(.callout).foregroundStyle(.tertiary)
                     .padding(.horizontal, 8).padding(.vertical, 4)
             }
@@ -251,6 +261,7 @@ struct SidebarView: View {
 
     private var visibleWorkspaces: [Workspace] {
         let ordered = store.state.workspaces.sorted { ($0.lastOpened ?? .distantPast) > ($1.lastOpened ?? .distantPast) }
+        if hideInactive { return ordered.filter { activeWorkspaceIDs.contains($0.id) } }
         guard !showAllWorkspaces, ordered.count > workspaceLimit else { return ordered }
         let keep = Set(ordered.prefix(workspaceLimit).map(\.id)).union(activeWorkspaceIDs)
         return ordered.filter { keep.contains($0.id) }
