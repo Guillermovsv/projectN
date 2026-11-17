@@ -64,6 +64,16 @@ final class AssistantController: NSObject, ObservableObject {
         didSet { d.set(wakeWordEnabled, forKey: "assistant.wakeWord"); updateWakeListening() }
     }
     @Published private(set) var wakeWordStatus = "Off"
+    /// How close to your recordings a sound must be before it's transcribed to confirm “Hey N”.
+    @Published var wakeSensitivity: WakeWordDetector.Sensitivity {
+        didSet { d.set(wakeSensitivity.rawValue, forKey: "assistant.wakeSensitivity"); wakeListener.reload() }
+    }
+    @Published private(set) var wakeSampleCount = 0
+    @Published private(set) var recordingWakeSample = false
+    @Published private(set) var wakeSampleMessage = ""
+    private var wakeSamples: [[Float]] = []
+    static let wakeSamplesNeeded = 3
+    private static let wakeSamplesKept = 6
 
     private let d = UserDefaults.standard
     private weak var store: Store?
@@ -141,6 +151,7 @@ final class AssistantController: NSObject, ObservableObject {
         floating = d.object(forKey: "assistant.floating") as? Bool ?? false
         bargeIn = d.object(forKey: "assistant.bargeIn") as? Bool ?? true
         wakeWordEnabled = d.object(forKey: "assistant.wakeWord") as? Bool ?? true
+        wakeSensitivity = WakeWordDetector.Sensitivity(rawValue: d.string(forKey: "assistant.wakeSensitivity") ?? "") ?? .normal
         super.init()
         synth.delegate = self
     }
@@ -157,7 +168,13 @@ final class AssistantController: NSObject, ObservableObject {
         wakeListener.canListen = { [weak self] in
             guard let self else { return false }
             return self.orb.phase == .idle && !self.micOpen && !self.streaming && !self.transcribing
-                && !self.isSpeaking && (!self.conversation || !self.handsFree)
+                && !self.isSpeaking && (!self.conversation || !self.handsFree) && !self.recordingWakeSample
+        }
+        wakeSamples = WakeWordSamples.load()
+        wakeSampleCount = wakeSamples.count
+        wakeListener.makeDetector = { [weak self] in
+            guard let self else { return nil }
+            return WakeWordDetector(samples: self.wakeSamples, sensitivity: self.wakeSensitivity)
         }
         wakeListener.vocabulary = { [weak self] in self?.vocabulary() ?? [] }
         wakeListener.onStatus = { [weak self] in self?.wakeWordStatus = $0 }
@@ -169,6 +186,53 @@ final class AssistantController: NSObject, ObservableObject {
     private func updateWakeListening() {
         guard store != nil, !AppHome.isTestProcess else { return }
         wakeListener.setEnabled(wakeWordEnabled)
+    }
+
+    // MARK: Your “Hey N” recordings
+
+    /// Records one sample of you saying “Hey N” (2.5 s window, trimmed to the speech in it).
+    func recordWakeSample() {
+        guard !recordingWakeSample, !AppHome.isTestProcess else { return }
+        guard orb.phase == .idle, !micOpen else {
+            wakeSampleMessage = "Stop the Assistant first."
+            return
+        }
+        recordingWakeSample = true
+        wakeListener.pause()
+        wakeSampleMessage = "Say “Hey N” now…"
+        let box = SampleBox()
+        Task { @MainActor in
+            defer { self.recordingWakeSample = false }
+            do {
+                try await NVoiceController.shared.assistantStartWakeListening(onAudio: { box.append($0) }, onLevel: { _ in })
+            } catch {
+                self.wakeSampleMessage = "Couldn't use the microphone: \(error.localizedDescription)"
+                return
+            }
+            try? await Task.sleep(for: .milliseconds(2500))
+            NVoiceController.shared.assistantCancel()
+            try? await Task.sleep(for: .milliseconds(150))   // audio already queued for conversion
+            guard let clip = WakeWordDetector.trimToSpeech(box.samples) else {
+                self.wakeSampleMessage = "Didn't hear it clearly. Try again, a little closer to the mic."
+                return
+            }
+            self.wakeSamples.append(clip)
+            if self.wakeSamples.count > Self.wakeSamplesKept { self.wakeSamples.removeFirst() }
+            WakeWordSamples.save(self.wakeSamples)
+            self.wakeSampleCount = self.wakeSamples.count
+            let left = Self.wakeSamplesNeeded - self.wakeSamples.count
+            self.wakeSampleMessage = left > 0 ? "Got it. Record \(left) more." : "Got it. “Hey N” is ready."
+            Diagnostics.log("assistant: recorded a “Hey N” sample (\(self.wakeSamples.count) kept)")
+            self.wakeListener.reload()
+        }
+    }
+
+    func clearWakeSamples() {
+        wakeSamples = []
+        WakeWordSamples.save([])
+        wakeSampleCount = 0
+        wakeSampleMessage = ""
+        wakeListener.reload()
     }
 
     /// Adopt the wake recording, including any prompt spoken immediately after “Hey N”.
@@ -1352,4 +1416,13 @@ struct AssistantBargeIn {
         let said = Set(words(spoken))
         return remaining.suffix(3).contains { stops.contains($0) && !said.contains($0) }
     }
+}
+
+
+/// Collects audio delivered on the audio queue.
+private final class SampleBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [Float] = []
+    func append(_ s: [Float]) { lock.withLock { storage += s } }
+    var samples: [Float] { lock.withLock { storage } }
 }

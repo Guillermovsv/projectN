@@ -381,6 +381,48 @@ final class NVoiceController: NSObject, ObservableObject {
     func assistantStart(vocabulary: [String] = [], onTranscript: ((String) -> Void)? = nil,
                         shouldStart: () -> Bool = { true },
                         onLevel: @escaping (Float) -> Void) async throws {
+        try await assistantPrepare()
+        // The final callback can claim ownership atomically with starting capture (there is no await below).
+        guard shouldStart() else { throw CancellationError() }
+        transcriber.onLevel = onLevel
+        let (hints, report) = assistantTranscript(vocabulary: vocabulary, onTranscript: onTranscript)
+        do {
+            try transcriber.start(localeIDs: profiles.activeLocaleIDs, contextualStrings: hints, onTranscript: report)
+        } catch {
+            assistantClearTranscript()
+            restoreOverlayLevels()
+            throw error
+        }
+    }
+
+    /// Opens the mic for “Hey N” without transcribing: audio (16 kHz mono, on a background queue) only goes to
+    /// `onAudio`. Call `assistantBeginTranscript` to start transcribing on the same recording.
+    func assistantStartWakeListening(onAudio: @escaping ([Float]) -> Void, shouldStart: () -> Bool = { true },
+                                     onLevel: @escaping (Float) -> Void) async throws {
+        try await assistantPrepare()   // speech models ready now, so confirming a match starts at once
+        guard shouldStart() else { throw CancellationError() }
+        transcriber.onLevel = onLevel
+        do {
+            try transcriber.start(localeIDs: profiles.activeLocaleIDs, transcribe: false, onAudio16k: onAudio)
+        } catch {
+            restoreOverlayLevels()
+            throw error
+        }
+    }
+
+    /// Starts transcribing the open “Hey N” recording, including the ~2 s heard just before.
+    func assistantBeginTranscript(vocabulary: [String], onTranscript: @escaping (String) -> Void) {
+        let (hints, report) = assistantTranscript(vocabulary: vocabulary, onTranscript: onTranscript)
+        transcriber.beginTranscription(localeIDs: profiles.activeLocaleIDs, contextualStrings: hints, onTranscript: report)
+    }
+
+    /// Drops that transcript; the mic stays open listening for “Hey N”.
+    func assistantEndTranscript() {
+        assistantClearTranscript()
+        transcriber.endTranscription()
+    }
+
+    private func assistantPrepare() async throws {
         guard !transcriber.isRecording, !busy else { throw TranscriberError.micUnavailable("dictation is in use") }
         if !assistantPrepared {
             // Dictation may be off: permissions, mic choice and speech models aren't set up yet.
@@ -395,13 +437,13 @@ final class NVoiceController: NSObject, ObservableObject {
         }
         // Permissions/model downloads suspend: a dictation may have started while we waited.
         guard !transcriber.isRecording, !busy else { throw TranscriberError.micUnavailable("dictation is in use") }
-        // The final callback can claim ownership atomically with starting capture (there is no await below).
-        guard shouldStart() else { throw CancellationError() }
-        transcriber.onLevel = onLevel
+    }
+
+    /// Speech hints and the transcript callback for one Assistant recording.
+    private func assistantTranscript(vocabulary: [String], onTranscript: ((String) -> Void)?)
+        -> (hints: [String], report: ((String) -> Void)?) {
         // Keep the speaker and full vocabulary for corrections even when Apple's 100 hints are exhausted.
-        let profile = profiles.active
-        let hints = ProfileStore.recognitionHints(personal: profiles.contextualStrings, vocabulary: vocabulary)
-        assistantProfile = profile
+        assistantProfile = profiles.active
         assistantVocabulary = vocabulary
         let token = UUID()
         assistantTranscriptToken = token
@@ -410,16 +452,14 @@ final class NVoiceController: NSObject, ObservableObject {
             guard let self, self.assistantTranscriptToken == token else { return }
             self.assistantTranscriptHandler?(text)
         }
-        do {
-            try transcriber.start(localeIDs: localeIDs, contextualStrings: hints, onTranscript: report)
-        } catch {
-            assistantProfile = nil
-            assistantVocabulary = []
-            assistantTranscriptToken = nil
-            assistantTranscriptHandler = nil
-            restoreOverlayLevels()
-            throw error
-        }
+        return (ProfileStore.recognitionHints(personal: profiles.contextualStrings, vocabulary: vocabulary), report)
+    }
+
+    private func assistantClearTranscript() {
+        assistantProfile = nil
+        assistantVocabulary = []
+        assistantTranscriptToken = nil
+        assistantTranscriptHandler = nil
     }
 
     /// Stops the Assistant's recording and returns what was said (and in which language).
@@ -428,25 +468,14 @@ final class NVoiceController: NSObject, ObservableObject {
         restoreOverlayLevels()
         let profile = assistantProfile
         let vocabulary = assistantVocabulary
-        assistantProfile = nil
-        assistantVocabulary = []
-        assistantTranscriptToken = nil
-        assistantTranscriptHandler = nil
+        assistantClearTranscript()
         let r = try await transcriber.stop()
         // Discard wake-listening background and speaker echo before applying/counting personal corrections.
         return (profiles.personalize(cleanTranscript(r.text), profile: profile, vocabulary: vocabulary), r.localeID)
     }
 
-    /// Keeps the Assistant's mic open but starts its transcript over (passive wake listening).
-    func assistantRestartTranscript() {
-        transcriber.restartTranscription()
-    }
-
     func assistantCancel() {
-        assistantProfile = nil
-        assistantVocabulary = []
-        assistantTranscriptToken = nil
-        assistantTranscriptHandler = nil
+        assistantClearTranscript()
         transcriber.cancel()
         restoreOverlayLevels()
     }

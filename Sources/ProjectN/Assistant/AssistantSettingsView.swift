@@ -11,8 +11,27 @@ struct AssistantSettingsView: View {
                 Toggle("Wake with “Hey N”", isOn: $assistant.wakeWordEnabled)
                 if assistant.wakeWordEnabled {
                     Text(assistant.wakeWordStatus).font(.caption).foregroundStyle(.secondary)
+                    LabeledContent("Your “Hey N”") {
+                        HStack {
+                            Text("\(assistant.wakeSampleCount) of \(AssistantController.wakeSamplesNeeded) recordings")
+                                .monospacedDigit().foregroundStyle(.secondary)
+                            Button(assistant.recordingWakeSample ? "Listening…" : "Record") { assistant.recordWakeSample() }
+                                .disabled(assistant.recordingWakeSample)
+                            if assistant.wakeSampleCount > 0 {
+                                Button("Clear") { assistant.clearWakeSamples() }.disabled(assistant.recordingWakeSample)
+                            }
+                        }
+                    }
+                    if !assistant.wakeSampleMessage.isEmpty {
+                        Text(assistant.wakeSampleMessage).font(.caption).foregroundStyle(.secondary)
+                    }
+                    Picker("Sensitivity", selection: $assistant.wakeSensitivity) {
+                        Text("Low").tag(WakeWordDetector.Sensitivity.low)
+                        Text("Normal").tag(WakeWordDetector.Sensitivity.normal)
+                        Text("High").tag(WakeWordDetector.Sensitivity.high)
+                    }
                 }
-                Text("Say “Hey N”, then your request, even when the Assistant is closed. While enabled, the microphone listens locally while ProjectN is open. Ambient audio isn't saved. Wake listening pauses during dictation and spoken replies.")
+                Text("Say “Hey N”, then your request, even when the Assistant is closed. Record yourself saying “Hey N” at least 3 times, the way you normally would. The microphone stays open while ProjectN is open, but it only compares sound with your recordings — nothing is transcribed. When something sounds like “Hey N”, a few seconds are transcribed on this Mac to confirm it; otherwise they're dropped. Nothing is sent anywhere or saved except your recordings. If it wakes when it shouldn't, lower the sensitivity; if it misses you, raise it or add recordings. Pauses during dictation and spoken replies.")
                     .font(.caption).foregroundStyle(.secondary)
                 Toggle("Listen as soon as the Assistant opens", isOn: $assistant.autoListen)
                 Toggle("Conversation mode — keep listening after each answer", isOn: $assistant.handsFree)

@@ -148,7 +148,13 @@ struct AssistantSpeechTests {
         listener.setEnabled(true)
         defer { listener.setEnabled(false) }
         try await waitFor { listener.isRecording }
+        #expect(recorder.begins == 0)          // nothing is transcribed until it sounds like “Hey N”
+        recorder.audio?([0.5])
+        #expect(recorder.begins == 0)
+        recorder.audio?([1])
+        try await waitFor { recorder.transcript != nil }
         let callback = try #require(recorder.transcript)
+        #expect(recorder.hints.contains("Hey N"))
         callback("Hey N, open Codex")
         #expect(prompts == ["open Codex"])
         #expect(!listener.isRecording)
@@ -157,6 +163,40 @@ struct AssistantSpeechTests {
         callback("Hey N, another command")
         #expect(prompts.count == 1)
         #expect(recorder.starts == 1)
+    }
+
+    @Test func unconfirmedMatchDropsTheTranscriptButKeepsTheMicrophone() async throws {
+        let recorder = FakeWakeRecorder()
+        let listener = makeListener(recorder)
+        var wakes = 0
+        listener.canListen = { true }
+        listener.onWake = { _, _ in wakes += 1 }
+        listener.setEnabled(true)
+        defer { listener.setEnabled(false) }
+        try await waitFor { listener.isRecording }
+        recorder.audio?([1])
+        try await waitFor { listener.isConfirming }
+        recorder.transcript?("they need help")
+        try await waitFor(seconds: AssistantWakeListener.confirmSeconds + 2) { recorder.ends == 1 }
+        #expect(!listener.isConfirming)
+        #expect(listener.isRecording)
+        #expect(recorder.cancellations == 0)
+        #expect(recorder.starts == 1)
+        recorder.transcript?("Hey N, open Codex")   // late result from the dropped transcript
+        #expect(wakes == 0)
+    }
+
+    @Test func withoutRecordingsTheMicrophoneStaysClosed() async throws {
+        let recorder = FakeWakeRecorder()
+        let listener = makeListener(recorder, detector: false)
+        var statuses: [String] = []
+        listener.onStatus = { statuses.append($0) }
+        listener.canListen = { true }
+        listener.setEnabled(true)
+        defer { listener.setEnabled(false) }
+        try await waitFor { statuses.last == AssistantWakeListener.needsSamplesStatus }
+        #expect(recorder.starts == 0)
+        #expect(!listener.isRecording)
     }
 
     @Test func dictationCanPreemptWakeAndLateResultsCannotWakeIt() async throws {
@@ -168,6 +208,8 @@ struct AssistantSpeechTests {
         listener.setEnabled(true)
         defer { listener.setEnabled(false) }
         try await waitFor { listener.isRecording }
+        recorder.audio?([1])
+        try await waitFor { recorder.transcript != nil }
         let callback = try #require(recorder.transcript)
         listener.pause()
         callback("Hey N, open Codex")
@@ -199,7 +241,10 @@ struct AssistantSpeechTests {
         var woke = false
         listener.canListen = { available }
         listener.onWake = { _, _ in woke = true; available = false }
-        recorder.onOpened = { recorder.transcript?("Hey N, open Codex") }
+        recorder.onOpened = {
+            listener.matched(distance: 0.1, token: listener.currentToken)
+            recorder.transcript?("Hey N, open Codex")
+        }
         listener.setEnabled(true)
         defer { listener.setEnabled(false); recorder.onOpened = nil }
         try await waitFor { recorder.attemptFinished }
@@ -227,43 +272,62 @@ struct AssistantSpeechTests {
         #expect(recorder.cancellations == 1)
     }
 
-    private func makeListener(_ recorder: FakeWakeRecorder) -> AssistantWakeListener {
-        AssistantWakeListener(recordingAvailable: { !recorder.inUse }, startRecording: { hints, transcript, allowed, level in
-            try await recorder.start(hints: hints, transcript: transcript, allowed: allowed, level: level)
-        }, cancelRecording: { recorder.cancel() })
+    private func makeListener(_ recorder: FakeWakeRecorder, detector: Bool = true) -> AssistantWakeListener {
+        let listener = AssistantWakeListener(recordingAvailable: { !recorder.inUse }, startRecording: { audio, allowed, level in
+            try await recorder.start(audio: audio, allowed: allowed, level: level)
+        }, beginTranscript: { hints, transcript in
+            recorder.begin(hints: hints, transcript: transcript)
+        }, endTranscript: { recorder.end() }, cancelRecording: { recorder.cancel() })
+        listener.makeDetector = { detector ? FakeWakeDetector() : nil }
+        return listener
     }
 
-    private func waitFor(_ condition: () -> Bool) async throws {
-        let deadline = Date().addingTimeInterval(4)
+    private func waitFor(seconds: TimeInterval = 4, _ condition: () -> Bool) async throws {
+        let deadline = Date().addingTimeInterval(seconds)
         while !condition(), Date() < deadline { try await Task.sleep(for: .milliseconds(20)) }
         try #require(condition())
     }
+}
+
+/// “Hears” the wake phrase in any chunk starting with 1.
+private final class FakeWakeDetector: WakeDetecting {
+    func feed(_ samples: [Float]) -> Float? { samples.first == 1 ? 0.1 : nil }
 }
 
 @MainActor
 private final class FakeWakeRecorder {
     var inUse = false
     var starts = 0
+    var begins = 0
+    var ends = 0
     var cancellations = 0
     var suspendStart = false
     var attemptFinished = false
     var onOpened: (() -> Void)?
+    var audio: (([Float]) -> Void)?
     var transcript: ((String) -> Void)?
+    var hints: [String] = []
     var pending: CheckedContinuation<Void, Never>?
 
-    func start(hints: [String], transcript: @escaping (String) -> Void, allowed: @escaping () -> Bool,
+    func start(audio: @escaping ([Float]) -> Void, allowed: @escaping () -> Bool,
                level: @escaping (Float) -> Void) async throws {
         defer { attemptFinished = true }
         if suspendStart { await withCheckedContinuation { pending = $0 } }
         guard allowed() else { throw CancellationError() }
-        #expect(hints.contains("Hey N"))
-        self.transcript = transcript
+        self.audio = audio
         starts += 1
         inUse = true
         level(0.02)
         onOpened?()
     }
 
+    func begin(hints: [String], transcript: @escaping (String) -> Void) {
+        begins += 1
+        self.hints = hints
+        self.transcript = transcript
+    }
+
+    func end() { ends += 1 }
     func resumeStart() { pending?.resume(); pending = nil }
     func cancel() { cancellations += 1; inUse = false }
 }

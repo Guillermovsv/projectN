@@ -16,43 +16,59 @@ enum AssistantWakeCommand {
     }
 }
 
-/// Passive, on-device wake listening using NVoice's existing recognizer and microphone. On wake, ownership
-/// transfers to the Assistant without restarting capture: “Hey N, open…” stays in one recording.
+/// Passive “Hey N” listening in two stages, so ProjectN doesn't transcribe everything it hears:
+/// 1. The mic is open but audio only goes to a light sound matcher (`WakeDetecting`) trained on your recordings.
+///    Nothing becomes text.
+/// 2. When something sounds like “Hey N”, the speech recognizer transcribes the last ~2 s plus what follows to
+///    confirm it. Confirmed: ownership of the running recording passes to the Assistant without restarting capture,
+///    so “Hey N, open…” stays in one recording. Not confirmed within a few seconds: the transcript is dropped and
+///    matching resumes.
 @MainActor
 final class AssistantWakeListener {
-    typealias StartRecording = ([String], @escaping (String) -> Void, @escaping () -> Bool,
-                               @escaping (Float) -> Void) async throws -> Void
+    typealias StartRecording = (@escaping ([Float]) -> Void, @escaping () -> Bool, @escaping (Float) -> Void) async throws -> Void
+    typealias BeginTranscript = ([String], @escaping (String) -> Void) -> Void
     var canListen: () -> Bool = { false }
     var vocabulary: () -> [String] = { [] }
+    /// A fresh matcher for each recording; nil until you've recorded your “Hey N”.
+    var makeDetector: () -> WakeDetecting? = { nil }
     var onWake: ((String, Float) -> Void)?
     var onStatus: ((String) -> Void)?
     private(set) var isRecording = false
+    private(set) var isConfirming = false
     private var enabled = false
     private var starting = false
     private var generation = 0
     private var monitor: Task<Void, Never>?
-    private var began = Date.distantPast
-    private var lastHeard = Date.distantPast
+    private var confirmUntil = Date.distantPast
     private var retryAt = Date.distantPast
     private var levels: [Float] = []
     private let recordingAvailable: () -> Bool
     private let startRecording: StartRecording
+    private let beginTranscript: BeginTranscript
+    private let endTranscript: () -> Void
     private let cancelRecording: () -> Void
-    private let restartTranscript: () -> Void
+    static let confirmSeconds: TimeInterval = 3
+    static let listeningStatus = "Listening for “Hey N” — sound only, nothing is transcribed"
+    static let needsSamplesStatus = "Record your “Hey N” below to turn this on"
     private var status = "Off" {
         didSet { if status != oldValue { onStatus?(status) } }
     }
 
     init(recordingAvailable: @escaping () -> Bool = { NVoiceController.shared.assistantRecordingAvailable },
-         startRecording: @escaping StartRecording = { vocabulary, transcript, shouldStart, level in
-             try await NVoiceController.shared.assistantStart(vocabulary: vocabulary, onTranscript: transcript,
-                                                             shouldStart: shouldStart, onLevel: level)
-         }, cancelRecording: @escaping () -> Void = { NVoiceController.shared.assistantCancel() },
-         restartTranscript: @escaping () -> Void = { NVoiceController.shared.assistantRestartTranscript() }) {
+         startRecording: @escaping StartRecording = { audio, shouldStart, level in
+             try await NVoiceController.shared.assistantStartWakeListening(onAudio: audio, shouldStart: shouldStart,
+                                                                           onLevel: level)
+         },
+         beginTranscript: @escaping BeginTranscript = { vocabulary, transcript in
+             NVoiceController.shared.assistantBeginTranscript(vocabulary: vocabulary, onTranscript: transcript)
+         },
+         endTranscript: @escaping () -> Void = { NVoiceController.shared.assistantEndTranscript() },
+         cancelRecording: @escaping () -> Void = { NVoiceController.shared.assistantCancel() }) {
         self.recordingAvailable = recordingAvailable
         self.startRecording = startRecording
+        self.beginTranscript = beginTranscript
+        self.endTranscript = endTranscript
         self.cancelRecording = cancelRecording
-        self.restartTranscript = restartTranscript
     }
 
     func setEnabled(_ enabled: Bool) {
@@ -72,13 +88,21 @@ final class AssistantWakeListener {
         }
     }
 
-    /// Called before speaking, manual listening or dictation. Never closes a recording already handed off.
+    /// Called before speaking, manual listening, dictation or recording a sample. Never closes a recording
+    /// already handed off.
     func pause() {
         generation += 1
         retryAt = Date().addingTimeInterval(0.8)
         if isRecording { cancelRecording() }
         isRecording = false
+        isConfirming = false
         if enabled { status = "Paused while the microphone is in use" }
+    }
+
+    /// The recordings changed: start over with a matcher built from them.
+    func reload() {
+        guard enabled else { return }
+        pause()
     }
 
     private func poll() async {
@@ -86,36 +110,28 @@ final class AssistantWakeListener {
             if isRecording { pause() }
             return
         }
-        // Bound passive audio/transcript memory by starting the transcript over — never by closing the mic, which
-        // made the microphone indicator switch off and on every 30 s and could miss a “Hey N” said in the gap.
-        // Restart in a pause in speech so the phrase isn't cut in half. Ambient audio is never saved to history.
         if isRecording {
-            let age = Date().timeIntervalSince(began)
-            if age > 60 || (age > 30 && Date().timeIntervalSince(lastHeard) > 1.5) {
-                restartTranscript()
-                began = Date()
+            if isConfirming, Date() >= confirmUntil {
+                isConfirming = false
+                endTranscript()
+                status = Self.listeningStatus
+                Diagnostics.log("assistant: it wasn't “Hey N” — transcript dropped, back to matching sound only")
             }
             return
         }
-        guard !isRecording, !starting, Date() >= retryAt,
-              recordingAvailable() else { return }
+        guard !starting, Date() >= retryAt, recordingAvailable() else { return }
+        guard let detector = makeDetector() else {
+            status = Self.needsSamplesStatus
+            return
+        }
         starting = true
         defer { starting = false }
         let token = generation
         levels = []
         do {
             try await startRecording(
-                ["Hey N", "Hey en", "Hey ene"] + vocabulary(),
-                { [weak self] text in
-                    guard let self, self.isRecording, self.generation == token else { return }
-                    self.lastHeard = Date()
-                    guard let prompt = AssistantWakeCommand.prompt(in: text), self.canListen() else { return }
-                    let sorted = self.levels.sorted()
-                    let floor = sorted.isEmpty ? 0 : sorted[sorted.count / 5]
-                    self.isRecording = false       // the Assistant now owns the running recording
-                    self.generation += 1
-                    self.status = "Assistant awake"
-                    self.onWake?(prompt, floor)
+                Self.audioHandler(detector) { distance in
+                    Task { @MainActor [weak self] in self?.matched(distance: distance, token: token) }
                 }, { [weak self] in
                     guard let self else { return false }
                     guard self.enabled, self.generation == token, self.canListen() else { return false }
@@ -129,14 +145,13 @@ final class AssistantWakeListener {
                     if self.levels.count > 40 { self.levels.removeFirst() }
                 })
             guard enabled, canListen(), generation == token else {
-                // A wake callback may already have transferred it, or a shortcut cancelled ours and opened
-                // a new recording. Never cancel that newer owner when this async call returns late.
+                // A wake may already have transferred it, or a shortcut cancelled ours and opened a new
+                // recording. Never cancel that newer owner when this async call returns late.
                 if generation == token, isRecording { pause() }
                 return
             }
             isRecording = true
-            began = Date()
-            status = "Listening for “Hey N”"
+            status = Self.listeningStatus
         } catch {
             guard generation == token else { return }
             isRecording = false
@@ -145,4 +160,32 @@ final class AssistantWakeListener {
             Diagnostics.log("assistant: wake listening unavailable — \(error.localizedDescription)")
         }
     }
+
+    /// Runs on the audio queue, never on the main actor.
+    nonisolated private static func audioHandler(_ detector: WakeDetecting,
+                                                 onMatch: @escaping (Float) -> Void) -> ([Float]) -> Void {
+        { samples in if let d = detector.feed(samples) { onMatch(d) } }
+    }
+
+    /// Stage 2: something sounded like “Hey N”. Transcribe a few seconds to be sure.
+    func matched(distance: Float, token: Int) {
+        guard enabled, isRecording, !isConfirming, generation == token, canListen() else { return }
+        Diagnostics.log(String(format: "assistant: sounded like “Hey N” (distance %.2f) — confirming", distance))
+        isConfirming = true
+        confirmUntil = Date().addingTimeInterval(Self.confirmSeconds)
+        beginTranscript(["Hey N", "Hey en", "Hey ene"] + vocabulary()) { [weak self] text in
+            guard let self, self.isRecording, self.isConfirming, self.generation == token,
+                  let prompt = AssistantWakeCommand.prompt(in: text), self.canListen() else { return }
+            let sorted = self.levels.sorted()
+            let floor = sorted.isEmpty ? 0 : sorted[sorted.count / 5]
+            self.isRecording = false       // the Assistant now owns the running recording
+            self.isConfirming = false
+            self.generation += 1
+            self.status = "Assistant awake"
+            self.onWake?(prompt, floor)
+        }
+    }
+
+    /// For tests: the generation a recording started now would get.
+    var currentToken: Int { generation }
 }
