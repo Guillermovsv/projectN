@@ -2,31 +2,35 @@ import Foundation
 
 /// Finds the on-disk conversations of Claude and Codex so panes can resume exactly where they left off.
 enum SessionDiscovery {
+    /// Read once: the app's own environment doesn't change while it runs, and `ProcessInfo.processInfo.environment`
+    /// builds a fresh dictionary on every call (it showed up in samples of the transcript scans).
+    private static let inheritedClaudeConfigDir = ProcessInfo.processInfo.environment["CLAUDE_CONFIG_DIR"]
+    private static let inheritedCodexHome = ProcessInfo.processInfo.environment["CODEX_HOME"]
+    private static let home = FileManager.default.homeDirectoryForCurrentUser
+
     // MARK: Claude
 
     static func claudeConfigDir(_ settings: AppSettings) -> URL {
         if settings.isolateClaudeConfig { return AppHome.claudeConfigDir }
-        if let dir = ProcessInfo.processInfo.environment["CLAUDE_CONFIG_DIR"], !dir.isEmpty {
+        if let dir = inheritedClaudeConfigDir, !dir.isEmpty {
             return URL(fileURLWithPath: (dir as NSString).expandingTildeInPath)
         }
-        return FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude")
+        return home.appendingPathComponent(".claude")
     }
 
     /// True if Claude has a saved transcript for this session id (i.e. the conversation actually started).
     static func claudeTranscriptExists(id: String, settings: AppSettings) -> Bool {
-        let projects = claudeConfigDir(settings).appendingPathComponent("projects")
-        guard let dirs = try? FileManager.default.contentsOfDirectory(atPath: projects.path) else { return false }
-        return dirs.contains { FileManager.default.fileExists(atPath: projects.appendingPathComponent($0).appendingPathComponent("\(id).jsonl").path) }
+        transcript(tool: .claude, id: id, settings: settings) != nil
     }
 
     // MARK: Codex
 
     static func codexHome(_ settings: AppSettings) -> URL {
         if settings.isolateCodexHome { return AppHome.codexHomeDir }
-        if let dir = ProcessInfo.processInfo.environment["CODEX_HOME"], !dir.isEmpty {
+        if let dir = inheritedCodexHome, !dir.isEmpty {
             return URL(fileURLWithPath: (dir as NSString).expandingTildeInPath)
         }
-        return FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex")
+        return home.appendingPathComponent(".codex")
     }
 
     struct CodexSession {
@@ -73,5 +77,51 @@ enum SessionDiscovery {
     static func samePath(_ a: String, _ b: String) -> Bool {
         URL(fileURLWithPath: a).resolvingSymlinksInPath().standardizedFileURL.path
             == URL(fileURLWithPath: b).resolvingSymlinksInPath().standardizedFileURL.path
+    }
+
+    // MARK: Transcript files
+
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var located: [String: URL] = [:]
+    /// Codex sessions whose file wasn't found, and when: walking `sessions/` (every rollout ever written) is only
+    /// repeated after a few seconds. Claude's lookup is a single folder listing, so it isn't throttled.
+    nonisolated(unsafe) private static var missing: [String: Date] = [:]
+    static var missingRetryInterval: TimeInterval = 5
+
+    /// The transcript of a Claude (`<config>/projects/*/<id>.jsonl`) or Codex (`<home>/sessions/**/rollout-*-<id>.jsonl`)
+    /// session. Remembered once found (checked with one `stat` afterwards): the agent harness and the prompt
+    /// tracker ask every second or two for every running session.
+    static func transcript(tool: Tool, id: String, settings: AppSettings) -> URL? {
+        guard tool == .claude || tool == .codex, !id.isEmpty else { return nil }
+        let fm = FileManager.default
+        let home = tool == .claude ? claudeConfigDir(settings) : codexHome(settings)
+        let key = "\(tool.rawValue):\(home.path):\(id)"
+        lock.lock()
+        let known = located[key]
+        let missedAt = missing[key]
+        lock.unlock()
+        if let known {
+            if fm.fileExists(atPath: known.path) { return known }
+            lock.lock(); located.removeValue(forKey: key); lock.unlock()
+        }
+        if tool == .codex, let missedAt, Date().timeIntervalSince(missedAt) < missingRetryInterval { return nil }
+
+        var found: URL?
+        if tool == .claude {
+            let root = home.appendingPathComponent("projects")
+            for d in (try? fm.contentsOfDirectory(atPath: root.path)) ?? [] {
+                let u = root.appendingPathComponent(d).appendingPathComponent("\(id).jsonl")
+                if fm.fileExists(atPath: u.path) { found = u; break }
+            }
+        } else {
+            let root = home.appendingPathComponent("sessions")
+            if let e = fm.enumerator(at: root, includingPropertiesForKeys: nil) {
+                for case let u as URL in e where u.pathExtension == "jsonl" && u.lastPathComponent.contains(id) { found = u; break }
+            }
+        }
+        lock.lock()
+        if let found { located[key] = found; missing.removeValue(forKey: key) } else { missing[key] = Date() }
+        lock.unlock()
+        return found
     }
 }

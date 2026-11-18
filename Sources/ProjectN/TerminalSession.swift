@@ -38,6 +38,12 @@ final class TerminalSession: NSObject, ObservableObject, LocalProcessTerminalVie
     /// Latest output time the cached screen is known to include (taken when its read was dispatched).
     private var cachedScreenOutputAt = Date.distantPast
     private var screenReadInFlight = false
+    /// Bumped whenever a fresh screen read lands. Activity and Auto answers are pure functions of the screen, so
+    /// they're only worked out again for a new one (the activity timer asks every second, Auto every 0.35 s).
+    private var screenGeneration = 0
+    private var activityGeneration = -1
+    private var decisionGeneration = -1
+    private var cachedDecision: AutoResponder.Decision?
     private let screenQueue = DispatchQueue(label: "dev.projectn.screen", qos: .utility)
     private var terminated = false
     /// Only the bottom of the screen matters to the prompt/working heuristics.
@@ -59,6 +65,7 @@ final class TerminalSession: NSObject, ObservableObject, LocalProcessTerminalVie
                         guard let self else { return }
                         self.cachedScreen = screen
                         self.cachedScreenOutputAt = outputAt
+                        self.screenGeneration &+= 1
                         self.screenReadInFlight = false
                         self.considerAutoAnswer(screen)
                     }
@@ -91,6 +98,9 @@ final class TerminalSession: NSObject, ObservableObject, LocalProcessTerminalVie
             new = .exited
         } else {
             guard let screen = screenTail() else { return false }
+            // Same screen as last time: same answer.
+            guard activityGeneration != screenGeneration else { return false }
+            activityGeneration = screenGeneration
             if let q = AutoResponder.pendingPrompt(screen: screen) {
                 new = .needsInput(q)
             } else if AutoResponder.isWorking(screen: screen) {
@@ -271,7 +281,12 @@ final class TerminalSession: NSObject, ObservableObject, LocalProcessTerminalVie
     /// must not prevent a stable prompt from receiving its second observation.
     private func considerAutoAnswer(_ screen: [String]) {
         guard autoComplete, isRunning, !terminated, !screen.isEmpty else { return }
-        guard let decision = AutoResponder.decide(screen: screen) else {
+        // `screen` is always the latest read (generation `screenGeneration`): decide once per screen.
+        if decisionGeneration != screenGeneration {
+            decisionGeneration = screenGeneration
+            cachedDecision = AutoResponder.decide(screen: screen)
+        }
+        guard let decision = cachedDecision else {
             pendingFingerprint = nil
             answeredFingerprint = nil
             return

@@ -227,6 +227,9 @@ struct AppSettings: Codable, Equatable {
     var browserSuspendMinutes: Int = 10
     /// Claude sessions get MCP tools for the built-in Browser and are told to use it by default (Chrome only when asked).
     var claudeUsesBuiltInBrowser: Bool = true
+    /// Claude / Codex / Cursor panes reuse your login shell's captured environment instead of running its startup
+    /// files again for every pane (see `LoginShell`): they start about a second sooner.
+    var fastPaneStart: Bool = true
 
     init() {}
 
@@ -258,5 +261,6 @@ struct AppSettings: Codable, Equatable {
         sleepIdleMinutes = (try? c.decode(Int.self, forKey: .sleepIdleMinutes)) ?? d.sleepIdleMinutes
         browserSuspendMinutes = (try? c.decode(Int.self, forKey: .browserSuspendMinutes)) ?? d.browserSuspendMinutes
         claudeUsesBuiltInBrowser = (try? c.decode(Bool.self, forKey: .claudeUsesBuiltInBrowser)) ?? d.claudeUsesBuiltInBrowser
+        fastPaneStart = (try? c.decode(Bool.self, forKey: .fastPaneStart)) ?? d.fastPaneStart
     }
 }

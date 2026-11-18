@@ -7,6 +7,10 @@ import Foundation
 ///   text blocks of that last assistant message. A pending `ExitPlanMode` call means a plan awaits approval.
 /// - Codex (`<home>/sessions/**/rollout-*-<id>.jsonl`): `event_msg` / `task_complete` carries `last_agent_message`;
 ///   `token_count` carries usage.
+///
+/// The harness reads every running task's transcript every 1.5 s. Those files grow to many MB (Codex rollouts hold
+/// whole tool outputs), so reads are incremental: a `Cursor` keeps the parse state and the byte offset reached, and
+/// each read only parses the lines appended since the previous one.
 enum TranscriptReader {
     struct Snapshot: Equatable {
         /// The turn finished; `result` holds the final answer.
@@ -28,20 +32,11 @@ enum TranscriptReader {
     }
 
     static func claudeTranscript(sessionID: String, settings: AppSettings) -> URL? {
-        let root = SessionDiscovery.claudeConfigDir(settings).appendingPathComponent("projects")
-        let fm = FileManager.default
-        for d in (try? fm.contentsOfDirectory(atPath: root.path)) ?? [] {
-            let u = root.appendingPathComponent(d).appendingPathComponent("\(sessionID).jsonl")
-            if fm.fileExists(atPath: u.path) { return u }
-        }
-        return nil
+        SessionDiscovery.transcript(tool: .claude, id: sessionID, settings: settings)
     }
 
     static func codexTranscript(sessionID: String, settings: AppSettings) -> URL? {
-        let root = SessionDiscovery.codexHome(settings).appendingPathComponent("sessions")
-        guard let e = FileManager.default.enumerator(at: root, includingPropertiesForKeys: nil) else { return nil }
-        for case let u as URL in e where u.pathExtension == "jsonl" && u.lastPathComponent.contains(sessionID) { return u }
-        return nil
+        SessionDiscovery.transcript(tool: .codex, id: sessionID, settings: settings)
     }
 
     static func fileSize(_ url: URL?) -> UInt64 {
@@ -49,20 +44,90 @@ enum TranscriptReader {
         return (a[.size] as? NSNumber)?.uint64Value ?? 0
     }
 
+    /// Where a task's transcript was read up to, and the parse state at that point.
+    struct Cursor {
+        let runtime: AgentRuntime
+        let url: URL
+        /// Where the task's part of the transcript starts (entries before it belong to earlier tasks).
+        let start: UInt64
+        /// Identity of the file read (a replaced file starts over).
+        let fileNumber: UInt64?
+        /// Bytes parsed so far: always the end of a complete line.
+        var offset: UInt64
+        var claude = ClaudeState()
+        var codex = CodexState()
+
+        init(runtime: AgentRuntime, url: URL, start: UInt64, fileNumber: UInt64?) {
+            self.runtime = runtime
+            self.url = url
+            self.start = start
+            self.fileNumber = fileNumber
+            self.offset = start
+        }
+
+        /// Parses complete lines into the state; returns the trailing partial line (not consumed).
+        mutating func consume(_ data: Data) -> Data {
+            guard let lastNewline = data.lastIndex(of: UInt8(ascii: "\n")) else { return data }
+            let complete = data[data.startIndex..<lastNewline]
+            if runtime == .claudeCode { claude.consume(complete) } else { codex.consume(complete) }
+            offset += UInt64(lastNewline - data.startIndex + 1)
+            return Data(data[(lastNewline + 1)...])
+        }
+
+        /// What the transcript says now. A trailing line without its newline yet is included when it's already
+        /// complete JSON (some writers add the newline separately), without committing it to the state.
+        func snapshot(pendingTail tail: Data) -> Snapshot {
+            var snap: Snapshot
+            if runtime == .claudeCode {
+                var c = claude
+                if !tail.isEmpty { c.consume(tail) }
+                snap = c.snapshot()
+            } else {
+                var c = codex
+                if !tail.isEmpty { c.consume(tail) }
+                snap = c.snap
+            }
+            snap.size = offset + UInt64(tail.count)
+            return snap
+        }
+    }
+
     /// Reads the transcript from `offset` (entries written before the task started are ignored).
     static func read(runtime: AgentRuntime, url: URL, offset: UInt64) -> Snapshot {
-        guard let h = try? FileHandle(forReadingFrom: url) else { return Snapshot() }
+        var cursor: Cursor?
+        return read(runtime: runtime, url: url, offset: offset, cursor: &cursor)
+    }
+
+    /// Incremental read: continues from `cursor` (updated in place) when it's for the same file and task; otherwise
+    /// starts over from `offset`. Equivalent to parsing everything from `offset` each time.
+    static func read(runtime: AgentRuntime, url: URL, offset: UInt64, cursor: inout Cursor?) -> Snapshot {
+        let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
+        let size = (attributes?[.size] as? NSNumber)?.uint64Value
+        let fileNumber = (attributes?[.systemFileNumber] as? NSNumber)?.uint64Value
+        if let c = cursor, c.runtime != runtime || c.url != url || c.start != offset || c.fileNumber != fileNumber
+            || (size.map { $0 < c.offset } ?? true) {
+            cursor = nil
+        }
+        var c = cursor ?? Cursor(runtime: runtime, url: url, start: offset, fileNumber: fileNumber)
+        guard let h = try? FileHandle(forReadingFrom: url) else { cursor = nil; return Snapshot() }
         defer { try? h.close() }
-        try? h.seek(toOffset: offset)
+        do { try h.seek(toOffset: c.offset) } catch { cursor = nil; return Snapshot() }
         let data = (try? h.readToEnd()) ?? Data()
-        var snap = runtime == .claudeCode ? parseClaude(data) : parseCodex(data)
-        snap.size = offset + UInt64(data.count)
-        return snap
+        let tail = c.consume(data)
+        cursor = c
+        return c.snapshot(pendingTail: tail)
     }
 
     // MARK: Claude
 
     static func parseClaude(_ data: Data) -> Snapshot {
+        var state = ClaudeState()
+        state.consume(data)
+        return state.snapshot()
+    }
+
+    /// Everything `parseClaude` tracks while walking the lines, so parsing can resume where it stopped.
+    struct ClaudeState {
         var snap = Snapshot()
         var usage = TokenUsage()
         var countedMessages = Set<String>()
@@ -72,10 +137,15 @@ enum TranscriptReader {
         var endTurnText: String?
         var plan: String?
         var apiError: String?
-        for line in data.split(separator: UInt8(ascii: "\n")) {
-            guard let o = try? JSONSerialization.jsonObject(with: Data(line)) as? [String: Any] else { continue }
+
+        mutating func consume(_ data: Data) {
+            for line in data.split(separator: UInt8(ascii: "\n")) { consumeLine(line) }
+        }
+
+        private mutating func consumeLine(_ line: Data.SubSequence) {
+            guard let o = try? JSONSerialization.jsonObject(with: Data(line)) as? [String: Any] else { return }
             let type = o["type"] as? String
-            if o["isSidechain"] as? Bool == true { continue }
+            if o["isSidechain"] as? Bool == true { return }
             if type == "assistant", let m = o["message"] as? [String: Any] {
                 let mid = (m["id"] as? String) ?? UUID().uuidString
                 if mid != lastMessageID { lastMessageID = mid; lastTexts = [] }
@@ -123,20 +193,25 @@ enum TranscriptReader {
                 if let t = endTurnText { snap.finished = true; snap.result = t }
             }
         }
-        // Some versions don't write turn_duration: an end_turn as the very last assistant entry also counts.
-        if !snap.finished, let t = endTurnText, lastStop == "end_turn", !t.isEmpty {
-            snap.finished = true
-            snap.result = t
+
+        /// The state as a snapshot (doesn't change the state: more lines may follow).
+        func snapshot() -> Snapshot {
+            var snap = self.snap
+            // Some versions don't write turn_duration: an end_turn as the very last assistant entry also counts.
+            if !snap.finished, let t = endTurnText, lastStop == "end_turn", !t.isEmpty {
+                snap.finished = true
+                snap.result = t
+            }
+            // The CLI gave up on an API error (usage limit, overload…): the turn is over, without an answer.
+            if let e = apiError {
+                snap.error = e
+                snap.usageLimit = TranscriptReader.isUsageLimit(e)
+                if !snap.finished { snap.finished = true; snap.result = nil }
+            }
+            if !snap.finished, let plan { snap.pendingPlan = plan }
+            snap.usage = countedMessages.isEmpty ? nil : usage
+            return snap
         }
-        // The CLI gave up on an API error (usage limit, overload…): the turn is over, without an answer.
-        if let e = apiError {
-            snap.error = e
-            snap.usageLimit = isUsageLimit(e)
-            if !snap.finished { snap.finished = true; snap.result = nil }
-        }
-        if !snap.finished, let plan { snap.pendingPlan = plan }
-        snap.usage = countedMessages.isEmpty ? nil : usage
-        return snap
     }
 
     static func isUsageLimit(_ message: String) -> Bool {
@@ -148,11 +223,23 @@ enum TranscriptReader {
     // MARK: Codex
 
     static func parseCodex(_ data: Data) -> Snapshot {
+        var state = CodexState()
+        state.consume(data)
+        return state.snap
+    }
+
+    /// Everything `parseCodex` tracks while walking the lines, so parsing can resume where it stopped.
+    struct CodexState {
         var snap = Snapshot()
         var lastAssistant: String?
-        for line in data.split(separator: UInt8(ascii: "\n")) {
+
+        mutating func consume(_ data: Data) {
+            for line in data.split(separator: UInt8(ascii: "\n")) { consumeLine(line) }
+        }
+
+        private mutating func consumeLine(_ line: Data.SubSequence) {
             guard let o = try? JSONSerialization.jsonObject(with: Data(line)) as? [String: Any],
-                  let p = o["payload"] as? [String: Any] else { continue }
+                  let p = o["payload"] as? [String: Any] else { return }
             let type = o["type"] as? String
             let ptype = p["type"] as? String
             if type == "event_msg", ptype == "task_started" {
@@ -172,7 +259,7 @@ enum TranscriptReader {
                     let message = (d?["message"] as? String) ?? (e as? String) ?? "\(e)"
                     let info = d?["codex_error_info"] as? String ?? ""
                     snap.error = message
-                    snap.usageLimit = info.contains("usage_limit") || isUsageLimit(message)
+                    snap.usageLimit = info.contains("usage_limit") || TranscriptReader.isUsageLimit(message)
                 }
             } else if type == "event_msg", ptype == "token_count",
                       let info = p["info"] as? [String: Any], let t = info["total_token_usage"] as? [String: Any] {
@@ -191,6 +278,5 @@ enum TranscriptReader {
                 if p["phase"] as? String == "commentary", !trimmed.isEmpty { snap.progress.append(trimmed) }
             }
         }
-        return snap
     }
 }

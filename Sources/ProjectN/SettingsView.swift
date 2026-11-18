@@ -575,6 +575,9 @@ struct ToolsSettingsView: View {
             }
             Section("Terminal") {
                 TextField("Shell", text: $store.settings.shell)
+                Toggle("Start Claude / Codex / Cursor panes without re-running shell startup files", isOn: $store.settings.fastPaneStart)
+                Text("Your login shell's environment (PATH, exports in ~/.zshrc, nvm…) is read once and reused, so a pane doesn't run all your startup files again before the CLI starts — about a second sooner each. It's read again when a startup file changes. Commands set up as an alias or function, and shells other than zsh, still start through the full login shell.")
+                    .font(.caption).foregroundStyle(.secondary)
             }
             Section("Memory") {
                 Picker("Sleep idle agent panes after", selection: $store.settings.sleepIdleMinutes) {

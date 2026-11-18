@@ -30,12 +30,12 @@ final class FileTreeModel: ObservableObject {
 
     func children(_ dir: URL) -> [Entry] {
         if let c = cache[dir] { return c }
-        let c = list(dir)
+        let c = Self.list(dir, showHidden: showHidden)
         DispatchQueue.main.async { self.cache[dir] = c }
         return c
     }
 
-    private func list(_ dir: URL) -> [Entry] {
+    nonisolated private static func list(_ dir: URL, showHidden: Bool) -> [Entry] {
         let opts: FileManager.DirectoryEnumerationOptions = showHidden ? [] : [.skipsHiddenFiles]
         guard let urls = try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.isDirectoryKey, .isPackageKey], options: opts) else { return [] }
         return urls.compactMap { u -> Entry? in
@@ -71,17 +71,35 @@ final class FileTreeModel: ObservableObject {
 
     func collapseAll() { expanded.removeAll() }
 
-    /// Re-list the root and expanded folders; publishes only on change.
+    private var refreshing = false
+    private static let refreshQueue = DispatchQueue(label: "dev.projectn.file-tree", qos: .utility)
+
+    /// Re-list the root and expanded folders off the main thread (every few seconds while the panel is open: big
+    /// expanded folders made that a visible hitch); publishes only on change.
     func refresh() {
-        guard let root else { return }
-        var next = cache
-        for dir in [root] + Array(expanded) {
-            let fresh = list(dir)
-            if next[dir] != fresh { next[dir] = fresh }
+        guard let root, !refreshing else { return }
+        refreshing = true
+        let dirs = [root] + Array(expanded)
+        let showHidden = self.showHidden
+        Self.refreshQueue.async { [weak self] in
+            var fresh: [URL: [Entry]] = [:]
+            var gone = Set<URL>()
+            for dir in dirs {
+                if FileManager.default.fileExists(atPath: dir.path) { fresh[dir] = Self.list(dir, showHidden: showHidden) }
+                else { gone.insert(dir) }
+            }
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.refreshing = false
+                // The tree moved on meanwhile (another project, hidden files toggled): this listing is stale.
+                guard self.root == root, self.showHidden == showHidden else { return }
+                var next = self.cache
+                for (dir, entries) in fresh where next[dir] != entries { next[dir] = entries }
+                // Forget folders that disappeared.
+                if !gone.isEmpty, !self.expanded.isDisjoint(with: gone) { self.expanded.subtract(gone) }
+                if next != self.cache { self.cache = next }
+            }
         }
-        // Forget folders that disappeared.
-        expanded = expanded.filter { FileManager.default.fileExists(atPath: $0.path) }
-        if next != cache { cache = next }
     }
 }
 

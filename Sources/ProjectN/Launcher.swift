@@ -22,9 +22,11 @@ enum Launcher {
     /// `extraArgs` (agent profiles: system prompt, tool limits) go after the regular flags.
     /// `prompt` starts the session with that first message; it is always placed after `--`
     /// so variadic flags (`--tools`, `--add-dir`) can't swallow it, and never interpreted by a shell.
+    /// `login`: your login shell's captured environment. When it applies, the CLI starts without running your
+    /// shell's startup files again (see `LoginShell`); otherwise through the full login shell.
     static func plan(tool: Tool, mode: SessionMode, options: LaunchOptions = LaunchOptions(), project: Project, workspaceName: String,
                      settings: AppSettings, extraArgs: [String] = [], prompt: String? = nil,
-                     exitMarker: URL? = nil, extraEnv: [String: String] = [:]) -> Plan {
+                     exitMarker: URL? = nil, extraEnv: [String: String] = [:], login: LoginShell.Capture? = nil) -> Plan {
         let shell = settings.shell.isEmpty ? "/bin/zsh" : settings.shell
         let servers = MCPConfig.load()
         var parts: [String] = []
@@ -65,19 +67,25 @@ enum Launcher {
         }
 
         let commandLine = parts.map(Shell.quote).joined(separator: " ")
+        // The captured login environment applies when it's this shell's and the command is a real program in it.
+        let fast = tool == .terminal ? nil : login.flatMap { l in
+            l.shell == shell && LoginShell.supports(shell) && parts.first.map(l.runsProgram) == true ? l : nil
+        }
         let args: [String]
         if tool == .terminal {
             args = ["-l", "-i"]
         } else {
-            // Run through an interactive login shell so the user's PATH (nvm, ~/.local/bin, …) is set up,
-            // then drop into a shell in the same folder when the tool exits.
+            // Run through an interactive login shell so the user's PATH (nvm, ~/.local/bin, …) is set up — or, with
+            // that environment already captured, an interactive shell that skips the startup files (`-f`) —
+            // then drop into a login shell in the same folder when the tool exits.
             // Agent panes: record the tool's exit code so the harness can tell a crash from a finished turn.
             let marker = exitMarker.map { "; __pn_rc=$?; echo $__pn_rc > \(Shell.quote($0.path))" } ?? ""
             let script = "\(commandLine)\(marker); echo; echo \"[\(tool.label) exited — you're in a shell now]\"; exec \(Shell.quote(shell)) -l -i"
-            args = ["-l", "-i", "-c", script]
+            args = [fast == nil ? "-l" : "-f", "-i", "-c", script]
         }
 
         var env = environment(project: project, workspaceName: workspaceName, settings: settings)
+        if let fast { env = fast.applied(to: env) }
         if !extraEnv.isEmpty {
             env.removeAll { kv in extraEnv.keys.contains { kv.hasPrefix($0 + "=") } }
             env += extraEnv.map { "\($0.key)=\($0.value)" }

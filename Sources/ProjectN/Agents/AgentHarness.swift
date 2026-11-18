@@ -82,6 +82,8 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
     var stallRecoveries: [UUID: Int] = [:]
     /// Transcript size at the last read, per task.
     var transcriptSize: [UUID: UInt64] = [:]
+    /// Where each running task's transcript was parsed up to (so a read only parses what was appended).
+    var transcriptCursors: [UUID: TranscriptReader.Cursor] = [:]
     /// Right after ProjectN interrupts a stuck turn, that aborted turn isn't the end of the task.
     var recoveringUntil: [UUID: Date] = [:]
     /// No progress for this long → you're told. Then it's interrupted and asked to continue; then it's stopped.
@@ -811,6 +813,8 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
         let exitURL = t.paneID.map(AgentStore.exitMarker)
         readsInFlight.insert(t.id)
         let id = t.id
+        // Only what was appended since the last read gets parsed (reads of one task never overlap: readsInFlight).
+        let previousCursor = transcriptCursors[id]
         readQueue.async { [weak self] in
             // Exit code first: if the CLI wrote its last entry and exited between the two reads,
             // the transcript read below still sees the finished turn.
@@ -818,18 +822,20 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             var snap: TranscriptReader.Snapshot?
             var size: UInt64?
+            var cursor = previousCursor
             if let sid = t.sessionID {
                 let url = t.runtime == .claudeCode
                     ? TranscriptReader.claudeTranscript(sessionID: sid, settings: settings)
                     : TranscriptReader.codexTranscript(sessionID: sid, settings: settings)
                 if let url {
-                    snap = TranscriptReader.read(runtime: t.runtime, url: url, offset: t.transcriptOffset)
-                    size = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? NSNumber)?.uint64Value
+                    snap = TranscriptReader.read(runtime: t.runtime, url: url, offset: t.transcriptOffset, cursor: &cursor)
+                    size = snap?.size
                 }
             }
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
                 self.readsInFlight.remove(id)
+                if self.task(id)?.status.isActive == true { self.transcriptCursors[id] = cursor }
                 if let size, self.task(id)?.status.isActive == true, self.transcriptSize[id] != size {
                     self.transcriptSize[id] = size
                     self.noteProgress(id)
@@ -918,6 +924,7 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
         stallStage.removeValue(forKey: id)
         stallRecoveries.removeValue(forKey: id)
         transcriptSize.removeValue(forKey: id)
+        transcriptCursors.removeValue(forKey: id)
         recoveringUntil.removeValue(forKey: id)
         progressRelayed.removeValue(forKey: id)
         // Requests addressed to this task as a coordinator go to the user now that it stopped listening.

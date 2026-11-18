@@ -5,17 +5,20 @@ import Foundation
 /// so prompts typed directly into the terminal show up in the sticky header too.
 enum PromptTracker {
     private static let lock = NSLock()
-    nonisolated(unsafe) private static var paths: [String: URL] = [:]
     private struct CachedPrompt {
         let modified: Date
         let size: UInt64
         let fileNumber: UInt64?
+        /// Bytes already looked at: always the end of a complete line. Growth after it is all that's read next time.
+        let scanned: UInt64
         let text: String?
     }
     nonisolated(unsafe) private static var prompts: [URL: CachedPrompt] = [:]
+    /// How far back a fresh read looks for the latest prompt.
+    private static let tailWindow: UInt64 = 512 * 1024
 
     static func lastPrompt(tool: Tool, sessionID: String, settings: AppSettings) -> String? {
-        guard let url = transcript(tool: tool, id: sessionID, settings: settings),
+        guard let url = SessionDiscovery.transcript(tool: tool, id: sessionID, settings: settings),
               let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
               let modified = attributes[.modificationDate] as? Date,
               let size = (attributes[.size] as? NSNumber)?.uint64Value else { return nil }
@@ -24,21 +27,37 @@ enum PromptTracker {
         if let cached, cached.modified == modified, cached.size == size, cached.fileNumber == fileNumber {
             return cached.text
         }
-        guard
-              let h = try? FileHandle(forReadingFrom: url) else { return nil }
+        guard let h = try? FileHandle(forReadingFrom: url) else { return nil }
         defer { try? h.close() }
-        let chunk: UInt64 = 512 * 1024
-        try? h.seek(toOffset: size > chunk ? size - chunk : 0)
-        guard let data = try? h.read(upToCount: Int(min(size, chunk))) else { return nil }
-        var prompt: String?
-        for line in data.split(separator: UInt8(ascii: "\n")).reversed() {
-            guard let obj = try? JSONSerialization.jsonObject(with: Data(line)) as? [String: Any] else { continue }
-            if let text = tool == .claude ? claudeUserText(obj) : codexUserText(obj) { prompt = text; break }
-        }
+        // The same file grew (an agent working writes to it constantly): only the appended lines can hold a newer
+        // prompt, so read just those. Anything else (first read, replaced, truncated, rewritten) reads the tail.
+        let appended = cached.map { $0.fileNumber == fileNumber && size > $0.scanned && size - $0.scanned <= tailWindow } ?? false
+        let from: UInt64 = appended ? cached!.scanned : (size > tailWindow ? size - tailWindow : 0)
+        try? h.seek(toOffset: from)
+        guard let data = try? h.read(upToCount: Int(size - from)) else { return nil }
+        // Complete lines are remembered as scanned. A last line without its newline yet counts only if it's already
+        // whole (then it's the newest), and is looked at again next time.
+        let end = data.lastIndex(of: UInt8(ascii: "\n")).map { $0 + 1 } ?? data.startIndex
+        let found = latestPrompt(in: data[end...], tool: tool) ?? latestPrompt(in: data[data.startIndex..<end], tool: tool)
+        let text = found ?? (appended ? cached?.text : nil)
         lock.lock()
-        prompts[url] = CachedPrompt(modified: modified, size: size, fileNumber: fileNumber, text: prompt)
+        prompts[url] = CachedPrompt(modified: modified, size: size, fileNumber: fileNumber,
+                                    scanned: from + UInt64(end - data.startIndex), text: text)
         lock.unlock()
-        return prompt
+        return text
+    }
+
+    /// The last user prompt among these lines (newest first; stops at the first one found).
+    private static func latestPrompt(in data: Data, tool: Tool) -> String? {
+        // Most lines are assistant output and tool results; a prompt line always contains "user" (`"type":"user"`,
+        // `"role":"user"`), so the others aren't parsed at all.
+        let marker = Data("\"user\"".utf8)
+        for line in data.split(separator: UInt8(ascii: "\n")).reversed() {
+            guard line.range(of: marker) != nil,
+                  let obj = try? JSONSerialization.jsonObject(with: Data(line)) as? [String: Any] else { continue }
+            if let text = tool == .claude ? claudeUserText(obj) : codexUserText(obj) { return text }
+        }
+        return nil
     }
 
     private static func clean(_ s: String) -> String? {
@@ -62,29 +81,6 @@ enum PromptTracker {
               p["type"] as? String == "message", p["role"] as? String == "user",
               let parts = p["content"] as? [[String: Any]] else { return nil }
         return clean(parts.compactMap { $0["type"] as? String == "input_text" ? $0["text"] as? String : nil }.joined(separator: "\n"))
-    }
-
-    private static func transcript(tool: Tool, id: String, settings: AppSettings) -> URL? {
-        let home = tool == .claude ? SessionDiscovery.claudeConfigDir(settings) : SessionDiscovery.codexHome(settings)
-        let key = "\(tool.rawValue):\(home.path):\(id)"
-        lock.lock(); let cached = paths[key]; lock.unlock()
-        if let cached, FileManager.default.fileExists(atPath: cached.path) { return cached }
-        let fm = FileManager.default
-        var found: URL?
-        if tool == .claude {
-            let root = SessionDiscovery.claudeConfigDir(settings).appendingPathComponent("projects")
-            for d in (try? fm.contentsOfDirectory(atPath: root.path)) ?? [] {
-                let u = root.appendingPathComponent(d).appendingPathComponent("\(id).jsonl")
-                if fm.fileExists(atPath: u.path) { found = u; break }
-            }
-        } else {
-            let root = SessionDiscovery.codexHome(settings).appendingPathComponent("sessions")
-            if let e = fm.enumerator(at: root, includingPropertiesForKeys: nil) {
-                for case let u as URL in e where u.pathExtension == "jsonl" && u.lastPathComponent.contains(id) { found = u; break }
-            }
-        }
-        if let found { lock.lock(); paths[key] = found; lock.unlock() }
-        return found
     }
 }
 

@@ -6,9 +6,14 @@ final class Store: ObservableObject {
     @Published var state: PersistedState { didSet { scheduleSave() } }
     @Published var settings: AppSettings {
         didSet {
+            // Bindings re-assign settings on every keystroke in a settings field; only real changes do anything.
+            guard settings != oldValue else { return }
             AppHome.save(settings, to: AppHome.settingsFile)
-            applyFontSize()
-            UserDefaults.standard.set(settings.browserSuspendMinutes, forKey: "browserSuspendMinutes")
+            // Setting a terminal's font resets its glyph caches, redraws it and clears its selection: only on a change.
+            if settings.fontSize != oldValue.fontSize { applyFontSize() }
+            if settings.browserSuspendMinutes != oldValue.browserSuspendMinutes {
+                UserDefaults.standard.set(settings.browserSuspendMinutes, forKey: "browserSuspendMinutes")
+            }
             if settings.theme != oldValue.theme { applyTheme() }
             if settings.voiceEnabled != oldValue.voiceEnabled || settings.voiceMenuBarIcon != oldValue.voiceMenuBarIcon {
                 applyVoice()
@@ -81,6 +86,16 @@ final class Store: ObservableObject {
         }
         RunLoop.main.add(a, forMode: .common)
         activityTimer = a
+        warmUpLoginShell()
+    }
+
+    /// Captures your login shell's environment in the background right away, so the first panes restored after
+    /// launch already start without re-running your shell's startup files (see `LoginShell`). On the launch queue:
+    /// launches queued meanwhile wait for it instead of each running the startup files themselves.
+    private func warmUpLoginShell() {
+        guard !AppHome.isTestProcess else { return }
+        let settings = self.settings
+        launchQueue.async { _ = LoginShell.forLaunch(settings: settings) }
     }
 
     private var activityTimer: Timer?
@@ -247,14 +262,21 @@ final class Store: ObservableObject {
         }
     }
 
-    /// Saves terminal panes' output so it can be shown again after relaunch.
-    func saveScrollback() {
+    /// Output time each terminal's saved scrollback already includes.
+    private var scrollbackSavedAt: [UUID: Date] = [:]
+
+    /// Saves terminal panes' output so it can be shown again after relaunch. Terminals with no new output since
+    /// their last save are skipped (`all` saves every one, e.g. when quitting).
+    func saveScrollback(all: Bool = false) {
         for ws in state.workspaces {
             for sp in ws.spaces {
                 for pane in sp.panes where pane.tool == .terminal {
                     guard let rt = runtimes[pane.id] else { continue }
+                    let outputAt = rt.lastOutputAt
+                    if !all, let saved = scrollbackSavedAt[pane.id], outputAt <= saved { continue }
                     let text = rt.scrollbackText()
                     try? text.write(to: scrollbackURL(pane.id), atomically: true, encoding: .utf8)
+                    scrollbackSavedAt[pane.id] = outputAt
                 }
             }
         }
@@ -607,10 +629,12 @@ final class Store: ObservableObject {
             let restored = pane.tool == .terminal && resume
                 ? try? String(contentsOf: scrollback, encoding: .utf8) : nil
             if let exitMarker { try? FileManager.default.removeItem(at: exitMarker) }
+            // Your login shell's environment, captured once: the CLI starts without running your startup files again.
+            let login = pane.tool == .terminal || AppHome.isTestProcess ? nil : LoginShell.forLaunch(settings: settings)
             let plan = Launcher.plan(tool: pane.tool, mode: mode, options: options,
                                      project: project, workspaceName: w.name, settings: settings,
                                      extraArgs: extraArgs, prompt: initialPrompt, exitMarker: exitMarker,
-                                     extraEnv: agentEnv)
+                                     extraEnv: agentEnv, login: login)
             DispatchQueue.main.async { [weak self] in
                 guard let self, self.pendingLaunches[pane.id] == token,
                       let (_, current) = self.pane(pane.id, in: wid) else { return }
@@ -892,6 +916,7 @@ final class Store: ObservableObject {
     /// Kill the process and forget saved output.
     private func discardPane(_ id: UUID) {
         initialPrompts.removeValue(forKey: id)
+        scrollbackSavedAt.removeValue(forKey: id)
         killRuntime(id)
         try? FileManager.default.removeItem(at: scrollbackURL(id))
     }
@@ -910,7 +935,7 @@ final class Store: ObservableObject {
     func terminateAll() {
         pendingLaunches.removeAll()
         pendingMessages.removeAll()
-        saveScrollback()
+        saveScrollback(all: true)
         saveWork?.cancel()
         saveNow()
         runtimes.values.forEach { $0.terminate() }
