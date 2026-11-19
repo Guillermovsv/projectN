@@ -150,6 +150,10 @@ final class NVoiceController: NSObject, ObservableObject {
         transcriber.inputDeviceProvider = {
             AudioDevices.resolve(NVoiceDefaults.store.string(forKey: "microphone") ?? AudioDevices.automatic)
         }
+        transcriber.onAudioHealthChange = { [weak self] _ in
+            guard let self else { return }
+            self.rebuildMenu(enhance: self.settings.enhanceEnabled)
+        }
         transcriber.prewarm()
 
         Task {
@@ -681,6 +685,12 @@ final class NVoiceController: NSObject, ObservableObject {
         guard let statusItem else { return }
         let menu = NSMenu()
         let status: String
+        if transcriber.audioSystemStuck {
+            let fix = NSMenuItem(title: "⚠︎ macOS audio stopped — Restart Audio System…", action: #selector(restartAudioSystem), keyEquivalent: "")
+            fix.target = self
+            menu.addItem(fix)
+            menu.addItem(.separator())
+        }
         if !hotkey.isRunning { status = "⚠︎ Grant Input Monitoring + Accessibility…" }
         else if !HotkeyMonitor.hasAccessibility(prompt: false) { status = "⚠︎ Grant Accessibility to paste…" }
         else { status = "\(settings.hotkeyMode == .hold ? "Hold" : "Tap") \(settings.hotkey.displayName) to dictate" }
@@ -768,6 +778,10 @@ final class NVoiceController: NSObject, ObservableObject {
         self.micItem = micItem
         updateMicTitle()
         menu.addItem(micItem)
+        let restart = NSMenuItem(title: "Restart Audio System…", action: #selector(restartAudioSystem), keyEquivalent: "")
+        restart.target = self
+        restart.toolTip = "Restarts macOS's audio service (coreaudiod) when the mic stops responding. Asks for your password."
+        menu.addItem(restart)
         menu.addItem(.separator())
 
         let s = NSMenuItem(title: "Voice Settings & Metrics…", action: #selector(openSettings), keyEquivalent: ",")
@@ -858,6 +872,35 @@ final class NVoiceController: NSObject, ObservableObject {
         correctionWindow = w
         w.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    /// Restarts coreaudiod — the only cure once the HAL reports kAudioHardwareNotRunningError, which no engine rebuild fixes.
+    @objc func restartAudioSystem() {
+        if dictationRecording { cancelDictation("restarting audio") }
+        Diagnostics.log("restarting coreaudiod (user asked)")
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            var err: NSDictionary?
+            let script = NSAppleScript(source: "do shell script \"/usr/bin/killall coreaudiod\" with administrator privileges")
+            script?.executeAndReturnError(&err)
+            let failure: String? = err.flatMap { e in
+                (e[NSAppleScript.errorNumber] as? Int) == -128 ? nil : "\(e[NSAppleScript.errorMessage] ?? "unknown error")"
+            }
+            let cancelled = err != nil && failure == nil
+            DispatchQueue.main.async {
+                guard let self, !cancelled else { return }
+                if let failure {
+                    Diagnostics.log("coreaudiod restart failed: \(failure)")
+                    self.show(error: "Could not restart audio: \(failure)")
+                    return
+                }
+                Sound.play("Glass")
+                // launchd brings coreaudiod back within a second or two; build a fresh engine on it.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                    self.transcriber.invalidateEngine(reason: "audio system restarted", audioRestarted: true)
+                    self.rebuildMenu(enhance: self.settings.enhanceEnabled)
+                }
+            }
+        }
     }
 
     @objc private func toggleEnhance() { settings.enhanceEnabled.toggle() }

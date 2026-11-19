@@ -1,4 +1,5 @@
 import AVFoundation
+import CoreAudio
 import Speech
 import NaturalLanguage
 import ObjCSupport
@@ -8,12 +9,14 @@ enum TranscriberError: LocalizedError {
     case noAudioFormat
     case micDenied
     case micUnavailable(String)
+    case audioSystemStuck
     var errorDescription: String? {
         switch self {
         case .unsupportedLocale(let l): return "On-device dictation does not support “\(l)”."
         case .noAudioFormat: return "Could not find a compatible audio format."
         case .micDenied: return "Microphone access is denied. Enable it in System Settings › Privacy & Security › Microphone."
         case .micUnavailable(let why): return "Microphone not ready — try again. (\(why))"
+        case .audioSystemStuck: return "macOS audio isn't responding. NVoice menu › Restart Audio System…"
         }
     }
 }
@@ -77,6 +80,20 @@ final class Transcriber {
     private var pipelineTask: Task<(String, String), Error>?
     private var startDate: Date?
     private(set) var isRecording = false
+    /// Set when CoreAudio refuses to start the mic ('stop') or hangs. Until then `start` fails at once instead of
+    /// freezing the app for seconds on every press, and no rebuilds pile up on a dead audio system.
+    private(set) var audioStuckUntil: Date?
+    static let stuckCooldown: TimeInterval = 15
+    var audioSystemStuck: Bool { audioStuckUntil.map { $0 > Date() } ?? false }
+    /// Called on the main thread when `audioSystemStuck` changes.
+    var onAudioHealthChange: ((Bool) -> Void)?
+    private func markAudio(stuck: Bool) {
+        let was = audioSystemStuck
+        audioStuckUntil = stuck ? Date().addingTimeInterval(Self.stuckCooldown) : nil
+        if was != stuck { onAudioHealthChange?(stuck) }
+    }
+    /// kAudioHardwareNotRunningError ('stop'): the HAL won't run the device — a wedged coreaudiod, not a stale engine.
+    static func isHardwareNotRunning(_ error: Error) -> Bool { (error as NSError).code == Int(kAudioHardwareNotRunningError) }
 
     // MARK: Permissions & models
 
@@ -131,6 +148,7 @@ final class Transcriber {
                onTranscript: ((String, String) -> Void)? = nil) throws {
         guard !isRecording else { return }
         guard AVCaptureDevice.authorizationStatus(for: .audio) == .authorized else { throw TranscriberError.micDenied }
+        if audioSystemStuck { throw TranscriberError.audioSystemStuck }
         let ids = Self.unique(localeIDs)
 
         let t0 = Date()
@@ -174,6 +192,8 @@ final class Transcriber {
                 catch {
                     lastError = error
                     Diagnostics.log("audio start failed (\(attempt == 0 ? "warm engine" : "fresh engine")): \(error.localizedDescription)")
+                    // A fresh engine can't fix a HAL that isn't running; retrying only doubles the wait.
+                    if Self.isHardwareNotRunning(error) { break }
                 }
             }
             return .failure(lastError)
@@ -186,15 +206,22 @@ final class Transcriber {
             guard let outcome else {
                 Diagnostics.log("audio start timed out — CoreAudio is not responding, moving to a fresh audio queue")
                 warm = nil
-                throw TranscriberError.micUnavailable("audio system not responding")
+                markAudio(stuck: true)
+                throw TranscriberError.audioSystemStuck
             }
-            (w, micFormat) = try outcome.get()
+            do { (w, micFormat) = try outcome.get() } catch where Self.isHardwareNotRunning(error) {
+                Diagnostics.log("CoreAudio reports the audio hardware is not running — failing fast for \(Int(Self.stuckCooldown)) s")
+                warm = nil
+                markAudio(stuck: true)
+                throw TranscriberError.audioSystemStuck
+            }
         } catch {
             rawCont?.finish()
             sinkLock.withLock { sinkStorage = nil; self.keepPreroll = false; preroll = []; prerollFrames = 0; monitorStorage = nil }
-            prewarm()
+            if !audioSystemStuck { prewarm() }   // a build on a dead audio system just hangs another queue
             throw error
         }
+        markAudio(stuck: false)
         engine = w.engine
         // Only the engine being recorded with: building an engine fires this too, so a global
         // observer would rebuild forever.
@@ -449,7 +476,7 @@ final class Transcriber {
             // The job may never have got its turn; the mic must still be released.
             DispatchQueue.global(qos: .utility).async { Self.end(e) }
             warm = nil
-            prewarm()
+            markAudio(stuck: true)
         }
         engine = nil
         if let o = configObserver { NotificationCenter.default.removeObserver(o); configObserver = nil }
@@ -484,7 +511,8 @@ final class Transcriber {
     }
 
     /// The audio setup changed (wake, unlock, device change, mic setting): drop the engine and build a fresh one.
-    func invalidateEngine(reason: String) {
+    func invalidateEngine(reason: String, audioRestarted: Bool = false) {
+        if audioRestarted { markAudio(stuck: false) }
         if isRecording { rebuildAfterRecording = true; return }
         // Coalesce bursts (unlock fires several notifications; AirPods connecting changes several properties).
         rebuildWork?.cancel()
