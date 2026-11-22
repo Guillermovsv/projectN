@@ -33,7 +33,7 @@ struct BrowserAutomationTests {
 @MainActor
 struct BrowserPageScriptTests {
     @Test func snapshotTypeClickAndConsoleWorkInAWebView() async throws {
-        let b = BrowserModel()
+        let b = BrowserTab()
         b.webView.frame = CGRect(x: 0, y: 0, width: 800, height: 600)
         let html = """
         <html><body><h1>Hello</h1>
@@ -104,5 +104,63 @@ struct PerWorkspaceBrowserTests {
         #expect(env.contains("PROJECTN_WORKSPACE_ID=\(id.uuidString)"))
         let none = Launcher.environment(project: Project(name: "p", path: "/tmp"), workspaceName: "", settings: AppSettings())
         #expect(!none.contains { $0.hasPrefix("PROJECTN_WORKSPACE_ID=") })
+    }
+}
+
+@Suite(.serialized)
+@MainActor
+struct BrowserTabsAndDeviceTests {
+    @Test func tabsOpenSelectCloseAndAreRemembered() {
+        let key = "test-\(UUID().uuidString)"
+        defer { ["browserTabs.", "browserTabSelected."].forEach { UserDefaults.standard.removeObject(forKey: $0 + key) } }
+        let m = BrowserModel(key: key)
+        #expect(m.tabs.count == 1 && m.current.tabLabel == "New Tab")
+        let first = m.current
+        first.device = .mobile
+        let second = m.newTab("http://localhost:4100/")
+        #expect(m.tabs.count == 2 && m.current === second)
+        #expect(second.device == .mobile)   // a new tab keeps the current device mode
+        m.select(first)
+        #expect(m.current === first)
+        m.save()
+        let restored = BrowserModel(key: key)
+        #expect(restored.tabs.count == 2)
+        #expect(restored.tabs[1].address == "http://localhost:4100/")
+        #expect(restored.current === restored.tabs[0] && restored.tabs[0].device == .mobile)
+        m.close(first)
+        #expect(m.tabs.count == 1 && m.current === second)
+        m.close(second)
+        #expect(m.tabs.count == 1 && m.current !== second)   // never zero tabs
+    }
+
+    @Test func devicesHaveRealViewportsAndUserAgents() {
+        #expect(BrowserDevice.mobile.viewport(landscape: false) == CGSize(width: 390, height: 844))
+        #expect(BrowserDevice.mobile.viewport(landscape: true) == CGSize(width: 844, height: 390))
+        #expect(BrowserDevice.desktop.viewport(landscape: true) == CGSize(width: 1440, height: 900))
+        #expect(BrowserDevice.fit.viewport(landscape: false) == nil)
+        #expect(abs(BrowserDevice.scale(CGSize(width: 390, height: 844), in: CGSize(width: 340, height: 600)) - 600.0 / 844.0) < 0.0001)
+        #expect(BrowserDevice.scale(CGSize(width: 390, height: 844), in: CGSize(width: 2000, height: 2000)) == 1)
+        let t = BrowserTab()
+        #expect(t.webView.customUserAgent == nil || t.webView.customUserAgent == "")
+        t.device = .mobile
+        #expect(t.webView.customUserAgent?.contains("iPhone") == true)
+        t.device = .tablet
+        #expect(t.webView.customUserAgent?.contains("iPad") == true)
+        t.device = .desktop
+        #expect(t.webView.customUserAgent == nil || t.webView.customUserAgent == "")
+    }
+
+    @Test func mobileTabReportsTheDeviceViewportToThePage() async throws {
+        let t = BrowserTab(device: .mobile)
+        t.ensureHosted()
+        t.webView.loadHTMLString("<html><body>hi</body></html>", baseURL: URL(string: "http://localhost/"))
+        try await Task.sleep(nanoseconds: 300_000_000)
+        await t.waitForLoad(timeout: 10)
+        let w = try await t.js("return innerWidth", [:]) as? Int
+        let h = try await t.js("return innerHeight", [:]) as? Int
+        let ua = try await t.js("return navigator.userAgent", [:]) as? String
+        #expect(w == 390 && h == 844)
+        #expect(ua?.contains("iPhone") == true)
+        t.tearDown()
     }
 }

@@ -42,7 +42,7 @@ final class RightPanelModel: ObservableObject {
         if let b = browsers[id] { return b }
         if let store {
             for key in browsers.keys where key.map({ store.workspace($0) == nil }) == true {
-                browsers.removeValue(forKey: key)?.webView.removeFromSuperview()
+                browsers.removeValue(forKey: key)?.closeAll()
             }
         }
         let b = BrowserModel(key: id?.uuidString ?? "home")
@@ -79,7 +79,7 @@ final class RightPanelModel: ObservableObject {
     }
 
     func open(url: URL) {
-        browser.load(url)
+        browser.open(url)
         show(.browser)
     }
 }

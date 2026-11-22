@@ -108,9 +108,12 @@ final class BrowserAutomation {
     /// A workspace that isn't on screen is driven in the background: the user's view is never switched.
     private func call(_ name: String, _ a: [String: Any], workspace: UUID?) async throws -> [String: Any] {
         guard let panel else { throw Failure(description: "ProjectN's browser isn't available.") }
-        let b = workspace.map { panel.browser(for: $0) } ?? panel.browser
-        let visible = b === panel.browser
+        let model = workspace.map { panel.browser(for: $0) } ?? panel.browser
+        let visible = model === panel.browser
         AuditLog.record("browser.tool", ["tool": name])
+        if name == "browser_tabs" { return try tabs(a, model, visible: visible) }
+        if name == "browser_navigate", a["new_tab"] as? Bool == true { model.newTab() }
+        let b = model.current
         b.wake()
         if visible && ["browser_navigate", "browser_screenshot", "browser_set_viewport"].contains(name) {
             panel.show(.browser)
@@ -126,7 +129,38 @@ final class BrowserAutomation {
         return r
     }
 
-    private func run(_ name: String, _ a: [String: Any], _ b: BrowserModel) async throws -> [String: Any] {
+    /// browser_tabs: list / new / select / close the workspace browser's tabs.
+    private func tabs(_ a: [String: Any], _ model: BrowserModel, visible: Bool) throws -> [String: Any] {
+        let action = (a["action"] as? String ?? "list").lowercased()
+        func tab(_ required: Bool) throws -> BrowserTab? {
+            guard let n = a["index"] as? Int else {
+                if required { throw Failure(description: "Give the tab's index (1-based, from action list).") }
+                return nil
+            }
+            guard n >= 1, n <= model.tabs.count else { throw Failure(description: "There's no tab \(n); there are \(model.tabs.count).") }
+            return model.tabs[n - 1]
+        }
+        switch action {
+        case "list": break
+        case "new":
+            model.newTab(a["url"] as? String)
+            if visible { panel?.show(.browser) }
+        case "select":
+            if let t = try tab(true) { model.select(t) }
+            if visible { panel?.show(.browser) }
+        case "close":
+            model.close(try tab(false) ?? model.current)
+        default:
+            throw Failure(description: "action must be list, new, select or close.")
+        }
+        let lines = model.tabs.enumerated().map { i, t in
+            "\(t === model.current ? "*" : " ") \(i + 1). \(t.tabLabel) — \(t.savedURL.isEmpty ? "(empty)" : t.savedURL)" +
+                (t.device == .fit ? "" : " [\(t.device.label)\(t.landscape ? ", landscape" : "")]")
+        }
+        return ["text": "Tabs (* = current; the other browser_* tools act on the current tab):\n" + lines.joined(separator: "\n")]
+    }
+
+    private func run(_ name: String, _ a: [String: Any], _ b: BrowserTab) async throws -> [String: Any] {
         switch name {
         case "browser_navigate":
             let target = (a["url"] as? String ?? "").trimmingCharacters(in: .whitespaces)
@@ -161,7 +195,8 @@ final class BrowserAutomation {
         case "browser_screenshot":
             try await Task.sleep(nanoseconds: 300_000_000)
             let data = try await b.screenshotJPEG(maxWidth: 1280)
-            return ["text": "Screenshot of \(b.webView.url?.absoluteString ?? "the page") (viewport: \(b.device.label))",
+            let vp = b.viewport.map { " \(Int($0.width))×\(Int($0.height))" } ?? ""
+            return ["text": "Screenshot of \(b.webView.url?.absoluteString ?? "the page") (viewport: \(b.device.label)\(vp))",
                     "image": data.base64EncodedString(), "mimeType": "image/jpeg"]
         case "browser_evaluate":
             guard let script = a["script"] as? String, !script.isEmpty else { throw Failure(description: "Give a script.") }
@@ -172,24 +207,29 @@ final class BrowserAutomation {
             if a["clear"] as? Bool == true { b.consoleLines.removeAll() }
             return ["text": lines.isEmpty ? "No console messages since the last page load." : lines.joined(separator: "\n")]
         case "browser_set_viewport":
-            guard let d = BrowserModel.Device(rawValue: (a["device"] as? String ?? "").lowercased()) else {
+            guard let d = BrowserDevice(rawValue: (a["device"] as? String ?? "").lowercased()) else {
                 throw Failure(description: "device must be fit, mobile, tablet or desktop.")
             }
             b.device = d
-            return ["text": "Viewport set to \(d.label)" + (d.viewportWidth.map { " (\(Int($0)) px wide)" } ?? " (panel width)") + "."]
+            if let l = a["landscape"] as? Bool { b.landscape = l }
+            b.ensureHosted()
+            try? await Task.sleep(nanoseconds: 300_000_000)
+            await b.waitForLoad(timeout: 15)   // a new user agent reloads the page
+            let vp = b.viewport.map { " (\(Int($0.width))×\(Int($0.height)) CSS px\(b.landscape ? ", landscape" : "")" + (d.userAgent != nil ? ", \(d.label.lowercased()) user agent" : "") + ")" } ?? " (panel size)"
+            return ["text": "Viewport set to \(d.label)\(vp)."]
         default:
             throw Failure(description: "Unknown tool \(name)")
         }
     }
 
-    private func summary(_ b: BrowserModel) async throws -> String {
+    private func summary(_ b: BrowserTab) async throws -> String {
         var s = "URL: \(b.webView.url?.absoluteString ?? b.address)\nTitle: \(b.title)"
         if let e = b.errorText { s += "\nLoad error: \(e)" }
         s += "\n\nUse browser_snapshot to read the page and get element refs, or browser_screenshot to see it."
         return s
     }
 
-    private func snapshot(_ b: BrowserModel, maxText: Int) async throws -> String {
+    private func snapshot(_ b: BrowserTab, maxText: Int) async throws -> String {
         let raw = try await b.js(Self.snapshotJS, ["maxText": max(500, min(maxText, 60000))])
         guard let json = raw as? String, let d = json.data(using: .utf8),
               let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any] else { return "\(raw ?? "")" }
@@ -216,7 +256,12 @@ final class BrowserAutomation {
         ]
         return [
             tool("browser_navigate", "Open a URL in ProjectN's built-in browser (the panel the user watches) and wait for it to load. Accepts a full URL, \"localhost:3000\", \"3000\", a file path, plain search words (searched on the web), or back / forward / reload. This is the default browser for opening sites, previewing local servers, testing and searching.",
-                 ["url": str("URL, host:port, file path, search words, or back / forward / reload.")], required: ["url"]),
+                 ["url": str("URL, host:port, file path, search words, or back / forward / reload."),
+                  "new_tab": ["type": "boolean", "description": "Open it in a new tab instead of the current one (default false)."]], required: ["url"]),
+            tool("browser_tabs", "List, open, switch to or close tabs of the built-in browser. The other browser_* tools act on the current tab.",
+                 ["action": ["type": "string", "enum": ["list", "new", "select", "close"], "description": "Default list."],
+                  "index": ["type": "integer", "description": "1-based tab number (select / close; close defaults to the current tab)."],
+                  "url": str("For new: what to open.")]),
             tool("browser_snapshot", "Read the current page: URL, title, the visible interactive elements (numbered refs for browser_click / browser_type) and the page text.",
                  ["max_text": ["type": "integer", "description": "Max characters of page text (default 12000)."]]),
             tool("browser_click", "Click an element on the current page (by ref from browser_snapshot, CSS selector, or visible text), then wait for any navigation.",
@@ -232,8 +277,9 @@ final class BrowserAutomation {
             tool("browser_console", "Recent console messages and uncaught errors from the page (newest last).",
                  ["limit": ["type": "integer", "description": "Max lines (default 100)."],
                   "clear": ["type": "boolean", "description": "Clear the log after reading."]]),
-            tool("browser_set_viewport", "Emulate a device width to test responsive layouts: fit (panel width), mobile (390), tablet (820), desktop (1440).",
-                 ["device": ["type": "string", "enum": ["fit", "mobile", "tablet", "desktop"]]], required: ["device"]),
+            tool("browser_set_viewport", "Emulate a device to test responsive layouts: fit (panel size), mobile (390×844, iPhone user agent), tablet (820×1180, iPad user agent), desktop (1440×900). Mobile/tablet can be landscape. Changing the user agent reloads the page.",
+                 ["device": ["type": "string", "enum": ["fit", "mobile", "tablet", "desktop"]],
+                  "landscape": ["type": "boolean", "description": "Rotate mobile/tablet to landscape (default: keep current)."]], required: ["device"]),
         ]
     }()
 
