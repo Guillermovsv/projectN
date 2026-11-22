@@ -22,6 +22,8 @@ func bridge(_ request: [String: Any]) -> [String: Any]? {
           let token = env[tokenVar], !token.isEmpty else { return nil }
     var req = request
     req["token"] = token
+    // The browser server works in the browser of the pane's own workspace.
+    if portVar == "PROJECTN_BROWSER_PORT", let ws = env["PROJECTN_WORKSPACE_ID"], !ws.isEmpty { req["workspace"] = ws }
     guard var data = try? JSONSerialization.data(withJSONObject: req) else { return nil }
     data.append(0x0A)
 

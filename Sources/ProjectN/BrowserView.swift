@@ -2,7 +2,8 @@ import AppKit
 import SwiftUI
 import WebKit
 
-/// A small browser for previewing local dev servers. Keeps one WKWebView alive across tab switches.
+/// A small browser for previewing local dev servers. Each workspace has its own (see `RightPanelModel.browser(for:)`),
+/// with its own page, history, console and remembered URL; its WKWebView stays alive across tab and workspace switches.
 @MainActor
 final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKScriptMessageHandler {
     enum Device: String, CaseIterable, Identifiable {
@@ -43,13 +44,23 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKSc
     @Published private(set) var canGoBack = false
     @Published private(set) var canGoForward = false
     @Published private(set) var errorText: String?
-    @Published var device: Device { didSet { UserDefaults.standard.set(device.rawValue, forKey: "browserDevice") } }
+    /// Something has been loaded (false for a workspace's brand-new browser).
+    @Published private(set) var hasPage = false
+    @Published var device: Device { didSet { UserDefaults.standard.set(device.rawValue, forKey: deviceKey) } }
+
+    /// Whose browser this is (a workspace id, or "home"); suffixes the UserDefaults keys.
+    let key: String
+    private var urlKey: String { "browserURL.\(key)" }
+    private var deviceKey: String { "browserDevice.\(key)" }
+    /// The Browser tab is showing this browser right now.
+    private(set) var onScreen = false
 
     private var observations: [NSKeyValueObservation] = []
     /// Console output + uncaught errors of the page (for agents: browser_console). Cleared on each navigation.
     var consoleLines: [String] = []
 
-    override init() {
+    init(key: String = "home") {
+        self.key = key
         let config = WKWebViewConfiguration()
         config.preferences.isElementFullscreenEnabled = true
         config.userContentController.addUserScript(WKUserScript(source: Self.consoleHookJS, injectionTime: .atDocumentStart, forMainFrameOnly: true))
@@ -57,8 +68,9 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKSc
         webView.allowsBackForwardNavigationGestures = true
         webView.allowsMagnification = true
         if #available(macOS 13.3, *) { webView.isInspectable = true }
-        address = UserDefaults.standard.string(forKey: "browserURL") ?? "http://localhost:3000"
-        device = Device(rawValue: UserDefaults.standard.string(forKey: "browserDevice") ?? "") ?? .fit
+        let d = UserDefaults.standard
+        address = d.string(forKey: "browserURL.\(key)") ?? ""
+        device = Device(rawValue: d.string(forKey: "browserDevice.\(key)") ?? d.string(forKey: "browserDevice") ?? "") ?? .fit
         super.init()
         webView.navigationDelegate = self
         config.userContentController.add(self, name: "pnConsole")
@@ -71,8 +83,9 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKSc
             webView.observe(\.url) { [weak self] wv, _ in
                 MainActor.assumeIsolated {
                     guard let self, let u = wv.url else { return }
+                    self.hasPage = true
                     self.address = u.isFileURL ? u.path : u.absoluteString
-                    UserDefaults.standard.set(u.absoluteString, forKey: "browserURL")
+                    if u.absoluteString != "about:blank" { UserDefaults.standard.set(u.absoluteString, forKey: self.urlKey) }
                 }
             },
         ]
@@ -86,6 +99,12 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKSc
     /// The Browser tab left the screen: after `browserSuspendMinutes` the page is unloaded (about:blank)
     /// so its JS, media and web process memory are released; it reloads when the tab is shown again.
     func didHide() {
+        onScreen = false
+        scheduleSuspend()
+    }
+
+    /// Starts the unload timer (also used after an agent drives a browser that isn't on screen).
+    func scheduleSuspend() {
         hiddenTimer?.invalidate()
         let minutes = UserDefaults.standard.object(forKey: "browserSuspendMinutes") as? Int ?? 10
         guard minutes > 0, suspendedURL == nil, let url = webView.url, url.absoluteString != "about:blank" else { return }
@@ -106,6 +125,12 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKSc
 
     /// The Browser tab is on screen again.
     func didShow() {
+        onScreen = true
+        wake()
+    }
+
+    /// Cancels a pending unload and reloads a suspended page, without claiming the screen.
+    func wake() {
         hiddenTimer?.invalidate()
         hiddenTimer = nil
         if let url = suspendedURL {
@@ -118,7 +143,27 @@ final class BrowserModel: NSObject, ObservableObject, WKNavigationDelegate, WKSc
     func loadInitialIfNeeded() {
         guard !didInitialLoad else { return }
         didInitialLoad = true
-        go(address)
+        if !address.isEmpty { go(address) }
+    }
+
+    /// An off-screen window that hosts the web view while it isn't in the panel, so an agent working in a
+    /// background workspace still gets real layout, rendering and screenshots.
+    private static let parking: NSWindow = {
+        let w = NSWindow(contentRect: NSRect(x: -30000, y: -30000, width: 1024, height: 800),
+                         styleMask: .borderless, backing: .buffered, defer: false)
+        w.isReleasedWhenClosed = false
+        w.ignoresMouseEvents = true
+        w.orderOut(nil)
+        return w
+    }()
+
+    /// Make sure the web view has a size and a window (parks it off-screen if the panel isn't showing it).
+    func ensureHosted() {
+        guard webView.window == nil else { return }
+        let size = webView.frame.size
+        webView.frame = NSRect(origin: .zero, size: size.width > 0 && size.height > 0 ? size : NSSize(width: 1024, height: 800))
+        webView.autoresizingMask = []
+        Self.parking.contentView?.addSubview(webView)
     }
 
     /// Accepts "localhost:5173", "example.com", a file path, or search words.
@@ -258,6 +303,17 @@ struct BrowserView: View {
                         .progressViewStyle(.linear)
                         .tint(Color.appAccent)
                         .frame(height: 2)
+                }
+                if !model.hasPage && !model.isLoading && model.errorText == nil {
+                    VStack(spacing: 8) {
+                        Image(systemName: "globe").font(.largeTitle).foregroundStyle(.secondary)
+                        Text("This workspace's browser").font(.headline)
+                        Text("Type a URL, localhost:3000 or a search above. Each workspace keeps its own page, and Claude sessions open pages in the browser of the workspace they run in.")
+                            .font(.callout).foregroundStyle(.secondary).multilineTextAlignment(.center)
+                    }
+                    .padding(24)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .background(Color.appWindow)
                 }
                 if let err = model.errorText {
                     VStack(spacing: 10) {

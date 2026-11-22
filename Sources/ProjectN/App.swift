@@ -61,6 +61,7 @@ struct ProjectNApp: App {
                     delegate.store = store
                     delegate.agents = agents
                     // Agent harness + Slack (Socket Mode) live only while ProjectN runs.
+                    panel.attach(store)
                     BrowserAutomation.shared.start(panel: panel)
                     agents.attach(store)
                     slack.attach(store: store, harness: agents)

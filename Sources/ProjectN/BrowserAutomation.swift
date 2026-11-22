@@ -27,7 +27,6 @@ final class BrowserAutomation {
 
     private let bridge = AgentBridge()
     private weak var panel: RightPanelModel?
-    private var browser: BrowserModel? { panel?.browser }
 
     func start(panel: RightPanelModel) {
         self.panel = panel
@@ -93,8 +92,9 @@ final class BrowserAutomation {
         case "call":
             let name = req["name"] as? String ?? ""
             let args = req["arguments"] as? [String: Any] ?? [:]
+            let workspace = (req["workspace"] as? String).flatMap(UUID.init(uuidString:))
             Task { @MainActor in
-                do { reply(try await self.call(name, args)) }
+                do { reply(try await self.call(name, args, workspace: workspace)) }
                 catch { reply(["text": "\(error)", "isError": true]) }
             }
         default:
@@ -104,14 +104,33 @@ final class BrowserAutomation {
 
     struct Failure: Error, CustomStringConvertible { let description: String }
 
-    private func call(_ name: String, _ a: [String: Any]) async throws -> [String: Any] {
-        guard let panel, let b = browser else { throw Failure(description: "ProjectN's browser isn't available.") }
+    /// Runs a tool in the browser of `workspace` (the calling pane's workspace; nil = the one on screen).
+    /// A workspace that isn't on screen is driven in the background: the user's view is never switched.
+    private func call(_ name: String, _ a: [String: Any], workspace: UUID?) async throws -> [String: Any] {
+        guard let panel else { throw Failure(description: "ProjectN's browser isn't available.") }
+        let b = workspace.map { panel.browser(for: $0) } ?? panel.browser
+        let visible = b === panel.browser
         AuditLog.record("browser.tool", ["tool": name])
+        b.wake()
+        if visible && ["browser_navigate", "browser_screenshot", "browser_set_viewport"].contains(name) {
+            panel.show(.browser)
+            try? await Task.sleep(nanoseconds: 50_000_000)   // let the panel attach the web view
+        }
+        b.ensureHosted()
+        defer { if !b.onScreen { b.scheduleSuspend() } }
+        var r = try await run(name, a, b)
+        if !visible, var text = r["text"] as? String {
+            text += "\n\n(This is the browser of your own workspace, which the user isn't looking at right now; they'll see it when they switch to that workspace.)"
+            r["text"] = text
+        }
+        return r
+    }
+
+    private func run(_ name: String, _ a: [String: Any], _ b: BrowserModel) async throws -> [String: Any] {
         switch name {
         case "browser_navigate":
             let target = (a["url"] as? String ?? "").trimmingCharacters(in: .whitespaces)
             guard !target.isEmpty else { throw Failure(description: "Give a url (or search words, or back / forward / reload).") }
-            panel.show(.browser)
             switch target.lowercased() {
             case "back": b.back()
             case "forward": b.forward()
@@ -122,17 +141,14 @@ final class BrowserAutomation {
             await b.waitForLoad(timeout: 30)
             return ["text": try await summary(b)]
         case "browser_snapshot":
-            b.didShow()
             return ["text": try await snapshot(b, maxText: a["max_text"] as? Int ?? 12000)]
         case "browser_click":
-            b.didShow()
             let r = try await b.js(Self.findJS + Self.clickJS, ["ref": a["ref"] ?? NSNull(), "selector": a["selector"] ?? NSNull(),
                                                                 "text": a["text"] ?? NSNull()])
             try await Task.sleep(nanoseconds: 400_000_000)
             await b.waitForLoad(timeout: 15)
             return ["text": "\(r)\n\n" + (try await summary(b))]
         case "browser_type":
-            b.didShow()
             let r = try await b.js(Self.findJS + Self.typeJS, ["ref": a["ref"] ?? NSNull(), "selector": a["selector"] ?? NSNull(),
                                                                "text": NSNull(), "value": a["text"] as? String ?? "",
                                                                "clear": a["clear"] as? Bool ?? true, "submit": a["submit"] as? Bool ?? false])
@@ -143,14 +159,12 @@ final class BrowserAutomation {
             }
             return ["text": "\(r)"]
         case "browser_screenshot":
-            panel.show(.browser)
             try await Task.sleep(nanoseconds: 300_000_000)
             let data = try await b.screenshotJPEG(maxWidth: 1280)
             return ["text": "Screenshot of \(b.webView.url?.absoluteString ?? "the page") (viewport: \(b.device.label))",
                     "image": data.base64EncodedString(), "mimeType": "image/jpeg"]
         case "browser_evaluate":
             guard let script = a["script"] as? String, !script.isEmpty else { throw Failure(description: "Give a script.") }
-            b.didShow()
             let r = try await b.js("const __r = await (async () => { \(script) })(); return __r === undefined ? 'undefined' : JSON.stringify(__r, null, 2);", [:])
             return ["text": String(describing: r).prefixString(20000)]
         case "browser_console":
@@ -161,7 +175,6 @@ final class BrowserAutomation {
             guard let d = BrowserModel.Device(rawValue: (a["device"] as? String ?? "").lowercased()) else {
                 throw Failure(description: "device must be fit, mobile, tablet or desktop.")
             }
-            panel.show(.browser)
             b.device = d
             return ["text": "Viewport set to \(d.label)" + (d.viewportWidth.map { " (\(Int($0)) px wide)" } ?? " (panel width)") + "."]
         default:

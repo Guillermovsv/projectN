@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import Testing
 @testable import ProjectN
@@ -59,5 +60,49 @@ struct BrowserPageScriptTests {
         await #expect(throws: (any Error).self) {
             _ = try await b.js(BrowserAutomation.findJS + BrowserAutomation.clickJS, ["ref": "99", "selector": NSNull(), "text": NSNull()])
         }
+    }
+}
+
+@Suite(.serialized)
+@MainActor
+struct PerWorkspaceBrowserTests {
+    @Test func eachWorkspaceHasItsOwnBrowserThatFollowsTheSelection() throws {
+        _ = TestHome.url
+        _ = NSApplication.shared
+        let store = Store()
+        defer { store.terminateAll() }
+        let project = Project(name: "Browser fixture", path: TestHome.url.path)
+        let a = Workspace(name: "A", projectIDs: [project.id])
+        let b = Workspace(name: "B", projectIDs: [project.id])
+        var state = PersistedState()
+        state.projects = [project]
+        state.workspaces = [a, b]
+        store.state = state
+        let panel = RightPanelModel()
+        panel.attach(store)
+
+        let home = panel.browser
+        #expect(home.key == "home")
+        store.state.ui.selectedWorkspaceID = a.id
+        let ba = panel.browser
+        #expect(ba !== home && ba.key == a.id.uuidString)
+        store.state.ui.selectedWorkspaceID = b.id
+        let bb = panel.browser
+        #expect(bb !== ba)
+        // An agent in A keeps working in A's browser while B is on screen.
+        #expect(panel.browser(for: a.id) === ba)
+        store.state.ui.selectedWorkspaceID = a.id
+        #expect(panel.browser === ba)
+        // A deleted workspace's browser is dropped; an unknown id falls back to the home browser.
+        store.deleteWorkspace(b.id)
+        #expect(panel.browser(for: b.id) === home)
+    }
+
+    @Test func panesCarryTheirWorkspaceID() {
+        let id = UUID()
+        let env = Launcher.environment(project: Project(name: "p", path: "/tmp"), workspaceName: "W", workspaceID: id, settings: AppSettings())
+        #expect(env.contains("PROJECTN_WORKSPACE_ID=\(id.uuidString)"))
+        let none = Launcher.environment(project: Project(name: "p", path: "/tmp"), workspaceName: "", settings: AppSettings())
+        #expect(!none.contains { $0.hasPrefix("PROJECTN_WORKSPACE_ID=") })
     }
 }

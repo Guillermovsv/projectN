@@ -25,7 +25,7 @@ enum Launcher {
     /// `login`: your login shell's captured environment. When it applies, the CLI starts without running your
     /// shell's startup files again (see `LoginShell`); otherwise through the full login shell.
     static func plan(tool: Tool, mode: SessionMode, options: LaunchOptions = LaunchOptions(), project: Project, workspaceName: String,
-                     settings: AppSettings, extraArgs: [String] = [], prompt: String? = nil,
+                     workspaceID: UUID? = nil, settings: AppSettings, extraArgs: [String] = [], prompt: String? = nil,
                      exitMarker: URL? = nil, extraEnv: [String: String] = [:], login: LoginShell.Capture? = nil) -> Plan {
         let shell = settings.shell.isEmpty ? "/bin/zsh" : settings.shell
         let servers = MCPConfig.load()
@@ -84,7 +84,7 @@ enum Launcher {
             args = [fast == nil ? "-l" : "-f", "-i", "-c", script]
         }
 
-        var env = environment(project: project, workspaceName: workspaceName, settings: settings)
+        var env = environment(project: project, workspaceName: workspaceName, workspaceID: workspaceID, settings: settings)
         if let fast { env = fast.applied(to: env) }
         if !extraEnv.isEmpty {
             env.removeAll { kv in extraEnv.keys.contains { kv.hasPrefix($0 + "=") } }
@@ -107,7 +107,7 @@ enum Launcher {
                     directory: home, commandLine: command)
     }
 
-    static func environment(project: Project, workspaceName: String, settings: AppSettings) -> [String] {
+    static func environment(project: Project, workspaceName: String, workspaceID: UUID? = nil, settings: AppSettings) -> [String] {
         var env = ProcessInfo.processInfo.environment
         // Don't leak "we're inside Claude Code / Codex" markers if the app was started from one of them.
         // (Your shell rc files still run, so anything you export there is re-applied.)
@@ -128,6 +128,8 @@ enum Launcher {
         env["PROJECTN_HOME"] = AppHome.root.path
         env["PROJECTN_MCP_CONFIG"] = AppHome.mcpFile.path
         env["PROJECTN_WORKSPACE"] = workspaceName
+        // Which workspace's built-in browser this pane's browser tools drive.
+        if let workspaceID { env["PROJECTN_WORKSPACE_ID"] = workspaceID.uuidString } else { env.removeValue(forKey: "PROJECTN_WORKSPACE_ID") }
         env["PROJECTN_PROJECT"] = project.name
         for (k, v) in BrowserAutomation.environment() { env[k] = v }
         env["PWD"] = project.path

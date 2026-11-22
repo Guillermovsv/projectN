@@ -29,7 +29,40 @@ final class RightPanelModel: ObservableObject {
     @Published var tab: Tab { didSet { UserDefaults.standard.set(tab.rawValue, forKey: "rightPanelTab") } }
     @Published var width: Double { didSet { UserDefaults.standard.set(width, forKey: "rightPanelWidth") } }
 
-    let browser = BrowserModel()
+    /// One browser per workspace (key: workspace id; nil = the dashboard / no workspace selected).
+    private var browsers: [UUID?: BrowserModel] = [:]
+    private weak var store: Store?
+
+    /// The browser of the workspace on screen — what the Browser tab shows.
+    var browser: BrowserModel { browser(for: store?.state.ui.selectedWorkspaceID) }
+
+    /// The browser that belongs to a workspace, created on first use. Browsers of deleted workspaces are dropped.
+    func browser(for workspaceID: UUID?) -> BrowserModel {
+        let id = workspaceID.flatMap { id in store?.workspace(id) == nil ? nil : id }
+        if let b = browsers[id] { return b }
+        if let store {
+            for key in browsers.keys where key.map({ store.workspace($0) == nil }) == true {
+                browsers.removeValue(forKey: key)?.webView.removeFromSuperview()
+            }
+        }
+        let b = BrowserModel(key: id?.uuidString ?? "home")
+        browsers[id] = b
+        return b
+    }
+
+    /// The workspace currently shown, if any.
+    var activeWorkspaceID: UUID? { store?.state.ui.selectedWorkspaceID }
+
+    func attach(_ store: Store) {
+        self.store = store
+        // Before browsers were per workspace there was one remembered URL: give it to the workspace on screen.
+        let d = UserDefaults.standard
+        if let old = d.string(forKey: "browserURL") {
+            let key = "browserURL.\(store.state.ui.selectedWorkspaceID?.uuidString ?? "home")"
+            if d.string(forKey: key) == nil { d.set(old, forKey: key) }
+            d.removeObject(forKey: "browserURL")
+        }
+    }
 
     init() {
         let d = UserDefaults.standard
@@ -65,7 +98,9 @@ struct RightPanelView: View {
                     if assistant.floating { FloatingAssistantNotice() } else { AssistantView() }
                 case .files: FileTreeView()
                 case .activity: ActivityView()
-                case .browser: BrowserView(model: panel.browser)
+                case .browser:
+                    // A new view per workspace so the old browser is told it's hidden and the new one it's shown.
+                    BrowserView(model: panel.browser).id(ObjectIdentifier(panel.browser))
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -77,6 +112,10 @@ struct RightPanelView: View {
         HStack(spacing: 8) {
             Image(systemName: panel.tab.symbol).foregroundStyle(.secondary)
             Text(panel.tab.label).font(.headline)
+            if panel.tab == .browser, let w = store.selectedWorkspace {
+                Text(w.name).font(.callout).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+                    .help("Each workspace has its own browser")
+            }
             Spacer(minLength: 4)
             Button { panel.toggle() } label: { Image(systemName: "xmark").font(.caption.weight(.semibold)) }
                 .buttonStyle(ChromeButtonStyle())

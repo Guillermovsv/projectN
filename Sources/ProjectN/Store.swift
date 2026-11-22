@@ -632,7 +632,7 @@ final class Store: ObservableObject {
             // Your login shell's environment, captured once: the CLI starts without running your startup files again.
             let login = pane.tool == .terminal || AppHome.isTestProcess ? nil : LoginShell.forLaunch(settings: settings)
             let plan = Launcher.plan(tool: pane.tool, mode: mode, options: options,
-                                     project: project, workspaceName: w.name, settings: settings,
+                                     project: project, workspaceName: w.name, workspaceID: w.id, settings: settings,
                                      extraArgs: extraArgs, prompt: initialPrompt, exitMarker: exitMarker,
                                      extraEnv: agentEnv, login: login)
             DispatchQueue.main.async { [weak self] in
