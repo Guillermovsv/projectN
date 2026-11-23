@@ -150,6 +150,11 @@ final class NVoiceController: NSObject, ObservableObject {
         transcriber.inputDeviceProvider = {
             AudioDevices.resolve(NVoiceDefaults.store.string(forKey: "microphone") ?? AudioDevices.automatic)
         }
+        // A device change broke the mic mid-dictation: end it there and paste what was said up to that point.
+        transcriber.onInterrupted = { [weak self] in
+            guard let self, self.dictationRecording else { return }
+            self.finishDictation()
+        }
         transcriber.onAudioHealthChange = { [weak self] _ in
             guard let self else { return }
             self.rebuildMenu(enhance: self.settings.enhanceEnabled)
