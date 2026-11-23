@@ -41,7 +41,13 @@ enum AudioDevices {
         case systemDefault:
             return nil
         case automatic:
-            guard let def = defaultInput(), def.isBluetooth else { return nil }
+            guard let def = defaultInput() else { return nil }
+            guard def.isBluetooth else {
+                // Pin the current default rather than following it: when AirPods connect and become the default
+                // input, a pinned engine keeps working on the same mic instead of breaking mid-dictation.
+                let pinnable = def.transport != kAudioDeviceTransportTypeVirtual && def.transport != kAudioDeviceTransportTypeAggregate
+                return pinnable ? def : nil
+            }
             return inputDevices().first { $0.isBuiltIn } ?? inputDevices().first { !$0.isBluetooth }
         default:
             // A specific mic; if it's unplugged, fall back to automatic.

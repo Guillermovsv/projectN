@@ -57,8 +57,25 @@ final class Transcriber {
     }
     private var engine: AVAudioEngine?   // the engine of the current dictation (main thread)
     private var rebuildAfterRecording = false
+    private var recheckAfterRecording = false
+    private var pendingRebuild: (reason: String, force: Bool)?
     private var configObserver: NSObjectProtocol?
     private var rebuildWork: DispatchWorkItem?
+    /// Capture health. Bluetooth connecting/disconnecting can leave an engine that starts fine but delivers no audio
+    /// (or pure digital silence) — every dictation then ends in “No speech detected”. A watchdog notices within
+    /// half a second and moves the recording to a fresh engine. Counters are guarded by `sinkLock`.
+    private var buffersSeen = 0
+    private var peakSeen: Float = 0
+    private var everHeardSound = false
+    private var lastCheckedBuffers = 0
+    private var captureStart = Date()
+    private var watchdog: Timer?
+    private var currentTap: AVAudioNodeTapBlock?
+    private var recordingID = 0
+    private var restarting = false
+    private var restarts: [Date] = []
+    private var silenceRestarted = false
+    static let watchdogInterval: TimeInterval = 0.5
     /// Where the mic tap sends audio for transcription. Nil while only listening for “Hey N” (no transcript);
     /// set when a transcription starts on the open mic. Guarded by `sinkLock`, like the pre-roll.
     private let sinkLock = NSLock()
@@ -165,14 +182,17 @@ final class Transcriber {
 
         let tapBlock: AVAudioNodeTapBlock = { [weak self] buffer, when in
             guard let self else { return }
-            if let copy = buffer.copy() as? AVAudioPCMBuffer {
-                let monitor = self.sinkLock.withLock { () -> ((AVAudioPCMBuffer) -> Void)? in
-                    self.sinkStorage?.yield(copy)
-                    if self.keepPreroll { self.remember(copy) }
-                    return self.monitorStorage
-                }
-                monitor?(copy)
+            let peak = Self.peak(of: buffer)
+            let copy = buffer.copy() as? AVAudioPCMBuffer
+            let monitor = self.sinkLock.withLock { () -> ((AVAudioPCMBuffer) -> Void)? in
+                self.buffersSeen += 1
+                self.peakSeen = max(self.peakSeen, peak)
+                guard let copy else { return nil }
+                self.sinkStorage?.yield(copy)
+                if self.keepPreroll { self.remember(copy) }
+                return self.monitorStorage
             }
+            if let copy { monitor?(copy) }
             let level = Self.level(of: buffer)
             let captured: Double? = when.isHostTimeValid
                 ? AVAudioTime.seconds(forHostTime: when.hostTime) + Double(buffer.frameLength) / buffer.format.sampleRate : nil
@@ -223,14 +243,16 @@ final class Transcriber {
         }
         markAudio(stuck: false)
         engine = w.engine
-        // Only the engine being recorded with: building an engine fires this too, so a global
-        // observer would rebuild forever.
-        configObserver = NotificationCenter.default.addObserver(forName: .AVAudioEngineConfigurationChange,
-                                                                object: w.engine, queue: .main) { [weak self] _ in
-            self?.rebuildAfterRecording = true
-        }
+        observeConfiguration(of: w.engine)
         isRecording = true
         startDate = Date()
+        recordingID += 1
+        currentTap = tapBlock
+        restarts = []
+        silenceRestarted = false
+        everHeardSound = false
+        resetCaptureHealth()
+        startWatchdog()
         Diagnostics.log(String(format: "recording started in %.0f ms", Date().timeIntervalSince(t0) * 1000))
 
         self.micFormat = micFormat
@@ -371,7 +393,7 @@ final class Transcriber {
         let module: DictationTranscriber
         let analyzer: SpeechAnalyzer
         let format: AVAudioFormat
-        let converter: AVAudioConverter?
+        var converter: AVAudioConverter?   // replaced if the mic format changes (recording moved to a fresh engine)
         let input: AsyncStream<AnalyzerInput>.Continuation
         let collector: Task<(String, Double, Int), Error>
 
@@ -422,6 +444,7 @@ final class Transcriber {
         }
 
         func feed(_ raw: AVAudioPCMBuffer) {
+            if raw.format != format, converter?.inputFormat != raw.format { converter = AVAudioConverter(from: raw.format, to: format) }
             if let converted = Transcriber.convert(raw, with: converter, to: format) {
                 input.yield(AnalyzerInput(buffer: converted))
             }
@@ -471,7 +494,17 @@ final class Transcriber {
     }
 
     private func teardownAudio() {
-        if let e = engine, worker.run(timeout: Self.stopTimeout, work: { Self.end(e) }) == nil {
+        watchdog?.invalidate(); watchdog = nil
+        currentTap = nil
+        let peak = sinkLock.withLock { peakSeen }
+        if !everHeardSound && peak == 0 {
+            Diagnostics.log("the mic delivered only silence — rebuilding the audio engine")
+            rebuildAfterRecording = true
+        }
+        if restarting, let e = engine {
+            // A restart is busy on the audio queue; don't queue behind it (and don't call that a stuck audio system).
+            DispatchQueue.global(qos: .utility).async { Self.end(e) }
+        } else if let e = engine, worker.run(timeout: Self.stopTimeout, work: { Self.end(e) }) == nil {
             Diagnostics.log("audio stop timed out — CoreAudio is not responding, moving to a fresh audio queue")
             // The job may never have got its turn; the mic must still be released.
             DispatchQueue.global(qos: .utility).async { Self.end(e) }
@@ -489,13 +522,113 @@ final class Transcriber {
         }
         micFormat = nil
         isRecording = false
-        if rebuildAfterRecording { rebuildAfterRecording = false; invalidateEngine(reason: "audio setup changed while recording") }
+        if rebuildAfterRecording {
+            rebuildAfterRecording = false; recheckAfterRecording = false
+            invalidateEngine(reason: "audio setup changed while recording")
+        } else if recheckAfterRecording {
+            recheckAfterRecording = false
+            invalidateEngine(reason: "audio devices changed while recording", force: false)
+        }
+    }
+
+    // MARK: Capture watchdog
+
+    private func observeConfiguration(of e: AVAudioEngine) {
+        if let o = configObserver { NotificationCenter.default.removeObserver(o) }
+        // Only the engine being recorded with: building an engine fires this too, so a global
+        // observer would rebuild forever.
+        configObserver = NotificationCenter.default.addObserver(forName: .AVAudioEngineConfigurationChange,
+                                                                object: e, queue: .main) { [weak self] _ in
+            guard let self, self.isRecording else { return }
+            self.rebuildAfterRecording = true
+            // The engine usually stops itself here (a device came or went); look now rather than at the next tick.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in self?.checkCapture() }
+        }
+    }
+
+    private func resetCaptureHealth() {
+        sinkLock.withLock { buffersSeen = 0; peakSeen = 0 }
+        lastCheckedBuffers = 0
+        captureStart = Date()
+    }
+
+    private func startWatchdog() {
+        watchdog?.invalidate()
+        let t = Timer(timeInterval: Self.watchdogInterval, repeats: true) { [weak self] _ in self?.checkCapture() }
+        RunLoop.main.add(t, forMode: .common)
+        watchdog = t
+    }
+
+    /// Main thread, while recording: is the mic still delivering real audio?
+    private func checkCapture() {
+        guard isRecording, !restarting else { return }
+        let (count, peak) = sinkLock.withLock { (buffersSeen, peakSeen) }
+        let elapsed = Date().timeIntervalSince(captureStart)
+        defer { lastCheckedBuffers = count }
+        if peak > 0 { everHeardSound = true }
+        let problem: String?
+        if engine?.isRunning == false {
+            problem = "the mic engine stopped (audio device change)"
+        } else if elapsed >= Self.watchdogInterval * 0.9, count == lastCheckedBuffers {
+            problem = count == 0 ? "the mic delivered no audio" : "the mic stopped delivering audio"
+        } else if elapsed >= 0.6, count > 0, peak == 0, !silenceRestarted {
+            // A working mic always picks up some noise; exact zeros mean a dead input route.
+            silenceRestarted = true
+            problem = "the mic is delivering pure silence"
+        } else {
+            problem = nil
+        }
+        if let problem { restartCapture(problem) }
+    }
+
+    /// Moves the running recording to a freshly built engine (same tap, same transcript), off the main thread.
+    private func restartCapture(_ why: String) {
+        guard isRecording, !restarting, let tap = currentTap else { return }
+        let now = Date()
+        restarts = restarts.filter { now.timeIntervalSince($0) < 10 }
+        guard restarts.count < 2 else { return }   // don't thrash a broken audio system
+        restarts.append(now)
+        restarting = true
+        let id = recordingID, old = engine
+        Diagnostics.log("\(why) — restarting the recording on a fresh audio engine")
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            let outcome = self.worker.run(timeout: Self.startTimeout, work: { [self] () -> Result<(Warm, AVAudioFormat), Error> in
+                if let old { Self.end(old) }
+                self.warm = nil
+                guard let w = self.takeWarm(forceRebuild: true) else { return .failure(TranscriberError.micUnavailable("no input format")) }
+                do { return .success((w, try Self.begin(w, tap: tap))) } catch { return .failure(error) }
+            }, discard: { result in
+                if case .success(let started) = result { Self.end(started.0.engine) }
+            })
+            DispatchQueue.main.async {
+                self.restarting = false
+                guard self.isRecording, self.recordingID == id else {
+                    // The recording ended meanwhile: never leave the mic open.
+                    if case .success(let started)? = outcome { DispatchQueue.global(qos: .utility).async { Self.end(started.0.engine) } }
+                    return
+                }
+                switch outcome {
+                case .success(let (w, format))?:
+                    self.engine = w.engine
+                    self.micFormat = format
+                    self.observeConfiguration(of: w.engine)
+                    self.resetCaptureHealth()
+                    Diagnostics.log("mic recovered on a fresh audio engine")
+                case .failure(let error)?:
+                    Diagnostics.log("mic restart failed: \(error.localizedDescription)")
+                case nil:
+                    Diagnostics.log("mic restart timed out — CoreAudio is not responding")
+                }
+            }
+        }
     }
 
     // MARK: Warm engine
 
     /// Builds the engine in the background (if it isn't ready already) so the next fn press starts instantly.
-    func prewarm(discardExisting: Bool = false) {
+    /// `reason` is logged only when an engine actually gets built.
+    func prewarm(discardExisting: Bool = false, reason: String? = nil) {
         // Waits on a background thread, so a build that hangs gets abandoned before the next fn press needs the queue.
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
@@ -504,25 +637,36 @@ final class Transcriber {
                 if discardExisting { self.warm = nil }
                 let device = self.inputDeviceProvider()
                 if let w = self.warm, w.requestedUID == device?.uid { return }
+                if let reason { Diagnostics.log("rebuilding audio engine — \(reason)") }
                 _ = self.buildWarm(device)
             })
             if finished == nil { Diagnostics.log("audio engine build timed out — moving to a fresh audio queue") }
         }
     }
 
-    /// The audio setup changed (wake, unlock, device change, mic setting): drop the engine and build a fresh one.
-    func invalidateEngine(reason: String, audioRestarted: Bool = false) {
+    /// The audio setup changed. `force` (wake, unlock, mic setting, coreaudiod restart): drop the engine and build a
+    /// fresh one. Otherwise (devices came or went): rebuild only if the mic we record from is now a different one.
+    func invalidateEngine(reason: String, force: Bool = true, audioRestarted: Bool = false) {
         if audioRestarted { markAudio(stuck: false) }
-        if isRecording { rebuildAfterRecording = true; return }
-        // Coalesce bursts (unlock fires several notifications; AirPods connecting changes several properties).
+        if isRecording {
+            if force { rebuildAfterRecording = true } else { recheckAfterRecording = true }
+            return
+        }
+        // Coalesce bursts (unlock fires several notifications; AirPods connecting fires many over several seconds).
+        if pendingRebuild?.force != true || force { pendingRebuild = (reason, force || pendingRebuild?.force == true) }
         rebuildWork?.cancel()
         let w = DispatchWorkItem { [weak self] in
-            guard let self, !self.isRecording else { self?.rebuildAfterRecording = true; return }
-            Diagnostics.log("rebuilding audio engine — \(reason)")
-            self.prewarm(discardExisting: true)
+            guard let self, let pending = self.pendingRebuild else { return }
+            guard !self.isRecording else {
+                if pending.force { self.rebuildAfterRecording = true } else { self.recheckAfterRecording = true }
+                self.pendingRebuild = nil
+                return
+            }
+            self.pendingRebuild = nil
+            self.prewarm(discardExisting: pending.force, reason: pending.reason)
         }
         rebuildWork = w
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6, execute: w)
+        DispatchQueue.main.asyncAfter(deadline: .now() + (pendingRebuild?.force == true ? 0.6 : 1.5), execute: w)
     }
 
     /// On the worker. Returns the warm engine if it matches the current mic, otherwise builds one now
@@ -603,6 +747,13 @@ final class Transcriber {
             return buffer
         }
         return error == nil && out.frameLength > 0 ? out : nil
+    }
+
+    private static func peak(of buffer: AVAudioPCMBuffer) -> Float {
+        guard let data = buffer.floatChannelData?[0] else { return 1 }   // not float: can't tell, assume alive
+        var p: Float = 0
+        for i in 0..<Int(buffer.frameLength) { p = max(p, abs(data[i])) }
+        return p
     }
 
     private static func level(of buffer: AVAudioPCMBuffer) -> Float {

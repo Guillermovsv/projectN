@@ -236,21 +236,23 @@ final class NVoiceController: NSObject, ObservableObject {
             self.openSettings()
         }
         // Rebuild the (pre-warmed) audio engine whenever the audio setup may have changed under it.
-        let rebuild: (String) -> Void = { [weak self] why in
+        let rebuild: (String, Bool) -> Void = { [weak self] why, force in
             DispatchQueue.main.async {
                 guard let self, self.isOn else { return }
-                self.transcriber.invalidateEngine(reason: why)
+                self.transcriber.invalidateEngine(reason: why, force: force)
             }
         }
         let ws = NSWorkspace.shared.notificationCenter
-        ws.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { _ in rebuild("woke from sleep") }
-        ws.addObserver(forName: NSWorkspace.sessionDidBecomeActiveNotification, object: nil, queue: .main) { _ in rebuild("session active") }
-        DistributedNotificationCenter.default().addObserver(forName: Notification.Name("com.apple.screenIsUnlocked"), object: nil, queue: .main) { _ in rebuild("screen unlocked") }
-        // Mics plugged in / out, AirPods connecting, default input changed.
+        ws.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { _ in rebuild("woke from sleep", true) }
+        ws.addObserver(forName: NSWorkspace.sessionDidBecomeActiveNotification, object: nil, queue: .main) { _ in rebuild("session active", true) }
+        DistributedNotificationCenter.default().addObserver(forName: Notification.Name("com.apple.screenIsUnlocked"), object: nil, queue: .main) { _ in rebuild("screen unlocked", true) }
+        // Mics plugged in / out, AirPods connecting, default input changed. Bluetooth fires dozens of these over a
+        // minute; rebuilding on each one is what wedged the mic. Only rebuild when the mic we record from changes —
+        // if the engine broke anyway, the recording watchdog restarts it.
         for sel in [kAudioHardwarePropertyDefaultInputDevice, kAudioHardwarePropertyDevices] {
             var addr = AudioObjectPropertyAddress(mSelector: sel, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
             AudioObjectAddPropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &addr, .main) { _, _ in
-                rebuild(sel == kAudioHardwarePropertyDefaultInputDevice ? "default mic changed" : "audio devices changed")
+                rebuild(sel == kAudioHardwarePropertyDefaultInputDevice ? "default mic changed" : "audio devices changed", false)
             }
         }
     }
