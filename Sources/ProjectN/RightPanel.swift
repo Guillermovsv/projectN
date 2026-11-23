@@ -46,6 +46,7 @@ final class RightPanelModel: ObservableObject {
             }
         }
         let b = BrowserModel(key: id?.uuidString ?? "home")
+        b.store = store
         browsers[id] = b
         return b
     }

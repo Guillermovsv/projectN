@@ -40,7 +40,7 @@ open /Applications/ProjectN.app
 |---|---|
 | **Expand a pane** — the ⤢ button makes one agent fill the space; click again to go back to the split view. | ![Expanded pane](docs/screenshots/expanded.png) |
 | **Files** — browse the focused project, insert paths, open files. | ![Files panel](docs/screenshots/files.png) |
-| **Browser** — preview localhost or any site at Fit / Mobile / Tablet / Desktop widths. | ![Browser panel](docs/screenshots/browser.png) |
+| **Browser** — preview localhost or any site at Fit / Mobile / Tablet / Desktop widths. Press ◎ (⇧⌘P) to *point things out*: click an element, drag an area or ⌥-select text and it's highlighted with a number and lands in the focused agent's chat box (selector, text, HTML and a screenshot go with your message). | ![Browser panel](docs/screenshots/browser.png) |
 | **Voice dictation (NVoice)** — hold fn anywhere, talk, release to paste. | ![Voice settings](docs/screenshots/voice.png) |
 
 ## Concepts

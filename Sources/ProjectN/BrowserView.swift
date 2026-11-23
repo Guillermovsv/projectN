@@ -67,6 +67,9 @@ final class BrowserModel: ObservableObject {
     @Published private(set) var current: BrowserTab
     /// The Browser panel is showing this workspace's browser right now.
     private(set) var onScreen = false
+    /// For pointing things out: the chat box they go to is a pane of this workspace.
+    weak var store: Store?
+    var workspaceID: UUID? { UUID(uuidString: key) }
 
     private var tabsKey: String { "browserTabs.\(key)" }
     private var selectedKey: String { "browserTabSelected.\(key)" }
@@ -176,6 +179,10 @@ final class BrowserTab: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
     @Published var landscape: Bool { didSet { if landscape != oldValue { owner?.save() } } }
     /// This tab is on screen right now.
     private(set) var onScreen = false
+    /// Pointing mode (◎): hover highlights, click / drag / ⌥-select points things out to the agent's chat box.
+    @Published var pointing = false
+    /// A short confirmation shown over the page ("[2] added to Ada's prompt").
+    @Published var pointingNotice: String?
 
     /// The CSS viewport being emulated (nil = panel size).
     var viewport: CGSize? { device.viewport(landscape: landscape) }
@@ -207,6 +214,7 @@ final class BrowserTab: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
         webView.navigationDelegate = self
         webView.uiDelegate = self
         ConsoleRouter.shared.register(webView, self)
+        BrowserPointing.register(self)
         applyDevice(reloadIfNeeded: false)
         observations = [
             webView.observe(\.estimatedProgress) { [weak self] wv, _ in MainActor.assumeIsolated { self?.progress = wv.estimatedProgress } },
@@ -231,6 +239,7 @@ final class BrowserTab: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
         config.preferences.javaScriptCanOpenWindowsAutomatically = true
         config.userContentController.addUserScript(WKUserScript(source: consoleHookJS, injectionTime: .atDocumentStart, forMainFrameOnly: true))
         config.userContentController.add(ConsoleRouter.shared, name: "pnConsole")
+        config.userContentController.add(ConsoleRouter.shared, contentWorld: BrowserPointing.world, name: "pnPoint")
         return config
     }
 
@@ -262,6 +271,7 @@ final class BrowserTab: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
     /// so its JS, media and web process memory are released; it reloads when the tab is shown again.
     func didHide() {
         onScreen = false
+        if pointing { setPointing(false) }
         scheduleSuspend()
     }
 
@@ -449,7 +459,7 @@ final class BrowserTab: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
     }
 
     nonisolated func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
-        MainActor.assumeIsolated { self.consoleLines.removeAll() }
+        MainActor.assumeIsolated { self.consoleLines.removeAll(); self.pointing = false }
     }
 
     nonisolated func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
@@ -485,7 +495,7 @@ final class BrowserTab: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
     }
 }
 
-/// Routes console messages to the tab whose page sent them (tabs opened by a page share its configuration).
+/// Routes console and pointing messages to the tab whose page sent them (tabs opened by a page share its configuration).
 @MainActor
 final class ConsoleRouter: NSObject, WKScriptMessageHandler {
     static let shared = ConsoleRouter()
@@ -495,8 +505,12 @@ final class ConsoleRouter: NSObject, WKScriptMessageHandler {
 
     nonisolated func userContentController(_ controller: WKUserContentController, didReceive message: WKScriptMessage) {
         MainActor.assumeIsolated {
-            guard let line = message.body as? String, let wv = message.webView, let tab = tabs.object(forKey: wv) else { return }
-            tab.receiveConsole(line)
+            guard let wv = message.webView, let tab = tabs.object(forKey: wv) else { return }
+            if message.name == "pnPoint" {
+                if let body = message.body as? [String: Any] { tab.receivePointing(body) }
+            } else if let line = message.body as? String {
+                tab.receiveConsole(line)
+            }
         }
     }
 }
@@ -586,6 +600,7 @@ private struct BrowserTabChip: View {
 }
 
 private struct BrowserTabView: View {
+    @EnvironmentObject var store: Store
     @ObservedObject var tab: BrowserTab
     let model: BrowserModel
     @FocusState private var addressFocused: Bool
@@ -619,6 +634,7 @@ private struct BrowserTabView: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .background(Color.appWindow)
                 }
+                if tab.pointing || tab.pointingNotice != nil { pointingBanner }
                 if let err = tab.errorText {
                     VStack(spacing: 10) {
                         Image(systemName: "exclamationmark.triangle").font(.largeTitle).foregroundStyle(.orange)
@@ -634,6 +650,37 @@ private struct BrowserTabView: View {
         }
         .onAppear { tab.didShow(); if !tab.hasPage && tab.address.isEmpty { addressFocused = true } }
         .onDisappear { tab.didHide() }
+    }
+
+    private var targetName: String? {
+        guard let ref = store.pointingTarget(workspaceID: model.workspaceID), let (_, p) = store.pane(ref.paneID, in: ref.workspaceID) else { return nil }
+        return "\(store.paneTitle(p)) (\(p.tool.label))"
+    }
+
+    /// Over the page while pointing: what you can do, and where it goes.
+    private var pointingBanner: some View {
+        VStack {
+            Spacer()
+            HStack(spacing: 8) {
+                Image(systemName: "scope")
+                if let notice = tab.pointingNotice {
+                    Text(notice).fontWeight(.semibold)
+                } else {
+                    Text("Click an element · drag an area · ⌥ select text · ↑ parent · Esc done")
+                    if let t = targetName { Text("→ \(t)").fontWeight(.semibold) }
+                }
+            }
+            .font(.caption)
+            .lineLimit(1)
+            .foregroundStyle(.white)
+            .padding(.horizontal, 12).padding(.vertical, 7)
+            .background(Capsule().fill(Color.pointing.opacity(0.95)))
+            .shadow(color: .black.opacity(0.25), radius: 6, y: 2)
+            .padding(.bottom, 14)
+            .padding(.horizontal, 10)
+            .allowsHitTesting(false)
+            .animation(.easeInOut(duration: 0.15), value: tab.pointingNotice)
+        }
     }
 
     /// The page at the device's real viewport, drawn as a device screen scaled to fit, with its size underneath.
@@ -670,6 +717,16 @@ private struct BrowserTabView: View {
                     .textFieldStyle(.roundedBorder)
                     .focused($addressFocused)
                     .onSubmit { tab.go(tab.address); addressFocused = false }
+                Button(action: tab.togglePointing) {
+                    Image(systemName: "scope")
+                        .foregroundStyle(tab.pointing ? Color.white : Color.primary)
+                        .padding(.horizontal, 3).padding(.vertical, 1)
+                        .background(RoundedRectangle(cornerRadius: 5).fill(tab.pointing ? Color.pointing : .clear))
+                }
+                .disabled(!tab.hasPage)
+                .keyboardShortcut("p", modifiers: [.command, .shift])
+                .help(tab.pointing ? "Stop pointing (Esc)"
+                      : "Point something out to the agent (⇧⌘P): click an element or drag an area, and it goes into the chat box of \(targetName ?? "the focused Claude/Codex pane"). With text selected, points out that text.")
                 Button(action: tab.openExternally) { Image(systemName: "arrow.up.forward.app") }
                     .help("Open in default browser")
             }

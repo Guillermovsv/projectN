@@ -806,9 +806,16 @@ final class Store: ObservableObject {
         @Published var text = ""
         @Published var attachments: [URL] = []
         @Published var recipients: [PaneRef] = []
+        /// Things pointed out in the browser (◎), sent with the message as numbered references.
+        @Published var marks: [BrowserMark] = []
         @Published var hidden = false
 
-        var isEmpty: Bool { text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && attachments.isEmpty }
+        var isEmpty: Bool { text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && attachments.isEmpty && marks.isEmpty }
+
+        @MainActor func removeMark(_ m: BrowserMark) {
+            marks.removeAll { $0.id == m.id }
+            BrowserPointing.unmark([m])
+        }
 
         func attach(_ urls: [URL]) {
             for u in urls where !attachments.contains(u) { attachments.append(u) }
@@ -844,6 +851,8 @@ final class Store: ObservableObject {
         let message = c.text.trimmingCharacters(in: .whitespacesAndNewlines)
         let files = c.attachments.map { Shell.quote($0.path) }.joined(separator: " ")
         var body = message
+        let pointed = BrowserMark.promptBlock(c.marks)
+        if !pointed.isEmpty { body += (body.isEmpty ? "Look at what I pointed out in the browser:" : "") + "\n\n" + pointed }
         if !files.isEmpty { body += (body.isEmpty ? "" : "\n\n") + files }
         guard !body.isEmpty else { return }
 
@@ -860,6 +869,30 @@ final class Store: ObservableObject {
         c.text = ""
         c.attachments = []
         c.recipients = []
+        BrowserPointing.unmark(c.marks)
+        c.marks = []
+    }
+
+    /// The chat box things pointed out in a workspace's browser go to: the focused pane of the space on screen when
+    /// it's an agent, else that space's first agent, else the workspace's first agent pane.
+    func pointingTarget(workspaceID: UUID?) -> PaneRef? {
+        let isAgent: (Pane) -> Bool = { $0.tool != .terminal }
+        if let o = focusOverride, let pid = o.paneID {
+            for w in state.workspaces { if let (_, p) = pane(pid, in: w.id), isAgent(p) { return PaneRef(workspaceID: w.id, paneID: pid) } }
+        }
+        guard let wid = workspaceID, let w = workspace(wid) else { return nil }
+        var spaces = w.spaces
+        if state.ui.selectedWorkspaceID == wid, let s = selectedSpace {
+            if let p = s.panes.first(where: { $0.id == s.focusedPaneID }), isAgent(p) { return PaneRef(workspaceID: wid, paneID: p.id) }
+            spaces.removeAll { $0.id == s.id }
+            spaces.insert(s, at: 0)
+        }
+        for s in spaces {
+            if let p = s.panes.first(where: { $0.id == s.focusedPaneID }).flatMap({ isAgent($0) ? $0 : nil }) ?? s.panes.first(where: isAgent) {
+                return PaneRef(workspaceID: wid, paneID: p.id)
+            }
+        }
+        return nil
     }
 
     /// Puts text into a pane's input and submits it. Starts (and resumes) the pane first if needed.

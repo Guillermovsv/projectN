@@ -3,6 +3,11 @@ import Combine
 import SwiftUI
 import UniformTypeIdentifiers
 
+extension Color {
+    /// Things pointed out in the browser: their highlight on the page and their chips.
+    static let pointing = Color(red: 1, green: 0.353, blue: 0.122)
+}
+
 /// Payload used when dragging a pane header onto another pane's chat box (to tag that agent).
 enum PaneDrag {
     static let prefix = "projectn-pane:"
@@ -75,6 +80,7 @@ struct ComposerView: View, Equatable {
     @State private var mentionQuery = ""
     @State private var attachments: [URL]
     @State private var recipients: [Store.PaneRef]
+    @State private var marks: [BrowserMark]
     @State private var hasText: Bool
     @State private var compact = false
     /// The agent shows a question or a menu and is waiting for your answer.
@@ -87,6 +93,7 @@ struct ComposerView: View, Equatable {
         self.runtime = runtime
         _attachments = State(initialValue: state.attachments)
         _recipients = State(initialValue: state.recipients)
+        _marks = State(initialValue: state.marks)
         _hasText = State(initialValue: !state.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
         _waiting = State(initialValue: runtime?.needsInput ?? false)
     }
@@ -98,7 +105,7 @@ struct ComposerView: View, Equatable {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            if !attachments.isEmpty || !recipients.isEmpty { chips }
+            if !attachments.isEmpty || !recipients.isEmpty || !marks.isEmpty { chips }
             // Fixed four-line height (longer text scrolls inside): the terminal above never resizes while you type,
             // so Claude/Codex don't redraw their whole screen on every new line. ⏎ sends, ⇧⏎ / ⌥⏎ new line.
             ComposerEditor(state: state, placeholder: placeholder, focusTrigger: focusTrigger,
@@ -137,6 +144,7 @@ struct ComposerView: View, Equatable {
         .onReceive(state.$text.map { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }.removeDuplicates()) { hasText = $0 }
         .onReceive(state.$attachments.removeDuplicates()) { attachments = $0 }
         .onReceive(state.$recipients.removeDuplicates()) { recipients = $0 }
+        .onReceive(state.$marks.removeDuplicates()) { marks = $0 }
         .onReceive(waitingChanges) { waiting = $0 }
     }
 
@@ -153,9 +161,9 @@ struct ComposerView: View, Equatable {
     }
 
     /// Answering the agent's prompt from here: an empty Return is Return in the terminal.
-    private var answersPrompt: Bool { waiting && !hasText && attachments.isEmpty && recipients.isEmpty }
+    private var answersPrompt: Bool { waiting && !hasText && attachments.isEmpty && recipients.isEmpty && marks.isEmpty }
 
-    private var canSend: Bool { hasText || !attachments.isEmpty || answersPrompt }
+    private var canSend: Bool { hasText || !attachments.isEmpty || !marks.isEmpty || answersPrompt }
 
     private func send() {
         if state.isEmpty {
@@ -166,7 +174,7 @@ struct ComposerView: View, Equatable {
         }
         // "2", "yes", "no"… typed while the agent waits for an answer pick that option (pasting "2" and pressing
         // Return would only confirm the highlighted one). Anything else is sent as a message.
-        if state.recipients.isEmpty, state.attachments.isEmpty, let runtime, runtime.answerFromChatBox(state.text) {
+        if state.recipients.isEmpty, state.attachments.isEmpty, state.marks.isEmpty, let runtime, runtime.answerFromChatBox(state.text) {
             state.text = ""
             return
         }
@@ -195,6 +203,12 @@ struct ComposerView: View, Equatable {
                              text: "→ \(store.paneTitle(p)) · \(s.name)",
                              tint: Color.appAccent) { state.recipients.removeAll { $0 == r } }
                     }
+                }
+                ForEach(marks) { m in
+                    Chip(icon: AnyView(Image(systemName: "scope").foregroundStyle(Color.pointing)),
+                         text: m.chipText, tint: Color.pointing) { state.removeMark(m) }
+                        .help(m.helpText)
+                        .onHover { if $0 { BrowserPointing.flash(m) } }
                 }
                 ForEach(attachments, id: \.self) { url in
                     Chip(icon: AnyView(Image(nsImage: NSWorkspace.shared.icon(forFile: url.path)).resizable().frame(width: 14, height: 14)),
