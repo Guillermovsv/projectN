@@ -166,6 +166,39 @@ struct AgentUnitTests {
         #expect(codex.hasPrefix("## Agent profile (trusted)") && codex.contains("Eres el Project Manager"))
     }
 
+    /// Notes stay out of the prompt (they grew into a 25 KB work log re-read on every step): a one-line pointer
+    /// and a search tool instead. Only a session without ProjectN's tools still gets them inline.
+    @Test func projectNotesStayOutOfThePromptAndAreSearchable() {
+        let p = AgentProfile.projectManager()
+        let project = Project(name: "Ads", path: "/x/ads-\(UUID().uuidString)")
+        AgentStore.addProjectNote(project.id, "Hero de Web Design EN 2342 publicado con video Hyperframes", by: "Dev")
+        AgentStore.addProjectNote(project.id, "Flujo de imágenes publicitarias: Google Sheet AI Images for Ads y carpeta de Drive Anuncios", by: "Gen")
+        AgentStore.addProjectNote(project.id, "Guía de formatos para anuncios en docs/formatos.md", by: "Gen")
+        let task = AgentTask(agentID: p.id, agentName: p.name, projectID: project.id, projectName: "Ads",
+                             instruction: "genera la siguiente imagen", origin: TaskOrigin(kind: .local),
+                             runtime: .codexCLI, model: p.model, effort: p.effort, permission: p.permission)
+        let ctx = ContextLoader.Bundle(files: [.init(relativePath: "README.md", text: "# Ads\nVer docs/formatos.md", truncated: false)],
+                                       notes: [], readmeFound: true)
+        let msg = PromptComposer.firstMessage(task: task, profile: p, project: project, context: ctx, includeInstructions: true, capabilities: .ask)
+        #expect(msg.contains("## Project notes\n3 shared notes about Ads (not included)") && msg.contains("`project_notes(query)`"))
+        #expect(!msg.contains("Hyperframes") && !msg.contains("Google Sheet") && msg.contains("Ver docs/formatos.md"))
+        #expect(msg.contains("search them with `project_notes(query)`"))   // the rule in the profile
+        let bare = PromptComposer.firstMessage(task: task, profile: p, project: project, context: ctx, includeInstructions: false, capabilities: .none)
+        #expect(bare.contains("Hyperframes") && bare.contains("Google Sheet"))
+
+        // Any word, case- and accent-insensitive; more words matched first.
+        let found = AgentStore.searchProjectNotes(project.id, query: "ANUNCIOS drive")
+        #expect(found.total == 3 && found.notes.count == 2 && found.notes[0].contains("Google Sheet") && found.notes[1].contains("Guía"))
+        #expect(AgentStore.searchProjectNotes(project.id, query: "guia").notes.first?.contains("Guía de formatos") == true)
+        #expect(AgentStore.searchProjectNotes(project.id, query: "tiktok").notes.isEmpty)
+        // No query: the newest ones, newest first; and the size cap holds.
+        let newest = AgentStore.searchProjectNotes(project.id, query: "", limit: 2)
+        #expect(newest.notes.count == 2 && newest.notes[0].contains("Guía") && newest.notes[1].contains("Google Sheet"))
+        #expect(AgentStore.searchProjectNotes(project.id, query: "", maxChars: 100).notes.count == 1)
+        // Follow-ups don't carry notes unless asked to.
+        #expect(!PromptComposer.resumeMessage(task: task).contains("Project notes"))
+    }
+
     @Test func projectManagerSeedAndPermissionMapping() throws {
         let pm = AgentProfile.projectManager()
         #expect(pm.name == "Project Manager" && pm.provider == .anthropic && pm.runtime == .claudeCode)

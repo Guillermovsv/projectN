@@ -462,7 +462,8 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
         let notes = AgentStore.projectNotes(project.id)
         let digest = AgentStore.notesDigest(notes)
         if let prev = resumeFrom {
-            prompt = PromptComposer.resumeMessage(task: t, updatedNotes: prev.notesDigest == digest ? nil : notes)
+            // Notes are only re-sent to a session that got them inline (no ProjectN tools to search them).
+            prompt = PromptComposer.resumeMessage(task: t, updatedNotes: tools != .none || prev.notesDigest == digest ? nil : notes)
             t.notesDigest = digest
         } else {
             t.notesDigest = digest
@@ -474,7 +475,8 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
                                                  recap: t.skipRecap == true || profile.sessionPolicy != .perProject ? [] : recentConversation(for: t),
                                                  projects: coordinating ? coordinatedProjects(profile) : [])
             // One terminal per agent + project: earlier sessions of this pair whose work is done are closed.
-            closeFinishedPanes(agent: profile.id, project: project.id)
+            // A scheduled run only replaces earlier scheduled runs' terminals: the user's conversation stays open.
+            closeFinishedPanes(agent: profile.id, project: project.id, scheduledOnly: t.origin.kind == .schedule)
         }
         // The bridge must be listening before a session that relies on it starts.
         guard bridge.port != nil || AgentBridge.helperPath == nil else { return }
@@ -554,7 +556,10 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
     func projectSession(agent p: AgentProfile, project: UUID, model: String) -> AgentTask? {
         // A queued task that will continue the session counts too: the next one waits for it and then continues
         // in its terminal, instead of resuming the same conversation in a second terminal.
+        // Scheduled runs start fresh sessions of their own (see runSchedule): a conversation with the user never
+        // continues one of them, so it doesn't inherit a run's whole context (nor feeds its own into the next run).
         guard let prev = tasks.last(where: { $0.agentID == p.id && $0.projectID == project && $0.sessionID != nil
+                                             && $0.origin.kind != .schedule
                                              && ($0.paneID != nil || $0.status == .queued) })
         else { return nil }
         guard prev.runtime == p.runtime, prev.status != .failed else { return nil }
@@ -566,7 +571,8 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
         // a follow-up a minute later landed in a new terminal with no memory of what it had just done.
         let warm = prev.paneID.flatMap { store?.runtimes[$0] }?.isRunning == true
             && Date().timeIntervalSince(lastUsed) < Double(policy.idleCloseMinutes * 60)
-        if !warm, let size = sessionContextTokens(prev), size >= policy.maxSessionContextK * 1000 {
+        // Even a warm one rotates at twice the limit: past that every step re-reads a huge conversation.
+        if let size = sessionContextTokens(prev), size >= policy.maxSessionContextK * 1000 * (warm ? 2 : 1) {
             AuditLog.record("session.rotated", ["agent": prev.agentName, "project": prev.projectName,
                                                 "session": prev.sessionID ?? "", "context_tokens": String(size)])
             return nil
@@ -617,7 +623,8 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
         }
         let notes = AgentStore.projectNotes(t.projectID)
         let digest = AgentStore.notesDigest(notes)
-        let message = PromptComposer.resumeMessage(task: t, updatedNotes: prev.notesDigest == digest ? nil : notes)
+        // A live process holds a token, so it has `project_notes`: never re-send them.
+        let message = PromptComposer.resumeMessage(task: t, updatedNotes: nil)
         t.notesDigest = digest
         replace(t)
         lastTyped[t.id] = Date()
@@ -1129,9 +1136,10 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
     }
 
     /// Closes this agent + project's panes whose tasks have finished (a new session is starting for the pair).
-    private func closeFinishedPanes(agent: UUID, project: UUID) {
+    private func closeFinishedPanes(agent: UUID, project: UUID, scheduledOnly: Bool = false) {
         guard let store else { return }
-        for o in tasks where o.agentID == agent && o.projectID == project && o.status.isFinished {
+        for o in tasks where o.agentID == agent && o.projectID == project && o.status.isFinished
+                          && (!scheduledOnly || o.origin.kind == .schedule) {
             guard let pid = o.paneID, let wid = o.workspaceID, let (_, pane) = store.pane(pid, in: wid), pane.agentTaskID == o.id else { continue }
             store.closePane(pid, in: wid)
             AuditLog.record("session.closed", ["agent": o.agentName, "project": o.projectName, "session": o.sessionID ?? "", "why": "replaced"])

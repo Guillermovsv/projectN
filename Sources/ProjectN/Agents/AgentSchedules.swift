@@ -33,7 +33,11 @@ extension AgentHarness {
         let origin = TaskOrigin(kind: .schedule, slackChannel: target.isEmpty ? nil : target,
                                 scheduleID: s.id, scheduleName: s.name)
         AuditLog.record("schedule.run", ["agent": p.name, "schedule": s.name, "reason": reason])
-        if case .failure(let e) = submit(AgentTaskRequest(agentID: p.id, projectID: projectID, instruction: s.instruction, origin: origin)) {
+        // Each run starts its own session (README + the schedule's instruction): continuing one conversation made
+        // every run re-read all earlier runs and chats — an hourly agent reached 236k tokens per step in a day.
+        var request = AgentTaskRequest(agentID: p.id, projectID: projectID, instruction: s.instruction, origin: origin)
+        request.freshSession = true
+        if case .failure(let e) = submit(request) {
             AuditLog.record("schedule.failed", ["agent": p.name, "schedule": s.name, "reason": e.description])
             return e
         }

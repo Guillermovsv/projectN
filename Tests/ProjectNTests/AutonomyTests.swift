@@ -421,6 +421,12 @@ struct AutonomyTests {
         // Run Now from the editor.
         #expect(env.harness.runSchedule(env.harness.profile(pm.id)!.schedules[0], of: env.harness.profile(pm.id)!) == nil)
         #expect(env.harness.tasks.filter { $0.origin.kind == .schedule }.count == 2)
+        // Each run is a session of its own: it doesn't continue the previous run's conversation.
+        let second = try #require(env.harness.tasks.last { $0.origin.kind == .schedule })
+        #expect(second.resumedFromTaskID == nil && second.continuedSession != true)
+        // …and a conversation with the user doesn't continue a scheduled run's session either.
+        #expect(env.harness.projectSession(agent: env.harness.profile(pm.id)!, project: env.project.id, model: t.model) == nil)
+        env.harness.cancel(second.id)
     }
 
     // MARK: No threads (default) and agents as their own DMs
@@ -884,9 +890,13 @@ struct AutonomyTests {
                                                        "context": "El login de la tienda falla desde ayer; ver README de Tienda."]),
                                     ("project_info", ["project": "Demo"]),
                                     ("save_project_note", ["note": "Las tareas de Demo están en Notion: https://app.notion.com/p/x1"]),
-                                    ("save_project_note", ["note": "Las tareas de Demo están en Notion: https://app.notion.com/p/x1", "project": "Demo"])],
+                                    ("save_project_note", ["note": "Las tareas de Demo están en Notion: https://app.notion.com/p/x1", "project": "Demo"]),
+                                    ("project_notes", ["query": "notion tareas", "project": "Demo"]),
+                                    ("project_notes", ["query": "notion"])],
                                    task: pm.id, env: env)
-        #expect(tools.contains("project_info"))
+        #expect(tools.contains("project_info") && tools.contains("project_notes"))
+        #expect(r[5].contains("app.notion.com") && r[5].contains("x1") && r[5].contains("\"total_notes\":1"))
+        #expect(r[6].contains("pass `project`"))
         #expect(r[0].contains("Pass `project`"))
         #expect(r[1].contains("task_id"))
         #expect(env.harness.tasks.first { $0.origin.parentTaskID == pm.id }?.projectID == env.other.id)

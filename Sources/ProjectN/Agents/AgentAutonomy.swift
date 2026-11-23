@@ -412,8 +412,30 @@ extension AgentHarness {
                let text = try? String(contentsOfFile: (p.path as NSString).appendingPathComponent(readme), encoding: .utf8) {
                 d["readme_excerpt"] = text.count > 3000 ? String(text.prefix(3000)) + "\n[… read \(readme) for the rest]" : text
             }
-            let notes = AgentStore.projectNotes(p.id)
-            if !notes.isEmpty { d["project_notes"] = notes }
+            let found = AgentStore.searchProjectNotes(p.id, query: "", limit: 8, maxChars: 3000)
+            if !found.notes.isEmpty {
+                d["project_notes_newest"] = found.notes
+                if found.total > found.notes.count {
+                    d["project_notes_total"] = found.total
+                    d["note"] = "Only the newest notes: search the rest with project_notes(query, project)."
+                }
+            }
+            reply(Self.json(d), false)
+
+        case "project_notes":
+            var target = store?.project(t.projectID)
+            if let pname = a["project"] as? String, !pname.isEmpty {
+                guard let p = namedProject(pname, for: profile) else { reply("No project named “\(pname)” that you can access.", true); return }
+                target = p
+            }
+            guard let target, target.id != Store.coordinationProjectID else {
+                reply("You work outside the projects: pass `project`.", true); return
+            }
+            let query = (a["query"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            let found = AgentStore.searchProjectNotes(target.id, query: query)
+            var d: [String: Any] = ["project": target.name, "total_notes": found.total, "notes": found.notes]
+            if found.total == 0 { d["note"] = "This project has no notes yet." }
+            else if found.notes.isEmpty { d["note"] = "No note matches. Try other keywords, or none for the newest notes." }
             reply(Self.json(d), false)
 
         case "list_agents":
@@ -691,7 +713,10 @@ enum AgentTools {
              "inputSchema": ["type": "object", "properties": props, "required": required, "additionalProperties": false]]
         }
         let str: (String) -> [String: Any] = { ["type": "string", "description": $0] }
-        var tools = [tool("save_project_note", "Save one durable fact about this project for every agent that works on it: where tasks / docs live (Notion page or database links and IDs), site URLs, MCP server names, conventions, decisions. No secrets.",
+        var tools = [tool("project_notes", "Search the project's shared notes (facts other agents and the user saved: where tasks / docs / Sheets / Drive folders live, IDs, URLs, decisions). Use it when the README doesn't answer something. Without a query: the newest notes.",
+                          ["query": str("Keywords, e.g. \"sheet drive anuncios\". Notes matching more of them come first."),
+                           "project": str("Project name; default: your project.")], []),
+                     tool("save_project_note", "Save one durable fact about this project for every agent that works on it: where tasks / docs live (Notion page or database links and IDs), site URLs, MCP server names, conventions, decisions. Not a log of what you did or changed. No secrets.",
                           ["note": str("The fact, self-contained, with links / IDs."),
                            "project": str("Project name; default: your project (required for coordinators working outside projects).")], ["note"]),
                      tool("ask", "Ask whoever gave you this task (the coordinating agent or the user) a question you can't resolve yourself. Returns immediately: then end your turn with one short line. The answer arrives as your next message in this session.",
