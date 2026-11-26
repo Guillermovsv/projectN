@@ -111,6 +111,7 @@ struct AgentEditor: View {
     @State private var draft: AgentProfile
     @State private var contextText: String
     @State private var cliText: String
+    @State private var zoneText: String
     @State private var runSheet = false
     @State private var tab: EditorTab = .general
     @State private var editingSchedule: AgentSchedule?
@@ -146,6 +147,7 @@ struct AgentEditor: View {
         _draft = State(initialValue: profile)
         _contextText = State(initialValue: profile.contextSources.joined(separator: "\n"))
         _cliText = State(initialValue: profile.cliTools.joined(separator: ", "))
+        _zoneText = State(initialValue: profile.workZone.joined(separator: ", "))
         _tab = State(initialValue: initialTab)
     }
 
@@ -156,6 +158,8 @@ struct AgentEditor: View {
         var p = draft
         p.contextSources = contextText.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
         p.cliTools = cliText.split(whereSeparator: { $0 == "," || $0 == " " || $0 == "\n" }).map(String.init).filter { !$0.isEmpty }
+        p.workZone = zoneText.split(whereSeparator: { $0 == "," || $0 == "\n" })
+            .map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
         return p
     }
 
@@ -204,6 +208,7 @@ struct AgentEditor: View {
                     draft = original
                     contextText = original.contextSources.joined(separator: "\n")
                     cliText = original.cliTools.joined(separator: ", ")
+                    zoneText = original.workZone.joined(separator: ", ")
                 }.disabled(!dirty)
                 Button("Save") { agents.saveProfile(normalized) }
                     .keyboardShortcut("s", modifiers: .command)
@@ -353,6 +358,17 @@ struct AgentEditor: View {
             toolsSection
         } else {
             Section { Text("Codex limits tools through its sandbox, set by the access level.").font(.caption).foregroundStyle(.secondary) }
+        }
+        if draft.permission.canWrite {
+            Section {
+                TextField("Folders", text: $zoneText, prompt: Text("Whole project"))
+                Text(zoneText.trimmingCharacters(in: .whitespaces).isEmpty
+                     ? "Writes anywhere in the project. List folders (comma-separated, relative to the project) to keep it to them, e.g. .agentes, .worktrees."
+                     : "Only writes inside these folders of the project. Edits, redirects and copies anywhere else — other project files, /tmp, outside the project — are refused and it's told where to write.")
+                    .font(.caption).foregroundStyle(.secondary)
+            } header: {
+                Text("Work zone")
+            }
         }
         Section("Delegation") {
             Toggle("Can delegate to other agents", isOn: $draft.canDelegate)

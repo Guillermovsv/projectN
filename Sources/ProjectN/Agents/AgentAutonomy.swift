@@ -180,7 +180,8 @@ extension AgentHarness {
         let input = payload["tool_input"] as? [String: Any] ?? [:]
         let ctx = ApprovalPolicy.Context(permission: profile.permission, projectPath: project.path,
                                          cliTools: profile.cliTools, cwd: payload["cwd"] as? String, autonomy: profile.autonomy,
-                                         autoMode: profile.autoMode)
+                                         autoMode: profile.autoMode, workZone: profile.workZone,
+                                         ownBackground: backgroundCommands[t.id] ?? [])
         let tier = ApprovalPolicy.decide(tool: tool, input: input, ctx)
         let summary = Self.describe(tool: tool, input: input)
         switch tier {
@@ -190,6 +191,10 @@ extension AgentHarness {
             }
             rememberApproved(t.id, input: input, summary: summary)
             lastHookAllowed[t.id] = Date()
+            if tool == "Bash", let command = input["command"] as? String {
+                noteCommandFacts(command, runInBackground: input["run_in_background"] as? Bool == true,
+                                 cwd: payload["cwd"] as? String ?? project.path, task: t)
+            }
             noteProgress(t.id, tool == "Bash" ? ApprovalPolicy.clip(summary) : tool)
             reply(["decision": "allow", "reason": "Allowed by ProjectN policy (routine work in the project)."])
         case .deny(let why):
@@ -208,6 +213,10 @@ extension AgentHarness {
                 case .approved:
                     self.rememberApproved(t.id, input: input, summary: summary)
                     self.lastHookAllowed[t.id] = Date()
+                    if tool == "Bash", let command = input["command"] as? String {
+                        self.noteCommandFacts(command, runInBackground: input["run_in_background"] as? Bool == true,
+                                              cwd: payload["cwd"] as? String ?? project.path, task: t)
+                    }
                     reply(["decision": "allow", "reason": "Approved by \(r.decidedBy ?? "the user")" + (r.answer.map { ": \($0)" } ?? ".")])
                 case .expired:
                     reply(["decision": "deny", "reason": "No approval within the time limit, so ProjectN blocked it. Don't retry; report that it needs approval."])
@@ -604,6 +613,9 @@ extension AgentHarness {
                 }
             }
 
+        case _ where Self.deliveryToolNames.contains(name):
+            callDeliveryTool(name, a, task: t, profile: profile, reply: reply)
+
         case "cancel_task":
             guard let id = (a["task_id"] as? String).flatMap(UUID.init(uuidString:)), let c = task(id),
                   c.origin.parentTaskID == t.id else { reply("Unknown task_id (only your own delegated tasks).", true); return }
@@ -719,6 +731,25 @@ enum AgentTools {
                      tool("save_project_note", "Save one durable fact about this project for every agent that works on it: where tasks / docs live (Notion page or database links and IDs), site URLs, MCP server names, conventions, decisions. Not a log of what you did or changed. No secrets.",
                           ["note": str("The fact, self-contained, with links / IDs."),
                            "project": str("Project name; default: your project (required for coordinators working outside projects).")], ["note"]),
+                     tool("delivery_status", "This request's acceptance criteria, findings (problems agents passed to each other) and automatic cycle, as ProjectN keeps them.", [:], []),
+                     tool("criteria_set", "Set this request's acceptance criteria before doing the work: 1–8 observable results, each with how it is checked. Another agent checks them later. Can be refined until one is checked.",
+                          ["criteria": ["type": "array", "description": "The criteria.",
+                                        "items": ["type": "object", "additionalProperties": false, "required": ["text", "check"],
+                                                  "properties": ["id": str("Optional id (default C1, C2…)."),
+                                                                 "text": str("What must hold, observable (not a task)."),
+                                                                 "check": str("Exactly how it is checked: command, test, page and viewport, file.")]]]],
+                          ["criteria"]),
+                     tool("criterion_update", "Record whether a criterion is met, with evidence. Only for agents checking the work, not the one who did it.",
+                          ["id": str("Criterion id, e.g. C3."), "status": ["type": "string", "enum": ["met", "unmet"]],
+                           "evidence": str("The command / test output / file / screenshot path that shows it.")], ["id", "status", "evidence"]),
+                     tool("finding_open", "Report a problem so the agent fixing the work gets it (ProjectN routes it). Anchor it precisely.",
+                          ["text": str("What fails and what was expected."),
+                           "anchor": str("Where: `file:line`, `page: <selector> · <width×height> · <screenshot path>`, `document: <file> · <page/sheet/cell>` or `criterion Cn`."),
+                           "severity": str("Optional, e.g. P1 (worst) … P3."),
+                           "id": str("Optional id from a report (e.g. B20); default P1, P2…")], ["text", "anchor"]),
+                     tool("finding_update", "Move a finding on: `fixed` (you fixed it: give the commit), `closed` or `reopened` (you checked someone else's fix: give a note with the evidence).",
+                          ["id": str("Finding id."), "status": ["type": "string", "enum": ["fixed", "closed", "reopened"]],
+                           "commit": str("Commit hash with the fix (for fixed)."), "note": str("What you ran / saw.")], ["id", "status"]),
                      tool("ask", "Ask whoever gave you this task (the coordinating agent or the user) a question you can't resolve yourself. Returns immediately: then end your turn with one short line. The answer arrives as your next message in this session.",
                           ["question": str("Self-contained. One line of context, then the question(s) as a numbered list (1., 2.…); put choices under each as `- a) …`, `- b) …`.")], ["question"])]
         guard canDelegate else { return tools }
@@ -747,6 +778,12 @@ enum AgentTools {
                  ["task_id": str("Task to review."), "reviewer_agent": str("Reviewer agent name."), "instruction": str("What to check.")],
                  ["task_id", "reviewer_agent"]),
             tool("cancel_task", "Cancel one of your delegated tasks.", ["task_id": str("The task_id.")], ["task_id"]),
+            tool("start_cycle", "Hand this request to ProjectN's automatic cycle: open findings go to the fixer, fixed ones to the tester, then the verifier checks the criteria; repeats until every criterion is met or the rounds run out. Then you get one message with the outcome. End your turn after starting it.",
+                 ["fixer": str("Agent that fixes (e.g. the developer)."), "verifier": str("Agent that checks the criteria (not the fixer)."),
+                  "tester": str("Optional agent that retests fixed findings (default: the verifier)."),
+                  "project": str("Project name (required when you work outside the projects)."),
+                  "max_rounds": ["type": "integer", "description": "Fix rounds before it stops and reports (1–5, default 3)."]],
+                 ["fixer", "verifier"]),
             tool("create_project", "Create a new, empty project (folder + README) in the user's projects folder. Use it only when the work needs a project that doesn't exist yet.",
                  ["name": str("Project name; becomes the folder name (letters, numbers, spaces, - _ .)."),
                   "description": str("One or two sentences for the README.")], ["name"]),

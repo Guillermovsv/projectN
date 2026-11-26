@@ -37,6 +37,11 @@ enum ApprovalPolicy {
         var autonomy: AgentAutonomy = .balanced
         /// Auto mode: everything runs except deleting, admin/system changes and secrets (see AgentProfile.autoMode).
         var autoMode: Bool = false
+        /// Folders of the project (relative) the agent may write in; empty = the whole project. Writes elsewhere —
+        /// other project files, /tmp, anywhere outside — are refused with where to write instead.
+        var workZone: [String] = []
+        /// Commands this task started in the background: stopping them (pkill -f) doesn't ask.
+        var ownBackground: [String] = []
     }
 
     /// Applies the agent's autonomy to a verdict for a top-level decision (nobody coordinating it):
@@ -97,6 +102,7 @@ enum ApprovalPolicy {
             return .orchestrator("Wants to leave plan mode and start working")
         case "Edit", "Write", "MultiEdit", "NotebookEdit":
             guard ctx.permission.canWrite else { return .deny("\(roleLabel(ctx)) can't modify files. Give your findings as text instead.") }
+            if let path, !inZone(path, ctx) { return zoneDenial(path, ctx) }
             if let path, !inside(path, ctx) { return .user("Writes outside the project: \(path)" + (isProtected(path) || !inHome(path) ? " [protected]" : "")) }
             if tool == "Write", let path, input["content"] as? String == "" { return .user("Deletes the contents of \(path)") }
             return ctx.permission == .askBeforeChanges ? .user("Edits \(path.map(relative(ctx)) ?? "a file")") : .allow
@@ -165,8 +171,14 @@ enum ApprovalPolicy {
             }
             if inner.isEmpty { verdict = max(verdict, .orchestrator("Runs a command with substitutions: \(clip(trimmed))")) }
         }
+        // `cd dir && …`: later parts of the command run in that folder (relative paths are judged from there).
+        var local = ctx
         for segment in segments(trimmed) {
-            verdict = max(verdict, classifySegment(segment, ctx))
+            let words = Shell.split(segment)
+            if words.first == "cd", words.count >= 2, !words[1].hasPrefix("-") {
+                local.cwd = CommandFacts.resolve(words[1], local.cwd ?? ctx.projectPath)
+            }
+            verdict = max(verdict, classifySegment(segment, local))
             if case .deny = verdict { return verdict }
         }
         return verdict
@@ -319,8 +331,25 @@ enum ApprovalPolicy {
             if mutating { return .user("Sends data to a server: \(clipped)") }
             return .orchestrator("Downloads from the network: \(clipped)")
         }
+        // Stopping a process this task started itself (a test server it ran in the background).
+        if cmd == "pkill", let pattern = args.last(where: { !$0.hasPrefix("-") }), pattern.count >= 4,
+           ctx.ownBackground.contains(where: { $0.contains(pattern) }) {
+            return .allow
+        }
         if ["chmod", "chown", "chflags", "xattr", "launchctl", "crontab", "defaults", "security", "killall", "kill", "pkill", "shutdown", "reboot", "diskutil"].contains(cmd) {
             return .user("Changes system state: \(clipped)")
+        }
+
+        // ── Work zone: files a command creates or copies to ──────────────────────────────
+        if !ctx.workZone.isEmpty {
+            let plain = args.filter { !$0.hasPrefix("-") }
+            var targets: [String] = []
+            switch cmd {
+            case "tee", "mkdir", "touch": targets = plain
+            case "cp", "mv", "ln": if plain.count >= 2, let last = plain.last { targets = [last] }
+            default: break
+            }
+            for t in targets where !isDevice(t) && !inZone(t, ctx) { return zoneDenial(t, ctx) }
         }
 
         // ── Paths outside the project ────────────────────────────────────────────────
@@ -337,7 +366,9 @@ enum ApprovalPolicy {
         }
         if segment.range(of: #"(^|[^<>&0-9])>{1,2}\s*([^\s&|;]+)"#, options: .regularExpression) != nil {
             let targets = matches(#">{1,2}\s*([^\s&|;]+)"#, in: segment)
-            for t in targets where !t.hasPrefix("&") && !harmlessPath(t) {
+            for t in targets where !t.hasPrefix("&") && !isDevice(t) {
+                if !ctx.workZone.isEmpty, !inZone(t, ctx) { return zoneDenial(t, ctx) }
+                if harmlessPath(t) { continue }
                 if !inside(t, ctx) { return .user("Writes outside the project: \(t)" + (isProtected(t) || !inHome(t) ? " [protected]" : "")) }
                 if !ctx.permission.canWrite { return .deny("\(roleLabel(ctx)) can't write files (redirect to \(t)).") }
             }
@@ -365,6 +396,26 @@ enum ApprovalPolicy {
         let p = PathGuard.canonical(abs)
         return p == base || p.hasPrefix(base + "/")
     }
+
+    /// Inside the agent's work zone (always true when it has none).
+    static func inZone(_ path: String, _ ctx: Context) -> Bool {
+        guard !ctx.workZone.isEmpty else { return true }
+        let expanded = (path as NSString).expandingTildeInPath
+        let abs = PathGuard.canonical(expanded.hasPrefix("/") ? expanded : ((ctx.cwd ?? ctx.projectPath) as NSString).appendingPathComponent(expanded))
+        let base = PathGuard.canonical(ctx.projectPath)
+        return ctx.workZone.contains { z in
+            let rel = z.trimmingCharacters(in: CharacterSet(charactersIn: "/ "))
+            guard !rel.isEmpty, !rel.contains("..") else { return false }
+            let dir = PathGuard.canonical((base as NSString).appendingPathComponent(rel))
+            return abs == dir || abs.hasPrefix(dir + "/")
+        }
+    }
+
+    static func zoneDenial(_ path: String, _ ctx: Context) -> ApprovalTier {
+        .deny("\(path) is outside this agent's work zone. It may only write in: \(ctx.workZone.joined(separator: ", ")) (inside the project). Write the file there instead.")
+    }
+
+    static func isDevice(_ p: String) -> Bool { p.hasPrefix("/dev/") }
 
     /// Secrets and credentials outside the project: reading or writing them always asks you.
     static func isProtected(_ path: String) -> Bool {

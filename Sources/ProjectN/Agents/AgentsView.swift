@@ -141,6 +141,7 @@ struct AgentsSidebar: View {
 
             ScrollView {
                 VStack(alignment: .leading, spacing: 3) {
+                    deliveriesRow
                     HStack {
                         Text("AGENTS").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
                         Spacer()
@@ -166,9 +167,30 @@ struct AgentsSidebar: View {
         }
     }
 
+    /// Deliveries: requests several agents worked on, with their criteria, findings and cycle.
+    private var deliveriesRow: some View {
+        let all = agents.deliveries
+        let active = all.filter(\.isActive).count
+        return HStack(spacing: 10) {
+            Image(systemName: "shippingbox").font(.body).frame(width: 32, height: 32)
+                .background(Circle().fill(Color.primary.opacity(0.08)))
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Deliveries").font(.callout.weight(nav.showDeliveries ? .semibold : .medium))
+                Text(active > 0 ? "\(active) in progress" : all.isEmpty ? "None yet" : "\(all.count) requests")
+                    .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+            }
+            Spacer()
+        }
+        .padding(.horizontal, 8).padding(.vertical, 6)
+        .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(nav.showDeliveries ? Color.primary.opacity(0.1) : .clear))
+        .contentShape(Rectangle())
+        .onTapGesture { nav.showDeliveries = true }
+        .padding(.bottom, 4)
+    }
+
     private func agentRow(_ p: AgentProfile) -> some View {
         let (status, line) = agents.liveStatus(of: p)
-        let selected = nav.selectedAgentID == p.id
+        let selected = !nav.showDeliveries && nav.selectedAgentID == p.id
         let active = agents.tasks(of: p.id).filter { $0.status.isActive || $0.status == .queued }
         return VStack(alignment: .leading, spacing: 2) {
             HStack(spacing: 10) {
@@ -186,7 +208,7 @@ struct AgentsSidebar: View {
             .padding(.vertical, selected ? 9 : 6)
             .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(selected ? Color.primary.opacity(0.1) : .clear))
             .contentShape(Rectangle())
-            .onTapGesture { nav.selectedAgentID = p.id }
+            .onTapGesture { nav.showDeliveries = false; nav.selectedAgentID = p.id }
             .contextMenu {
                 Button("Edit Agent…") { openSettings(p.id) }
                 Button(p.enabled ? "Turn Off" : "Turn On") { var x = p; x.enabled.toggle(); agents.saveProfile(x) }
@@ -205,6 +227,7 @@ struct AgentsSidebar: View {
                 .padding(.vertical, 2)
                 .contentShape(Rectangle())
                 .onTapGesture {
+                    nav.showDeliveries = false
                     nav.selectedAgentID = p.id
                     nav.selectedTaskByAgent[p.id] = t.id
                 }
@@ -243,7 +266,9 @@ struct AgentsDetailView: View {
 
     var body: some View {
         Group {
-            if let id = nav.selectedAgentID, let p = agents.profile(id) {
+            if nav.showDeliveries {
+                DeliveriesPage()
+            } else if let id = nav.selectedAgentID, let p = agents.profile(id) {
                 AgentPage(profile: p)
             } else {
                 VStack(spacing: 12) {

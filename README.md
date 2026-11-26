@@ -156,6 +156,31 @@ The switch at the top of the sidebar (or ⌃⌘1 / ⌃⌘2) flips between **Work
 - **Center**: the selected agent — model, effort, access, status, ⚙︎ to edit — with its **conversations listed vertically**, like a chat history (*New chat* on top, then In progress · Today · Yesterday · Previous 7 days · Older; drag the edge to resize). A task shows its request, any approval waiting on you (Approve / Deny right there), and its live **terminal**, or its **result** once finished. The box at the bottom starts a **new task** in the project you pick, or — on a running task — sends your message into **that session**. ⌘↩ sends.
 - **Right**: the same Files · Activity · Browser panel; Files follows the selected task's project.
 
+### Deliveries
+
+**Deliveries**, at the top of the Agents sidebar, lists every request that several agents worked on (a coordinator delegating, or the automatic cycle below), newest first. A delivery shows:
+
+- **Who worked**: each task of the request — the coordinator's turns, the delegated tasks, the cycle's steps — with its start time, duration, a timeline bar and output tokens. Times and usage come from ProjectN's own task records, not from what agents write. Click a row to open that task in its agent's page.
+- **Criteria** and **findings** (below), with their status, evidence and history.
+- **Automatic cycle**: who fixes, retests and verifies, the round and why it stopped, if it did.
+- **Left behind**: the git worktrees agents created for the request (`git worktree add`, seen by the approval hook). *Clean Up Worktrees…* removes them (`git worktree remove --force`) after you confirm; branches and commits stay.
+
+Requests from before this version are grouped by their Slack thread.
+
+### Criteria, findings and the automatic cycle
+
+Agents keep the state of a request in ProjectN instead of in files, through these tools (every agent has them):
+
+| Tool | What it does |
+|---|---|
+| `criteria_set` | The request's acceptance criteria: 1–8 observable results, each with how it's checked. Can be refined until one is checked. |
+| `criterion_update` | `met` / `unmet` with the evidence (command, test output, file, screenshot). Not by the agent fixing the work. |
+| `finding_open` | A problem for whoever fixes the work, anchored to `file:line`, a page element and viewport, a document or a criterion. Report ids (B20) are kept; otherwise P1, P2… |
+| `finding_update` | `fixed` (with the commit) by whoever fixed it; `closed` / `reopened` (with a note) by someone else. |
+| `delivery_status` | The whole state: criteria, findings, cycle, worktrees. |
+
+Coordinators also get **`start_cycle(fixer, verifier, tester?, max_rounds?)`**. From then on ProjectN drives the request by itself, one step at a time: open or reopened findings go to the **fixer**; fixed ones to the **tester** (default: the verifier) to close or reopen; then the **verifier** checks every criterion and opens findings for what isn't met. It repeats until every criterion is met, or stops when the fix rounds run out (default 3) or agents stop updating anything. Steps run as delegated tasks of the coordinator (their progress shows in the same Slack thread), but their results aren't handed back one by one: the coordinator gets **one message when the cycle ends**, with criteria met, rounds and what's left, and tells you. The fixer can't verify or retest its own work, and can't mark criteria.
+
 ### Agents (Settings → Agents)
 
 Each profile has: name, role, provider (Anthropic / OpenAI / other compatible), runtime (Claude Code / Codex CLI), model, reasoning effort, instructions, allowed tools, access level, project access, context sources, session policy, concurrency limit, timeout and an on/off switch. Profiles can be created, edited, duplicated and deleted. A **Project Manager** profile (Claude Code, Opus 5.5, effort high, read-only, can delegate, all projects, README as context) is created on first launch.
@@ -188,6 +213,8 @@ Every tool call of a Claude Code agent passes ProjectN's approval hook (`pn-agen
 - **Questions go up**: any agent can call `ask`; it reaches the agent that delegated the task, or you (answer in the Slack thread). The session continues with the answer.
 - If Claude Code still shows its own prompt for a command ProjectN already approved, ProjectN confirms it (only that command).
 - Unanswered approvals expire as "no" (default 60 min). Read-only agents can't change files at all.
+- **Work zone** (Settings → Agents → Access): folders of the project an agent may write in, e.g. `.agentes, .worktrees` for a reviewer. Edits, redirects (`> file`), `tee`, `cp` / `mv` / `mkdir` / `touch` targets anywhere else — other project files, `/tmp`, outside the project — are refused, and the agent is told where to write. Empty = the whole project, as before. Relative paths after `cd dir && …` are judged from that folder.
+- **Its own processes**: `pkill -f <pattern>` doesn't ask when the pattern matches a command the same task started in the background (a test server it ran with `run_in_background` or `&`).
 - **New projects**: "Project Manager, crea el proyecto *Landing García* y …" in Slack creates the folder (with a README) in your projects folder, adds it to ProjectN and runs the task in it — you asked, so no extra confirmation. Agents that can delegate have `create_project`, which always asks you first. Folders are only created inside the projects folder (default: where most of your projects live; Settings → Agents → Autonomy), never overwritten.
 - **Per-agent MCP servers, CLI tools and API keys**: each profile picks servers from Settings → MCP Servers (only those are loaded — `--strict-mcp-config`), commands it may run without asking, and which stored API keys are in its environment.
 - Codex agents get their MCP servers but not the hook or delegation tools; they rely on Codex's sandbox and prompt in their pane.
@@ -277,7 +304,8 @@ Models must appear in the app's catalog; efforts must be supported by the select
   scrollback/    saved terminal output, restored on relaunch
   settings.json  app settings
   agents.json    agent profiles (no credentials)
-  agents/        task history, audit log, model list cache, handled Slack events
+  agents/        task history, audit log, model list cache, handled Slack events,
+                 deliveries/ (criteria, findings, cycle and worktrees of each request)
   integrations.json  Slack settings (tokens are in secrets.json)
   secrets.json   API keys and Slack tokens (file mode 0600, only your user can read it)
   mcp.json       MCP servers for every Claude & Codex session started here

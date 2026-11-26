@@ -39,6 +39,10 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
     @Published private(set) var policy: AgentPolicy
     /// Approvals and questions agents are waiting on (in memory: they can't outlive the processes waiting).
     @Published var requests: [AgentRequest] = []
+    /// Criteria, findings, cycle and worktrees of each request (delivery), by conversation id.
+    @Published var deliveryRecords: [UUID: DeliveryRecord] = DeliveryStore.loadAll()
+    /// Commands each task started in the background (a test server…): it may stop them without asking.
+    var backgroundCommands: [UUID: [String]] = [:]
 
     let bridge = AgentBridge()
     /// Secret per running task → task id. Only in memory and in that task's environment.
@@ -320,6 +324,7 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
                           model: resolution.model, effort: resolution.effort, permission: profile.permission)
         t.notes = resolution.notes
         t.dependsOn = request.dependsOn
+        if t.origin.conversationID == nil { t.origin.conversationID = t.id }
         if request.freshSession { t.skipRecap = true }
         if let parentID = request.origin.parentTaskID, let parent = task(parentID) {
             t.depth = parent.depth + 1
@@ -951,6 +956,8 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
                                     instruction: left.joined(separator: "\n\n"), origin: origin))
         }
         handBackToCoordinator(done)
+        backgroundCommands.removeValue(forKey: id)
+        advanceCycle(after: done)
         pump()
     }
 
@@ -1107,6 +1114,8 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
     /// not inside wait_for_tasks, which reports it anyway), else as a follow-up that answers the user.
     private func handBackToCoordinator(_ done: AgentTask) {
         guard let pid = done.origin.parentTaskID, let parent = task(pid) else { return }
+        // Steps of the automatic cycle: the cycle reports to the coordinator once, when it ends.
+        if done.cycleStep != nil { return }
         // Same account, same limit: waking the coordinator would only fail again (the user is told directly).
         if done.usageLimit == true, parent.runtime == done.runtime, !parent.status.isActive { return }
         let shownInSlack = done.status == .completed && done.origin.slackChannel != nil && done.origin.slackThreadTS != nil

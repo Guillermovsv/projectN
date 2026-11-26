@@ -216,6 +216,9 @@ struct AgentProfile: Codable, Identifiable, Hashable {
     /// The agent's own private Slack channel (created by ProjectN's app), and the name it was created with.
     var slackChannelID: String?
     var slackChannelName: String?
+    /// Folders inside the project (relative, e.g. ".agentes", ".worktrees") where this agent may write.
+    /// Empty = the whole project (as before). Enforced by the approval hook: writes elsewhere are refused.
+    var workZone: [String] = []
 
     /// The emoji actually used in Slack.
     var slackEmoji: String {
@@ -318,6 +321,7 @@ struct AgentProfile: Codable, Identifiable, Hashable {
         slackIcon = (try? c.decode(String.self, forKey: .slackIcon)) ?? ""
         slackChannelID = try? c.decode(String.self, forKey: .slackChannelID)
         slackChannelName = try? c.decode(String.self, forKey: .slackChannelName)
+        workZone = (try? c.decode([String].self, forKey: .workZone)) ?? []
     }
 
     /// The first profile created on a fresh install (section 6 of the spec).
@@ -358,6 +362,9 @@ struct TaskOrigin: Codable, Hashable {
     var scheduleName: String?
     /// Created by ProjectN itself (e.g. results of delegated tasks handed back to the coordinator): no "started" notice.
     var automatic: Bool?
+    /// The request this task belongs to (its delivery): the first task's id, carried by every delegated task and
+    /// follow-up. nil on tasks from before deliveries existed (they're grouped by Slack thread / root task).
+    var conversationID: UUID?
 
     static let local = TaskOrigin(kind: .local)
     /// How the request's author is named to the agent (no raw Slack member ids).
@@ -463,6 +470,9 @@ struct AgentTask: Codable, Identifiable, Hashable {
     var skipRecap: Bool?
     /// Digest of the project notes this session has seen (sent again when they change).
     var notesDigest: String?
+    /// Started by the automatic delivery cycle (fix / retest / verify): its result isn't handed back to the
+    /// coordinator one by one; the cycle reports when it ends.
+    var cycleStep: DeliveryCycle.Step?
     var duration: TimeInterval? { startedAt.map { (finishedAt ?? Date()).timeIntervalSince($0) } }
 }
 

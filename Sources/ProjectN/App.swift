@@ -113,6 +113,9 @@ final class NavigationModel: ObservableObject {
     }
     /// Task tab per agent (an id that matches no task = the new-task page).
     @Published var selectedTaskByAgent: [UUID: UUID] = [:]
+    /// Agents view shows Deliveries (requests agents worked on together) instead of one agent.
+    @Published var showDeliveries = false
+    @Published var selectedDeliveryID: UUID?
     /// Agent to show when Settings → Agents opens.
     @Published var focusAgentInSettings: UUID?
 
