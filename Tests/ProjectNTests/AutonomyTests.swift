@@ -866,6 +866,9 @@ struct AutonomyTests {
         pmProfile.worksOutsideProjects = true
         env.harness.saveProfile(pmProfile)
 
+        // Claude Code's config folder exists on a real Mac (trust is written into its .claude.json).
+        try FileManager.default.createDirectory(at: ClaudeTrust.configFile(env.store.settings).deletingLastPathComponent(),
+                                                withIntermediateDirectories: true)
         // No project named and none asked for: it goes to the coordination folder.
         env.slack.handle(event: ["type": "app_mention", "user": "U1", "channel": "C1", "ts": "4401.1",
                                  "text": "<@UBOT> Project Manager, qué hay pendiente esta semana SLOW"], eventID: "Ev4401.1")
@@ -882,6 +885,12 @@ struct AutonomyTests {
         #expect(args.contains("**Demo** — \(env.project.path) — - Arreglar login") && args.contains("**Tienda**"))
         #expect(!args.contains("<untrusted_file path=") && args.contains("--add-dir") && args.contains(env.other.path))
         #expect(args.contains("coordination folder, outside every project"))
+        // Every folder it adds is trusted first: a project added later doesn't stop it at "Adding a new directory".
+        let claudeJSON = (try? JSONSerialization.jsonObject(with: Data(contentsOf: ClaudeTrust.configFile(env.store.settings)))) as? [String: Any]
+        let trusted = (claudeJSON?["projects"] as? [String: [String: Any]]) ?? [:]
+        for p in [env.project.path, env.other.path] {
+            #expect(trusted[(p as NSString).standardizingPath]?["hasTrustDialogAccepted"] as? Bool == true)
+        }
 
         // Its tools need a project.
         let (tools, r) = await mcp([("delegate_task", ["agent": "Developer", "instruction": "Revisa el login",

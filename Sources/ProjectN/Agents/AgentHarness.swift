@@ -497,8 +497,12 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
             ClaudeTrust.accept(path: project.path, settings: store.settings)
             args += ["--append-system-prompt", PromptComposer.systemPrompt(profile: profile, project: project, capabilities: tools)]
             if project.id == Store.coordinationProjectID {
-                // Reads the projects it coordinates without Claude Code asking for each folder.
-                for p in coordinatedProjects(profile) { args += ["--add-dir", p.path] }
+                // Reads the projects it coordinates without Claude Code asking for each folder: each one is also
+                // marked trusted, or a project added since stops the session at "Adding a new directory… trust?".
+                for p in coordinatedProjects(profile) {
+                    ClaudeTrust.accept(path: p.path, settings: store.settings)
+                    args += ["--add-dir", p.path]
+                }
             }
             // Built-in tools for the access level (or the profile's own selection). MCP tools aren't affected.
             if let tools = AgentToolCatalog.claudeFlag(profile) { args += ["--tools", tools] }
