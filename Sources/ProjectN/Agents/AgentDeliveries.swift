@@ -22,7 +22,8 @@ extension AgentHarness {
 
     // MARK: Tools
 
-    static let deliveryToolNames: Set<String> = ["criteria_set", "criterion_update", "finding_open", "finding_update", "delivery_status", "start_cycle"]
+    static let deliveryToolNames: Set<String> = ["criteria_set", "criterion_update", "finding_open", "finding_update", "delivery_status",
+                                                 "start_cycle", "review_lists", "ship_pr", "stop_ship"]
 
     func callDeliveryTool(_ name: String, _ a: [String: Any], task t: AgentTask, profile: AgentProfile,
                           reply: @escaping (String, Bool) -> Void) {
@@ -72,6 +73,22 @@ extension AgentHarness {
             case "start_cycle":
                 guard depthAllowsDelegation(t, profile) else { reply("\(profile.name) can't delegate, so it can't start a cycle.", true); return }
                 reply(try startCycle(a, task: t, profile: profile), false)
+
+            case "review_lists":
+                let paths = (a["paths"] as? [String])?.filter { !$0.isEmpty }
+                let lists = reviewLists(delivery: id, projectID: t.projectID, paths: paths)
+                let where_ = store?.project(t.projectID).map { ReviewLists.folder(for: $0.path).path } ?? ""
+                reply(Self.json(["lists": lists.map { ["name": $0.name, "when": $0.patterns, "checklist": $0.text] },
+                                 "note": lists.isEmpty ? "No review list matches these files (lists live in \(where_))." : "Apply every point; open a finding for each one that fails."]), false)
+
+            case "ship_pr":
+                guard depthAllowsDelegation(t, profile) else { reply("\(profile.name) can't delegate, so it can't hand a PR to an agent.", true); return }
+                reply(try startShip(a, task: t, profile: profile), false)
+
+            case "stop_ship":
+                guard let s = deliveryRecords[id]?.ship, s.isLive else { reply("No PR is being taken to merge for this request.", true); return }
+                stopShip(id, reason: str("reason") ?? "Stopped by \(who)")
+                reply("Stopped watching PR #\(s.pr).", false)
 
             default:
                 reply("Unknown tool \(name).", true)
@@ -136,7 +153,7 @@ extension AgentHarness {
 
     /// A task ended: if it was a step of a running cycle, record what it means and launch the next step.
     func advanceCycle(after done: AgentTask) {
-        guard done.cycleStep != nil else { return }
+        guard let step = done.cycleStep, step != .ship else { return }
         let id = Delivery.key(done)
         guard let c = deliveryRecords[id]?.cycle, c.state == .running else { return }
         guard done.status == .completed else {
@@ -186,7 +203,12 @@ extension AgentHarness {
         origin.delegatedBy = "ProjectN (automatic cycle)"
         origin.automatic = nil
         origin.conversationID = id
-        let text = CycleInstructions.text(step, ids: ids, record: r)
+        var reviews: [ReviewList] = []
+        if step == .verify {
+            reviews = reviewLists(delivery: id, projectID: c.projectID)
+            if !reviews.isEmpty { mutateDelivery(id) { r in for n in reviews.map(\.name) where !r.reviewsApplied.contains(n) { r.reviewsApplied.append(n) } } }
+        }
+        let text = CycleInstructions.text(step, ids: ids, record: r, reviews: reviews)
         switch submit(AgentTaskRequest(agentID: agent.id, projectID: c.projectID, instruction: text, origin: origin)) {
         case .success(let child):
             update(child.id) { $0.cycleStep = step }

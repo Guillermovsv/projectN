@@ -181,7 +181,8 @@ extension AgentHarness {
         let ctx = ApprovalPolicy.Context(permission: profile.permission, projectPath: project.path,
                                          cliTools: profile.cliTools, cwd: payload["cwd"] as? String, autonomy: profile.autonomy,
                                          autoMode: profile.autoMode, workZone: profile.workZone,
-                                         ownBackground: backgroundCommands[t.id] ?? [])
+                                         ownBackground: backgroundCommands[t.id] ?? [],
+                                         pushBranches: pushableBranches(for: t))
         let tier = ApprovalPolicy.decide(tool: tool, input: input, ctx)
         let summary = Self.describe(tool: tool, input: input)
         switch tier {
@@ -308,6 +309,7 @@ extension AgentHarness {
         AuditLog.record("request.\(r.status.rawValue)", ["request": r.id.uuidString, "agent": r.agentName, "by": r.decidedBy ?? "",
                                                          "summary": r.summary, "answer": r.answer ?? ""])
         for w in requestWaiters.removeValue(forKey: r.id) ?? [] { w(r) }
+        rememberDecision(r)
         if let t = task(r.taskID) {
             if !t.status.isFinished, !requests.contains(where: { $0.taskID == t.id && $0.isPending }) { setStatus(t.id, .running) }
             emitEvent(task(r.taskID) ?? t, .requestResolved(r))
@@ -408,6 +410,7 @@ extension AgentHarness {
                 reply("You work outside the projects: pass `project` (the project the fact is about).", true); return
             }
             let added = AgentStore.addProjectNote(target.id, note, by: t.agentName)
+            if added { noteDecisionSaved(note, task: t) }
             AuditLog.record("project.note", ["agent": t.agentName, "project": target.name, "note": note])
             reply(added ? "Saved. Every agent working on \(target.name) gets it from now on." : "Already in the project notes.", false)
 
@@ -750,6 +753,8 @@ enum AgentTools {
                      tool("finding_update", "Move a finding on: `fixed` (you fixed it: give the commit), `closed` or `reopened` (you checked someone else's fix: give a note with the evidence).",
                           ["id": str("Finding id."), "status": ["type": "string", "enum": ["fixed", "closed", "reopened"]],
                            "commit": str("Commit hash with the fix (for fixed)."), "note": str("What you ran / saw.")], ["id", "status"]),
+                     tool("review_lists", "The project's review lists (what to check when certain files change) that apply to this request's changes, or to the paths you give.",
+                          ["paths": ["type": "array", "items": ["type": "string"], "description": "Changed files (relative); default: what changed in this request's worktrees."]], []),
                      tool("ask", "Ask whoever gave you this task (the coordinating agent or the user) a question you can't resolve yourself. Returns immediately: then end your turn with one short line. The answer arrives as your next message in this session.",
                           ["question": str("Self-contained. One line of context, then the question(s) as a numbered list (1., 2.…); put choices under each as `- a) …`, `- b) …`.")], ["question"])]
         guard canDelegate else { return tools }
@@ -784,6 +789,12 @@ enum AgentTools {
                   "project": str("Project name (required when you work outside the projects)."),
                   "max_rounds": ["type": "integer", "description": "Fix rounds before it stops and reports (1–5, default 3)."]],
                  ["fixer", "verifier"]),
+            tool("ship_pr", "Hand this request's pull request to an agent until it's ready to merge: ProjectN reads it every 2 min and gives the agent a task whenever checks fail, it conflicts with the base or reviewers comment (it may push to that PR's branch without asking). You get a message when it's ready, merged, closed or stuck. Merging is the user's.",
+                 ["pr": str("PR number or URL."), "agent": str("Agent that fixes it (e.g. the developer)."),
+                  "project": str("Project name (required when you work outside the projects)."),
+                  "max_fixes": ["type": "integer", "description": "Fix tasks before it stops and reports (1–10, default 5)."]],
+                 ["pr", "agent"]),
+            tool("stop_ship", "Stop taking this request's pull request to merge.", ["reason": str("Why.")], []),
             tool("create_project", "Create a new, empty project (folder + README) in the user's projects folder. Use it only when the work needs a project that doesn't exist yet.",
                  ["name": str("Project name; becomes the folder name (letters, numbers, spaces, - _ .)."),
                   "description": str("One or two sentences for the README.")], ["name"]),

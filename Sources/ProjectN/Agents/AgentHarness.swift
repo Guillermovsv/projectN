@@ -43,6 +43,11 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
     @Published var deliveryRecords: [UUID: DeliveryRecord] = DeliveryStore.loadAll()
     /// Commands each task started in the background (a test server…): it may stop them without asking.
     var backgroundCommands: [UUID: [String]] = [:]
+    /// Until merge: PR checks in flight, how often a PR is read, when waiting counts as stuck; tests replace gh.
+    var shipChecking: Set<UUID> = []
+    var shipInterval: TimeInterval = 120
+    var shipStuckAfter: TimeInterval = 45 * 60
+    var shipFetcher: ((String) -> (out: String, code: Int32))?
 
     let bridge = AgentBridge()
     /// Secret per running task → task id. Only in memory and in that task's environment.
@@ -648,6 +653,7 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
         guard let store else { return }
         expireRequests()
         remindPendingRequests()
+        shipTick()
         if Date().timeIntervalSince(lastScheduleCheck) >= 30 {
             lastScheduleCheck = Date()
             runDueSchedules()
@@ -958,6 +964,7 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
         handBackToCoordinator(done)
         backgroundCommands.removeValue(forKey: id)
         advanceCycle(after: done)
+        shipStepFinished(done)
         pump()
     }
 

@@ -345,3 +345,195 @@ struct DeliveryCycleTests {
         #expect(await hook("Bash", ["command": "pkill -f 'servidor-prueba.mjs 18517'"], task: t.id, env: env).hasPrefix("allow"))
     }
 }
+
+/// Until merge, review lists and decisions: the pure parts.
+struct ShipAndReviewRuleTests {
+    static let failingJSON = #"{"state":"OPEN","mergeable":"MERGEABLE","reviewDecision":"REVIEW_REQUIRED","headRefName":"seguridad/webhook-workos","url":"https://github.com/o/r/pull/117","statusCheckRollup":[{"__typename":"CheckRun","name":"pruebas","status":"COMPLETED","conclusion":"SUCCESS"},{"__typename":"CheckRun","name":"saas","status":"COMPLETED","conclusion":"FAILURE"},{"__typename":"StatusContext","context":"coolify","state":"PENDING"}],"comments":[{"body":"x"}],"reviews":[{"state":"COMMENTED","body":""},{"state":"CHANGES_REQUESTED","body":"cambia esto"}]}"#
+
+    @Test func readsThePullRequest() throws {
+        let s = try #require(PRSnapshot.parse(Self.failingJSON))
+        #expect(s.state == "OPEN" && s.branch == "seguridad/webhook-workos" && s.failing == ["saas"] && s.pending == ["coolify"])
+        #expect(s.passed == 1 && s.comments == 2)
+        #expect(ShipWatch.prNumber("https://github.com/o/r/pull/117") == 117 && ShipWatch.prNumber("#42") == 42 && ShipWatch.prNumber("x") == nil)
+    }
+
+    @Test func decidesWhatTheWatchDoes() throws {
+        var w = ShipWatch(pr: 117, agent: "Developer", projectID: UUID(), coordinatorTaskID: UUID())
+        var s = try #require(PRSnapshot.parse(Self.failingJSON))
+        w.seenComments = 2
+        #expect(w.evaluate(s) == .fix(["Failing checks: saas"]))
+        s.failing = []; s.mergeable = "CONFLICTING"
+        #expect(w.evaluate(s) == .fix(["The branch conflicts with the base branch"]))
+        s.mergeable = "MERGEABLE"; s.comments = 3
+        if case .fix(let r) = w.evaluate(s) { #expect(r.first?.contains("1 new review comment") == true) } else { Issue.record("expected fix") }
+        w.seenComments = 3
+        #expect(w.evaluate(s) == .wait("Checks running: coolify"))
+        s.pending = []
+        if case .ready(let why) = w.evaluate(s) { #expect(why.contains("waiting for a reviewer")) } else { Issue.record("expected ready") }
+        s.reviewDecision = "APPROVED"
+        if case .ready(let why) = w.evaluate(s) { #expect(why.contains("ready to merge")) } else { Issue.record("expected ready") }
+        s.failing = ["saas"]; w.fixes = 5
+        if case .stop = w.evaluate(s) {} else { Issue.record("expected stop") }
+        s.state = "MERGED"
+        #expect(w.evaluate(s) == .merged)
+    }
+
+    @Test func pushesOnlyToThePRBranchWithoutForce() {
+        let b = ["seguridad/webhook-workos"]
+        #expect(ShipWatch.pushAllowed(args: ["origin", "HEAD:seguridad/webhook-workos"], branches: b))
+        #expect(ShipWatch.pushAllowed(args: ["origin", "seguridad/webhook-workos"], branches: b))
+        #expect(ShipWatch.pushAllowed(args: ["origin", "HEAD:refs/heads/seguridad/webhook-workos"], branches: b))
+        #expect(!ShipWatch.pushAllowed(args: ["--force", "origin", "HEAD:seguridad/webhook-workos"], branches: b))
+        #expect(!ShipWatch.pushAllowed(args: ["origin", "+HEAD:seguridad/webhook-workos"], branches: b))
+        #expect(!ShipWatch.pushAllowed(args: ["origin", "HEAD:main"], branches: b))
+        #expect(!ShipWatch.pushAllowed(args: ["upstream", "HEAD:seguridad/webhook-workos"], branches: b))
+        #expect(!ShipWatch.pushAllowed(args: [], branches: b))
+        #expect(!ShipWatch.pushAllowed(args: ["origin", "HEAD:seguridad/webhook-workos"], branches: []))
+        let ctx = ApprovalPolicy.Context(permission: .editProject, projectPath: "/p", cwd: "/p", pushBranches: b)
+        #expect(ApprovalPolicy.decide(tool: "Bash", input: ["command": "git push origin HEAD:seguridad/webhook-workos"], ctx) == .allow)
+        if case .user = ApprovalPolicy.decide(tool: "Bash", input: ["command": "git push origin HEAD:main"], ctx) {} else { Issue.record("expected user") }
+        if case .user = ApprovalPolicy.decide(tool: "Bash", input: ["command": "git push -f origin HEAD:seguridad/webhook-workos"], ctx) {} else { Issue.record("expected user") }
+    }
+
+    @Test func reviewListsMatchChangedFiles() {
+        #expect(ReviewLists.glob("saas/src/**", matches: "saas/src/rutas/avisos.ts"))
+        #expect(ReviewLists.glob("**/*.sql", matches: "saas/migraciones/006.sql") && ReviewLists.glob("**/*.sql", matches: "a.sql"))
+        #expect(!ReviewLists.glob("saas/src/*", matches: "saas/src/rutas/avisos.ts"))
+        #expect(ReviewLists.glob("app/web/js/motor/", matches: "app/web/js/motor/aashto.js"))
+        let seg = ReviewLists.parse(name: "seguridad-saas", "when: saas/src/**, saas/migraciones/**\n- Concurrencia\n- Reintentos")
+        let calc = ReviewLists.parse(name: "calculo", "cuando: app/web/js/motor/**\n- Cita la fuente")
+        let always = ReviewLists.parse(name: "general", "- CHANGELOG")
+        #expect(seg.patterns.count == 2 && seg.text == "- Concurrencia\n- Reintentos" && always.patterns.isEmpty)
+        #expect(ReviewLists.matching([seg, calc, always], changed: ["saas/src/rutas/avisos-identidad.ts"]).map(\.name) == ["seguridad-saas", "general"])
+        #expect(ReviewLists.instructionBlock([seg]).contains("### seguridad-saas"))
+    }
+}
+
+/// Until merge and decisions through the harness (gh replaced by canned answers).
+@Suite(.serialized)
+@MainActor
+struct ShipAndDecisionTests {
+    typealias Env = AgentHarnessTests.Env
+
+    private func waitUntil(_ seconds: Double = 20, line: Int = #line, _ condition: () -> Bool) async throws {
+        let deadline = Date().addingTimeInterval(seconds)
+        while !condition(), Date() < deadline { try await Task.sleep(for: .milliseconds(50)) }
+        #expect(condition(), "waited at line \(line)")
+    }
+
+    private func mcp(_ calls: [(String, [String: Any])], task: UUID, env: Env) async -> [String] {
+        var lines = [#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}"#,
+                     #"{"jsonrpc":"2.0","method":"notifications/initialized"}"#]
+        for (i, c) in calls.enumerated() {
+            let msg: [String: Any] = ["jsonrpc": "2.0", "id": i + 2, "method": "tools/call", "params": ["name": c.0, "arguments": c.1]]
+            lines.append(String(data: try! JSONSerialization.data(withJSONObject: msg), encoding: .utf8)!)
+        }
+        let out = FileManager.default.temporaryDirectory.appendingPathComponent("pn-out-\(UUID()).txt")
+        FileManager.default.createFile(atPath: out.path, contents: nil)
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: TestHome.helper)
+        p.arguments = ["mcp"]
+        var e = ProcessInfo.processInfo.environment
+        e["PROJECTN_AGENT_PORT"] = String(env.harness.bridge.port ?? 0)
+        e["PROJECTN_AGENT_TOKEN"] = env.harness.tokenOfTask[task] ?? ""
+        p.environment = e
+        let inPipe = Pipe()
+        p.standardInput = inPipe
+        p.standardOutput = try? FileHandle(forWritingTo: out)
+        let text: String = await withCheckedContinuation { cont in
+            p.terminationHandler = { _ in cont.resume(returning: (try? String(contentsOf: out, encoding: .utf8)) ?? "") }
+            try? p.run()
+            inPipe.fileHandleForWriting.write(Data((lines.joined(separator: "\n") + "\n").utf8))
+            try? inPipe.fileHandleForWriting.close()
+        }
+        return text.split(separator: "\n").compactMap { line in
+            ((try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any])?["result"] as? [String: Any])
+                .flatMap { ($0["content"] as? [[String: Any]])?.first?["text"] as? String }
+        }
+    }
+
+    /// Canned `gh pr view` answers, switched by the test (read off the main thread).
+    final class FakeGH: @unchecked Sendable {
+        private let lock = NSLock()
+        /// Answers in order; the last one repeats.
+        var answers: [String] = []
+        private(set) var calls = 0
+        func run(_ cmd: String) -> (out: String, code: Int32) {
+            lock.withLock {
+                calls += 1
+                return (answers.count > 1 ? answers.removeFirst() : (answers.first ?? ""), 0)
+            }
+        }
+    }
+
+    private func start(_ ts: String) async throws -> (Env, AgentTask) {
+        let env = try await AgentHarnessTests.makeSharedEnv()
+        var dev = AgentProfile(name: "Developer", role: "Developer", model: "claude-opus-5-5", instructions: "Code.")
+        dev.permission = .editProject; dev.allProjects = true; dev.concurrencyLimit = 3
+        env.harness.saveProfile(dev)
+        env.slack.handle(event: ["type": "app_mention", "user": "U1", "channel": "C1", "ts": ts,
+                                 "text": "<@UBOT> Project Manager, coordina el trabajo en Demo SLOW"], eventID: "Ev\(ts)")
+        let pm = try #require(env.harness.tasks.last)
+        try await waitUntil { env.harness.task(pm.id)?.status == .running }
+        return (env, pm)
+    }
+
+    @Test func failingChecksGoToTheAgentThenReadyIsReported() async throws {
+        let (env, pm) = try await start("9500.1")
+        defer { env.store.terminateAll(); env.harness.shipFetcher = nil; env.harness.shipInterval = 120 }
+        let gh = FakeGH()
+        let green = ShipAndReviewRuleTests.failingJSON
+            .replacingOccurrences(of: "\"FAILURE\"", with: "\"SUCCESS\"").replacingOccurrences(of: "\"PENDING\"", with: "\"SUCCESS\"")
+        gh.answers = [ShipAndReviewRuleTests.failingJSON, green]
+        env.harness.shipFetcher = { gh.run($0) }
+        env.harness.shipInterval = 0.3
+
+        let r = await mcp([("ship_pr", ["pr": "https://github.com/o/r/pull/117", "agent": "Developer"])], task: pm.id, env: env)
+        #expect(r.first?.contains("\"watching\":\"PR #117\"") == true)
+        // The failing check → a fix task for the developer, who may push to the PR branch only.
+        try await waitUntil { env.harness.tasks.contains { $0.cycleStep == .ship } }
+        let fix = try #require(env.harness.tasks.first { $0.cycleStep == .ship })
+        #expect(fix.agentName == "Developer" && fix.instruction.contains("Failing checks: saas")
+                && fix.instruction.contains("git push origin HEAD:seguridad/webhook-workos"))
+        #expect(env.harness.deliveryRecords[pm.id]?.ship?.branch == "seguridad/webhook-workos")
+
+        // After the fix everything is green: ready, reported once to the coordinator; merging stays with the user.
+        try await waitUntil { env.harness.deliveryRecords[pm.id]?.ship?.state == .ready }
+        try await waitUntil { ((env.harness.task(pm.id)?.inbox ?? []) + (env.harness.task(pm.id)?.followUps ?? [])).contains { $0.contains("Until merge: PR #117 — ready") } }
+        #expect(env.harness.tasks.filter { $0.cycleStep == .ship }.count == 1)
+        // Stop from the Deliveries view.
+        env.harness.stopShip(pm.id, reason: "test")
+        #expect(env.harness.deliveryRecords[pm.id]?.ship?.state == .stopped)
+    }
+
+    @Test func yourAnswerToAQuestionIsSavedAsADecision() async throws {
+        let (env, _) = try await start("9600.1")
+        defer { env.store.terminateAll() }
+        let dev = try #require(env.harness.profiles.first { $0.name == "Developer" })
+        let t = try env.harness.submit(.init(agentID: dev.id, projectID: env.project.id, instruction: "SLOW csv", origin: .local)).get()
+        try await waitUntil { env.harness.task(t.id)?.status == .running }
+        _ = await mcp([("ask", ["question": "¿Qué formato de fecha uso en el CSV?"])], task: t.id, env: env)
+        let q = try #require(env.harness.pendingUserRequests().first { $0.taskID == t.id })
+        env.harness.resolveRequest(q.id, answer: "dd/mm/aaaa, como en pantalla", by: "U1")
+        let notes = AgentStore.projectNotes(env.project.id)
+        #expect(notes.contains("Decisión") && notes.contains("formato de fecha") && notes.contains("dd/mm/aaaa"))
+        #expect(env.harness.deliveryRecords[Delivery.key(t)]?.decisions.count == 1)
+    }
+
+    @Test func theVerifierGetsTheProjectsReviewLists() async throws {
+        let (env, pm) = try await start("9700.1")
+        defer { env.store.terminateAll() }
+        var ver = AgentProfile(name: "Verificador", role: "QA", model: "claude-opus-5-5", instructions: "Verify.")
+        ver.permission = .editProject; ver.allProjects = true
+        env.harness.saveProfile(ver)
+        let dir = ReviewLists.folder(for: env.project.path)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try "- Concurrencia: lo que se cuenta es correcto en paralelo".write(to: dir.appendingPathComponent("seguridad.md"), atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        _ = await mcp([("start_cycle", ["fixer": "Developer", "verifier": "Verificador"])], task: pm.id, env: env)
+        try await waitUntil { env.harness.tasks.contains { $0.cycleStep == .verify } }
+        let v = try #require(env.harness.tasks.first { $0.cycleStep == .verify })
+        #expect(v.instruction.contains("### seguridad") && v.instruction.contains("Concurrencia"))
+        #expect(env.harness.deliveryRecords[pm.id]?.reviewsApplied == ["seguridad"])
+    }
+}

@@ -181,6 +181,25 @@ Agents keep the state of a request in ProjectN instead of in files, through thes
 
 Coordinators also get **`start_cycle(fixer, verifier, tester?, max_rounds?)`**. From then on ProjectN drives the request by itself, one step at a time: open or reopened findings go to the **fixer**; fixed ones to the **tester** (default: the verifier) to close or reopen; then the **verifier** checks every criterion and opens findings for what isn't met. It repeats until every criterion is met, or stops when the fix rounds run out (default 3) or agents stop updating anything. Steps run as delegated tasks of the coordinator (their progress shows in the same Slack thread), but their results aren't handed back one by one: the coordinator gets **one message when the cycle ends**, with criteria met, rounds and what's left, and tells you. The fixer can't verify or retest its own work, and can't mark criteria.
 
+### Until merge
+
+After you accept a delivery, a coordinator can hand its pull request to an agent with **`ship_pr(pr, agent)`**. ProjectN reads the PR with `gh pr view` every 2 minutes and, whenever **checks fail**, the branch **conflicts** with its base or **new review comments** arrive, gives the agent a task with what to fix (how to read the failed logs and the comments). For that PR the agent may push to its branch without asking — only `git push origin HEAD:<branch>`, never a force-push or another branch. When checks are green, it merges cleanly and nothing new is pending, the coordinator is told it's **ready** (and tells you); the merge is yours. Checks pending for 45 minutes are reported as **stuck**; after 5 fix tasks (`max_fixes`) it stops and reports. *Stop* in the delivery (or `stop_ship`) ends it. Deliveries shows the PR's state, status and every step.
+
+### Review lists
+
+What to check whenever certain files change, written once per project and given to the verifier every time:
+
+```
+~/.projectn/reviews/<project folder name>/<name>.md    one project (e.g. reviews/pavirigido/seguridad-saas.md)
+~/.projectn/reviews/_all/<name>.md                     every project
+```
+
+The first line may say which files trigger it — `when: saas/src/**, saas/migraciones/**` (`cuando:` works too; `**` = any folders, `*` = anything but `/`); without it the list always applies. The rest is the checklist. The cycle's verify step gets the lists that match what changed in the request's worktrees, with the instruction to open a finding for every point that fails; any agent can ask for them with `review_lists`. Deliveries shows which lists were applied.
+
+### Decisions
+
+When you answer an agent's question (`ask`), the question and your answer are saved as a project note starting with *Decisión*, so every agent working on the project finds it later (`project_notes`), and the delivery lists it. Notes agents save that start with *Decisión* / *Decision* are listed too.
+
 ### Agents (Settings → Agents)
 
 Each profile has: name, role, provider (Anthropic / OpenAI / other compatible), runtime (Claude Code / Codex CLI), model, reasoning effort, instructions, allowed tools, access level, project access, context sources, session policy, concurrency limit, timeout and an on/off switch. Profiles can be created, edited, duplicated and deleted. A **Project Manager** profile (Claude Code, Opus 5.5, effort high, read-only, can delegate, all projects, README as context) is created on first launch.

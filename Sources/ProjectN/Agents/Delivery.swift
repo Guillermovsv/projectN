@@ -49,7 +49,7 @@ struct DeliveryFinding: Codable, Hashable, Identifiable {
 /// The automatic cycle: findings go to the fixer, fixed ones to the tester, then the verifier checks the criteria.
 struct DeliveryCycle: Codable, Hashable {
     enum State: String, Codable { case running, done, stopped }
-    enum Step: String, Codable { case fix, retest, verify }
+    enum Step: String, Codable { case fix, retest, verify, ship }
     var fixer: String
     var tester: String?
     var verifier: String
@@ -77,11 +77,16 @@ struct DeliveryRecord: Codable, Hashable, Identifiable {
     var cycle: DeliveryCycle?
     /// Absolute paths of git worktrees agents created for this request (`git worktree add`).
     var worktrees: [String] = []
+    /// Its pull request being taken to merge-ready (DeliveryShip.swift).
+    var ship: ShipWatch?
+    /// Review lists given to the verifier (names), and decisions taken during the request.
+    var reviewsApplied: [String] = []
+    var decisions: [String] = []
     var updatedAt = Date()
 
     var criteriaMet: Int { criteria.filter { $0.status == .met }.count }
     var openFindings: [DeliveryFinding] { findings.filter { $0.status != .closed } }
-    var isEmpty: Bool { criteria.isEmpty && findings.isEmpty && cycle == nil && worktrees.isEmpty }
+    var isEmpty: Bool { criteria.isEmpty && findings.isEmpty && cycle == nil && worktrees.isEmpty && ship == nil && decisions.isEmpty }
 
     init(id: UUID) { self.id = id }
     init(from decoder: Decoder) throws {
@@ -91,6 +96,9 @@ struct DeliveryRecord: Codable, Hashable, Identifiable {
         findings = (try? c.decode([DeliveryFinding].self, forKey: .findings)) ?? []
         cycle = try? c.decode(DeliveryCycle.self, forKey: .cycle)
         worktrees = (try? c.decode([String].self, forKey: .worktrees)) ?? []
+        ship = try? c.decode(ShipWatch.self, forKey: .ship)
+        reviewsApplied = (try? c.decode([String].self, forKey: .reviewsApplied)) ?? []
+        decisions = (try? c.decode([String].self, forKey: .decisions)) ?? []
         updatedAt = (try? c.decode(Date.self, forKey: .updatedAt)) ?? Date()
     }
 }
@@ -252,6 +260,8 @@ extension DeliveryRecord {
                           "fixer": c.fixer, "tester": c.tester ?? "", "verifier": c.verifier, "stop_reason": c.stopReason ?? ""]
         }
         if !worktrees.isEmpty { d["worktrees"] = worktrees }
+        if let s = ship { d["until_merge"] = ["pr": s.pr, "state": s.state.rawValue, "status": s.status, "fixes": s.fixes] }
+        if !decisions.isEmpty { d["decisions"] = decisions }
         return d
     }
 
@@ -273,7 +283,7 @@ extension DeliveryRecord {
 // MARK: - Step instructions
 
 enum CycleInstructions {
-    static func text(_ step: DeliveryCycle.Step, ids: [String], record: DeliveryRecord) -> String {
+    static func text(_ step: DeliveryCycle.Step, ids: [String], record: DeliveryRecord, reviews: [ReviewList] = []) -> String {
         let list = record.findings.filter { ids.contains($0.id) }
             .map { "- \($0.id)\($0.severity.map { " [\($0)]" } ?? ""): \($0.text) — \($0.anchor)\($0.history.last?.note.map { " (last note: \($0))" } ?? "")" }
             .joined(separator: "\n")
@@ -306,7 +316,9 @@ enum CycleInstructions {
             For every criterion that isn't met, open a finding (finding_open) with an anchor, so it gets fixed.
             Close (or reopen) findings marked fixed that you checked. Don't change code.
             When everything is met, write the delivery summary in your answer, in the user's language.
-            """
+            """ + ReviewLists.instructionBlock(reviews)
+        case .ship:
+            return ""
         }
     }
 }

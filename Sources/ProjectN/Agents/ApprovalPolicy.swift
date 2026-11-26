@@ -42,6 +42,8 @@ enum ApprovalPolicy {
         var workZone: [String] = []
         /// Commands this task started in the background: stopping them (pkill -f) doesn't ask.
         var ownBackground: [String] = []
+        /// Branches it may push to without asking (a PR it's taking to merge): `git push origin HEAD:<branch>`.
+        var pushBranches: [String] = []
     }
 
     /// Applies the agent's autonomy to a verdict for a top-level decision (nobody coordinating it):
@@ -311,7 +313,10 @@ enum ApprovalPolicy {
         }
 
         // ── Publishing / deploying / sending: always you ──────────────────────────────
-        if cmd == "git", sub == "push" { return .user("Pushes to a remote: \(clipped)") }
+        if cmd == "git", sub == "push" {
+            if ShipWatch.pushAllowed(args: Array(args.drop(while: { $0 != "push" }).dropFirst()), branches: ctx.pushBranches) { return .allow }
+            return .user("Pushes to a remote: \(clipped)")
+        }
         if ["npm", "pnpm", "yarn", "bun", "cargo", "gem", "twine", "poetry"].contains(cmd), sub == "publish" || sub == "upload" { return .user("Publishes a package: \(clipped)") }
         if cmd == "gh", ["release", "pr", "repo", "workflow", "secret", "api"].contains(sub), !argsLower.contains(where: { ["list", "view", "status", "diff", "checks"].contains($0) }) {
             return .user("Changes GitHub: \(clipped)")

@@ -110,7 +110,7 @@ enum DeliveryText {
     }
 
     static func state(_ d: Delivery) -> (Color, String) {
-        if d.isActive { return (.green, "circle.fill") }
+        if d.isActive || d.record?.ship?.isLive == true { return (.green, "circle.fill") }
         if d.record?.cycle?.state == .stopped { return (.orange, "exclamationmark.circle.fill") }
         if let r = d.record, !r.criteria.isEmpty, r.criteriaMet < r.criteria.count { return (.orange, "circle.lefthalf.filled") }
         if d.tasks.contains(where: { $0.status != .completed }) { return (.red, "xmark.circle.fill") }
@@ -150,6 +150,9 @@ private struct DeliveryDetail: View {
                 if let r = delivery.record, !r.criteria.isEmpty { criteria(r) }
                 if let r = delivery.record, !r.findings.isEmpty { findings(r) }
                 if let c = delivery.record?.cycle { cycle(c) }
+                if let w = delivery.record?.ship { ship(w) }
+                if let r = delivery.record, !r.reviewsApplied.isEmpty { reviews(r) }
+                if let r = delivery.record, !r.decisions.isEmpty { decisions(r) }
                 leftBehind
             }
             .padding(18)
@@ -317,6 +320,55 @@ private struct DeliveryDetail: View {
                     Text("Round \(c.round) of \(c.maxRounds) · \(c.steps) steps").font(.caption.monospacedDigit()).foregroundStyle(.secondary)
                 }
                 if let why = c.stopReason { Text(why).font(.callout).foregroundStyle(.orange) }
+            }
+        }
+    }
+
+    // MARK: Until merge
+
+    private func ship(_ w: ShipWatch) -> some View {
+        let color: Color = switch w.state {
+        case .ready, .merged: .green
+        case .fixing, .watching: .blue
+        case .closed, .stopped: .orange
+        }
+        return section("Until merge", note: "PR #\(w.pr) · \(w.agent)") {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 8) {
+                    statusTag(w.state.rawValue, color)
+                    Text(w.status).font(.callout).textSelection(.enabled)
+                    Spacer()
+                    if !w.url.isEmpty, let u = URL(string: w.url) { Link("Open PR", destination: u).font(.caption) }
+                    if w.isLive {
+                        Button("Stop") { agents.stopShip(delivery.id, reason: "Stopped by you in ProjectN") }.controlSize(.small)
+                    }
+                }
+                Text("Fix tasks: \(w.fixes) of \(w.maxFixes)" + (w.lastCheck.map { " · last checked \(DeliveryText.clock($0))" } ?? "")
+                     + (w.branch.isEmpty ? "" : " · branch \(w.branch)"))
+                    .font(.caption).foregroundStyle(.secondary)
+                if let why = w.stopReason { Text(why).font(.callout).foregroundStyle(.orange) }
+                ForEach(Array(w.notes.suffix(8).enumerated()), id: \.offset) { _, n in
+                    Text("\(DeliveryText.clock(n.at))  \(n.text)").font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                }
+            }
+        }
+    }
+
+    // MARK: Reviews & decisions
+
+    private func reviews(_ r: DeliveryRecord) -> some View {
+        section("Review lists", note: "Given to the verifier for what changed") {
+            HStack(spacing: 6) {
+                ForEach(r.reviewsApplied, id: \.self) { tag($0, .purple) }
+                Spacer()
+            }
+        }
+    }
+
+    private func decisions(_ r: DeliveryRecord) -> some View {
+        section("Decisions", note: "Saved in the project notes; every agent gets them") {
+            VStack(alignment: .leading, spacing: 4) {
+                ForEach(r.decisions, id: \.self) { Text($0).font(.callout).textSelection(.enabled) }
             }
         }
     }
