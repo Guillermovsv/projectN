@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 /// Agents view → Deliveries: one entry per request agents worked on together. In the middle, who worked and when
@@ -11,6 +12,7 @@ struct DeliveriesPage: View {
     @Environment(\.showSidebar) private var showSidebar
     @AppStorage("deliveryListWidth") private var listWidth: Double = 290
     @AppStorage("deliveryFilterAll") private var showAll = false
+    @State private var showRules = false
 
     var body: some View {
         let all = agents.deliveries
@@ -28,6 +30,8 @@ struct DeliveriesPage: View {
                     Text("Requests that agents worked on together").font(.caption).foregroundStyle(.secondary)
                 }
                 Spacer()
+                Button { showRules = true } label: { Label("Reviews & Decisions", systemImage: "checklist") }
+                    .help("Review lists and decisions of each project")
                 Picker("", selection: $showAll) {
                     Text("Recent & tracked").tag(false)
                     Text("All (\(all.count))").tag(true)
@@ -57,6 +61,9 @@ struct DeliveriesPage: View {
             }
         }
         .background(Color.appSurface)
+        .sheet(isPresented: $showRules) {
+            ProjectRulesSheet(projectID: selected.flatMap { agents.projectID(of: $0) })
+        }
     }
 
     static func isRelevant(_ d: Delivery) -> Bool {
@@ -184,8 +191,26 @@ private struct DeliveryDetail: View {
                 .frame(maxWidth: 900, alignment: .leading)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            .safeAreaInset(edge: .bottom) { filesBar }
             ColumnResizeHandle(width: $sideWidth, range: 260...440, direction: -1)
             ForYouPanel(delivery: delivery).frame(width: sideWidth)
+        }
+    }
+
+    // MARK: Files
+
+    @ViewBuilder private var filesBar: some View {
+        if let path = agents.projectPath(of: delivery), let dir = DeliveryInsights.evidenceFolder(delivery, projectPath: path) {
+            HStack(spacing: 8) {
+                Image(systemName: "folder").foregroundStyle(.secondary)
+                Text("Files: .agentes/\(dir.lastPathComponent)/ · \(DeliveryInsights.fileCount(dir)) files")
+                    .font(.caption).foregroundStyle(.secondary)
+                Spacer()
+                Button("Open Folder") { NSWorkspace.shared.open(dir) }.controlSize(.small)
+            }
+            .padding(.horizontal, 18).padding(.vertical, 8)
+            .background(.bar)
+            .overlay(alignment: .top) { Divider() }
         }
     }
 
@@ -252,6 +277,7 @@ private struct DeliveryDetail: View {
                             .font(.caption.monospacedDigit()).foregroundStyle(.secondary).frame(width: 128, alignment: .trailing)
                     }
                     .padding(.vertical, 4)
+                    .padding(.leading, CGFloat(DeliveryInsights.depth(t, in: d)) * 22)
                     .contentShape(Rectangle())
                     .onTapGesture { open(t) }
                     .help(AgentHarness.oneLine(t.instruction, max: 300) + "\n\nClick to open this task in its agent's page.")
@@ -304,7 +330,7 @@ private struct DeliveryDetail: View {
                             Text(c.text).font(.callout).lineLimit(expanded.contains(key) ? nil : 1)
                             Spacer(minLength: 8)
                             if c.amendments?.isEmpty == false { tag("amended", .purple) }
-                            statusTag(label(c.status), c.status == .met ? .green : c.status == .unmet ? .red : .secondary)
+                            statusTag(label(c, r), c.status == .met ? .green : c.status == .unmet ? .red : .secondary)
                         }
                         if expanded.contains(key) {
                             VStack(alignment: .leading, spacing: 3) {
@@ -324,8 +350,17 @@ private struct DeliveryDetail: View {
         }
     }
 
-    private func label(_ s: DeliveryCriterion.Status) -> String {
-        switch s { case .met: return "met"; case .unmet: return "not met"; case .pending: return "pending" }
+    /// "met", or "not met · P10" with the findings that keep it from being met.
+    private func label(_ c: DeliveryCriterion, _ r: DeliveryRecord) -> String {
+        switch c.status {
+        case .met: return "met"
+        case .pending: return "pending"
+        case .unmet:
+            let ids = r.findings.filter { f in
+                f.status != .closed && ["criterion \(c.id)", "criterio \(c.id)"].contains { f.anchor.folded.contains($0.folded) }
+            }.map(\.id)
+            return ids.isEmpty ? "not met" : "not met · " + ids.joined(separator: " ")
+        }
     }
 
     private func findings(_ r: DeliveryRecord) -> some View {
@@ -338,7 +373,7 @@ private struct DeliveryDetail: View {
                     Text("SEV.").frame(width: 30, alignment: .leading)
                     Text("WHAT FAILS").frame(maxWidth: .infinity, alignment: .leading)
                     Text("ANCHOR").frame(width: 180, alignment: .leading)
-                    Text("STATUS").frame(width: 104, alignment: .trailing)
+                    Text("STATUS").frame(width: 120, alignment: .trailing)
                 }
                 .font(.caption2.weight(.semibold)).foregroundStyle(.secondary).padding(.bottom, 4)
                 Divider()
@@ -352,7 +387,7 @@ private struct DeliveryDetail: View {
                                 .frame(maxWidth: .infinity, alignment: .leading)
                             Text(f.anchor).font(.caption.monospaced()).foregroundStyle(.secondary)
                                 .lineLimit(expanded.contains(key) ? nil : 1).truncationMode(.middle).frame(width: 180, alignment: .leading)
-                            statusTag(f.status == .needsDecision ? "needs decision" : f.status.rawValue, color(f.status)).frame(width: 104, alignment: .trailing)
+                            statusTag(findingLabel(f), color(f.status)).frame(width: 120, alignment: .trailing)
                         }
                         if expanded.contains(key) {
                             VStack(alignment: .leading, spacing: 2) {
@@ -370,6 +405,24 @@ private struct DeliveryDetail: View {
                     Divider()
                 }
             }
+        }
+    }
+
+    /// What is happening to a finding right now: "fixing · round 2", "retesting", "queued", "to retest"…
+    private func findingLabel(_ f: DeliveryFinding) -> String {
+        let running = delivery.tasks.last { $0.cycleStep != nil && !$0.status.isFinished }
+        let inStep = running.map { DeliveryInsights.findingIDs(inStep: $0.instruction).contains(f.id) } ?? false
+        let cycleOn = delivery.record?.cycle?.state == .running
+        switch f.status {
+        case .open, .reopened:
+            if inStep, running?.cycleStep == .fix { return "fixing · round \(delivery.record?.cycle?.round ?? 1)" }
+            if cycleOn { return f.status == .reopened ? "reopened · queued" : "queued" }
+            return f.status.rawValue
+        case .fixed:
+            if inStep, running?.cycleStep == .retest { return "retesting" }
+            return cycleOn ? "fixed · to retest" : "fixed"
+        case .closed: return "closed"
+        case .needsDecision: return "needs decision"
         }
     }
 
@@ -403,6 +456,11 @@ private struct DeliveryDetail: View {
                     statusTag(c.state.rawValue, c.state == .done ? .green : c.state == .running ? .blue : .orange)
                 }
                 if let why = c.stopReason { Text(why).font(.callout).foregroundStyle(.orange).textSelection(.enabled) }
+                let r = delivery.record
+                let closed = r?.findings.filter { $0.status == .closed }.count ?? 0
+                Text([DeliveryInsights.branch(r).map { "Branch \($0)" }, "no push", "round \(c.round) of \(c.maxRounds)",
+                      "\(closed)/\(r?.findings.count ?? 0) findings closed"].compactMap { $0 }.joined(separator: " · "))
+                    .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
             }
         }
     }
@@ -497,6 +555,8 @@ private struct ForYouPanel: View {
     @State private var confirmCleanup = false
     @State private var cleanupLog: [String] = []
     @State private var cleaning = false
+    @State private var pendingCommand: String?
+    @State private var commandOutput: String?
 
     var body: some View {
         let r = delivery.record
@@ -548,6 +608,8 @@ private struct ForYouPanel: View {
                             suggestions(undecided: undecided, unmet: unmet)
                         }
                     }
+                    questionsCard
+                    commandsCard
                     if let w = r?.ship, w.state == .ready {
                         card {
                             Text("PR #\(w.pr) is ready to merge").font(.callout.weight(.semibold))
@@ -556,6 +618,7 @@ private struct ForYouPanel: View {
                         }
                     }
                     answerBox
+                    cycleLog
                     cleanup
                     usage
                 }
@@ -604,10 +667,123 @@ private struct ForYouPanel: View {
     }
 
     private func suggestion(_ title: String, _ text: String) -> some View {
-        Button { reply = text } label: {
-            Label(title, systemImage: "text.bubble").font(.caption)
+        Button(title) { send(text) }
+            .controlSize(.small)
+            .help(text)
+    }
+
+    private func send(_ text: String) {
+        sent = agents.replyToCoordinator(delivery, text: text) ? "Sent: \(AgentHarness.oneLine(text, max: 60))" : "Couldn't send it."
+    }
+
+    // MARK: The coordinator's questions and commands
+
+    /// The coordinator's latest answer, when nothing has happened since (its questions are still open).
+    private var lastWord: String? {
+        guard let c = agents.coordinatorTask(of: delivery), c.status.isFinished, c.id == delivery.tasks.last?.id else { return nil }
+        return c.result
+    }
+
+    @ViewBuilder private var questionsCard: some View {
+        if let text = lastWord {
+            ForEach(Array(DeliveryInsights.questions(in: text).enumerated()), id: \.offset) { _, q in
+                card {
+                    Text(q.text.isEmpty ? "Decide" : q.text).font(.callout.weight(.semibold)).fixedSize(horizontal: false, vertical: true)
+                    ForEach(q.options, id: \.key) { o in
+                        Button {
+                            send((q.number.isEmpty ? "" : "\(q.number): ") + "\(o.key)) \(o.text)")
+                        } label: {
+                            Text("\(o.key)) \(o.text)").frame(maxWidth: .infinity, alignment: .leading).multilineTextAlignment(.leading)
+                        }
+                        .buttonStyle(.bordered).controlSize(.small)
+                    }
+                }
+            }
         }
-        .buttonStyle(.link)
+    }
+
+    @ViewBuilder private var commandsCard: some View {
+        if let text = lastWord, let dir = agents.projectPath(of: delivery) {
+            let cmds = DeliveryInsights.commands(in: text)
+            if !cmds.isEmpty {
+                card {
+                    Text("Suggested command").font(.callout.weight(.semibold))
+                    ForEach(cmds, id: \.self) { c in
+                        Text(c).font(.caption.monospaced()).textSelection(.enabled)
+                        HStack {
+                            Button("Run…") { pendingCommand = c }.controlSize(.small)
+                            Button("Copy") {
+                                NSPasteboard.general.clearContents()
+                                NSPasteboard.general.setString(c, forType: .string)
+                            }.controlSize(.small)
+                        }
+                    }
+                    if let out = commandOutput { Text(out).font(.caption2.monospaced()).foregroundStyle(.secondary).lineLimit(8).textSelection(.enabled) }
+                }
+                .confirmationDialog("Run this command in \((dir as NSString).lastPathComponent)?", isPresented: Binding(
+                    get: { pendingCommand != nil }, set: { if !$0 { pendingCommand = nil } })) {
+                    Button("Run") {
+                        guard let c = pendingCommand else { return }
+                        pendingCommand = nil
+                        commandOutput = "Running…"
+                        Task {
+                            let r = await agents.runSuggested(c, in: dir)
+                            commandOutput = (r.ok ? "✓ " : "✗ ") + (r.output.isEmpty ? "(no output)" : String(r.output.suffix(600)))
+                        }
+                    }
+                } message: {
+                    Text(pendingCommand ?? "")
+                }
+            }
+        }
+    }
+
+    // MARK: What ProjectN did by itself
+
+    @ViewBuilder private var cycleLog: some View {
+        let steps = delivery.tasks.filter { $0.cycleStep != nil }
+        if !steps.isEmpty {
+            card {
+                Text("What ProjectN did by itself").font(.callout.weight(.semibold))
+                ForEach(Array(steps.enumerated()), id: \.offset) { i, t in
+                    HStack(alignment: .firstTextBaseline, spacing: 6) {
+                        Text((t.startedAt ?? t.createdAt).formatted(.dateTime.hour().minute()))
+                            .font(.caption2.monospacedDigit()).foregroundStyle(.secondary).frame(width: 52, alignment: .leading)
+                        Circle().fill(dot(t)).frame(width: 7, height: 7)
+                        Text(logLine(t, index: i, all: steps)).font(.caption).fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                if let c = delivery.record?.cycle, c.state != .running {
+                    HStack(alignment: .firstTextBaseline, spacing: 6) {
+                        Text((c.endedAt ?? Date()).formatted(.dateTime.hour().minute()))
+                            .font(.caption2.monospacedDigit()).foregroundStyle(.secondary).frame(width: 52, alignment: .leading)
+                        Circle().fill(c.state == .done ? Color.green : .orange).frame(width: 7, height: 7)
+                        Text(c.state == .done ? "Finished: every criterion met" : "Stopped and told the coordinator")
+                            .font(.caption.weight(.medium))
+                    }
+                }
+            }
+        }
+    }
+
+    private func dot(_ t: AgentTask) -> Color {
+        switch t.cycleStep { case .fix, .ship: return .orange; case .retest: return .blue; default: return .green }
+    }
+
+    private func logLine(_ t: AgentTask, index: Int, all: [AgentTask]) -> String {
+        let who = t.agentName.trimmingCharacters(in: .whitespaces)
+        let ids = DeliveryInsights.findingIDs(inStep: t.instruction)
+        let list = ids.isEmpty ? "" : " " + ids.joined(separator: ", ")
+        let state = t.status.isFinished ? (t.status == .completed ? "" : " (\(t.status.label.lowercased()))") : " — working"
+        switch t.cycleStep {
+        case .fix:
+            let round = all[...index].filter { $0.cycleStep == .fix }.count
+            return "Round \(round): sent\(list) to \(who)\(state)"
+        case .retest: return "Sent\(list) to \(who) to retest\(state)"
+        case .verify: return "\(who) checked the criteria\(state)"
+        case .ship: return "\(who) fixes the PR\(state)"
+        case nil: return who
+        }
     }
 
     // MARK: Clean-up & usage

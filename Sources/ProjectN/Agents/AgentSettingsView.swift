@@ -112,6 +112,7 @@ struct AgentEditor: View {
     @State private var contextText: String
     @State private var cliText: String
     @State private var zoneText: String
+    @State private var newZoneFolder = ""
     @State private var runSheet = false
     @State private var tab: EditorTab = .general
     @State private var editingSchedule: AgentSchedule?
@@ -361,13 +362,35 @@ struct AgentEditor: View {
         }
         if draft.permission.canWrite {
             Section {
-                TextField("Folders", text: $zoneText, prompt: Text("Whole project"))
-                Text(zoneText.trimmingCharacters(in: .whitespaces).isEmpty
-                     ? "Writes anywhere in the project. List folders (comma-separated, relative to the project) to keep it to them, e.g. .agentes, .worktrees."
-                     : "Only writes inside these folders of the project. Edits, redirects and copies anywhere else — other project files, /tmp, outside the project — are refused and it's told where to write.")
-                    .font(.caption).foregroundStyle(.secondary)
+                let zone = zoneText.split(whereSeparator: { $0 == "," || $0 == "\n" })
+                    .map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+                if zone.isEmpty {
+                    zoneRow(Text("The whole project"), allowed: true)
+                } else {
+                    ForEach(zone, id: \.self) { z in
+                        HStack {
+                            zoneRow(Text(z.hasSuffix("/") ? z : z + "/").font(.body.monospaced()), allowed: true)
+                            Button { zoneText = zone.filter { $0 != z }.joined(separator: ", ") } label: { Image(systemName: "minus.circle") }
+                                .buttonStyle(.borderless).help("Remove")
+                        }
+                    }
+                    zoneRow(Text("Everything else in the project"), allowed: false)
+                    zoneRow(Text("/tmp, /private/tmp and outside the project"), allowed: false)
+                }
+                HStack {
+                    TextField("Folder", text: $newZoneFolder, prompt: Text(".agentes"))
+                        .onSubmit(addZoneFolder)
+                    Button("Add Folder", action: addZoneFolder).disabled(newZoneFolder.trimmingCharacters(in: .whitespaces).isEmpty)
+                }
+                LabeledContent("Its own processes") { Text("Stops what it started in the background without asking").foregroundStyle(.secondary) }
+                LabeledContent("Always asks you") { Text("Deleting, pushing, publishing, deploying, sudo").foregroundStyle(.secondary) }
             } header: {
                 Text("Work zone")
+            } footer: {
+                Text(zone(zoneText).isEmpty
+                     ? "Writes anywhere in the project. Add folders (relative to the project) to keep it to them, e.g. .agentes and .worktrees for a reviewer."
+                     : "Edits, redirects (> file), tee, cp / mv / mkdir / touch anywhere else are refused, and it's told where to write instead.")
+                    .font(.caption).foregroundStyle(.secondary)
             }
         }
         Section("Delegation") {
@@ -384,6 +407,29 @@ struct AgentEditor: View {
                     .font(.caption).foregroundStyle(.secondary)
             }
         }
+    }
+
+    private func zone(_ text: String) -> [String] {
+        text.split(whereSeparator: { $0 == "," || $0 == "\n" }).map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+    }
+
+    private func zoneRow(_ label: Text, allowed: Bool) -> some View {
+        HStack {
+            label
+            Spacer()
+            Text(allowed ? "allowed" : "blocked").font(.caption.weight(.medium))
+                .foregroundStyle(allowed ? Color.green : Color.red)
+                .padding(.horizontal, 8).padding(.vertical, 2)
+                .background(Capsule().strokeBorder((allowed ? Color.green : Color.red).opacity(0.5)))
+        }
+    }
+
+    private func addZoneFolder() {
+        let f = newZoneFolder.trimmingCharacters(in: CharacterSet(charactersIn: "/ ")).replacingOccurrences(of: "..", with: "")
+        guard !f.isEmpty else { return }
+        let cur = zone(zoneText)
+        if !cur.contains(f) { zoneText = (cur + [f]).joined(separator: ", ") }
+        newZoneFolder = ""
     }
 
     private var effectiveTools: [String] { draft.tools.isEmpty ? AgentToolCatalog.preset(for: draft.permission) : draft.tools }

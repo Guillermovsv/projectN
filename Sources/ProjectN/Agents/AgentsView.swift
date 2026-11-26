@@ -171,6 +171,12 @@ struct AgentsSidebar: View {
     private var deliveriesRow: some View {
         let all = agents.deliveries
         let active = all.filter(\.isActive).count
+        // What waits on you there: approvals / questions, findings needing a decision, cycles that stopped.
+        let waiting = all.reduce(0) { n, d in
+            n + agents.pendingForUser(d).count + (d.record?.findings.filter { $0.status == .needsDecision }.count ?? 0)
+                + (d.record?.cycle?.state == .stopped && d.tasks.last.map { agents.profile($0.agentID)?.canDelegate == true } == true
+                   && d.tasks.last?.status.isFinished == true ? 1 : 0)
+        }
         return HStack(spacing: 10) {
             Image(systemName: "shippingbox").font(.body).frame(width: 32, height: 32)
                 .background(Circle().fill(Color.primary.opacity(0.08)))
@@ -180,6 +186,7 @@ struct AgentsSidebar: View {
                     .font(.caption).foregroundStyle(.secondary).lineLimit(1)
             }
             Spacer()
+            if waiting > 0 { CountBadge(count: waiting) }
         }
         .padding(.horizontal, 8).padding(.vertical, 6)
         .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(nav.showDeliveries ? Color.primary.opacity(0.1) : .clear))

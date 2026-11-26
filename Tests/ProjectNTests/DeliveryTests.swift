@@ -619,3 +619,44 @@ struct DecisionAndAmendRuleTests {
         #expect(!ReviewLists.contains(found[0], commit: "zz"))
     }
 }
+
+/// What the Deliveries view reads out of the coordinator's answers (real text from the PaviRígido #117 run).
+struct DeliveryInsightTests {
+    static let pmAnswer = """
+    **Veredicto: el #117 no cumple del todo lo que dice (6 de 8 criterios).**
+
+    ## Preguntas
+    1. El PR se cerró sin motivo registrado y no hay nada corriendo. ¿Qué hacemos con él?
+    - a) Retomarlo: el Developer corrige P1–P8 y se vuelve a probar y verificar
+    - b) Dejarlo cerrado
+    2. Si se retoma, ¿los eventos de Radar deben contar como inicios de sesión fallidos para la alerta?
+    - a) Sí, como ahora
+    - b) No, solo los fallos de autenticación
+
+    Para reabrirlo: `gh pr reopen 117`. Nunca `git push --force origin main` ni `git branch -D x`.
+    """
+
+    @Test func readsTheCoordinatorsQuestions() {
+        let qs = DeliveryInsights.questions(in: Self.pmAnswer)
+        #expect(qs.count == 2)
+        #expect(qs[0].number == "1" && qs[0].text.contains("¿Qué hacemos con él?"))
+        #expect(qs[0].options.map(\.key) == ["a", "b"] && qs[0].options[1].text == "Dejarlo cerrado")
+        #expect(qs[1].options[0].text == "Sí, como ahora")
+        #expect(DeliveryInsights.questions(in: "Todo listo, sin preguntas.").isEmpty)
+    }
+
+    @Test func offersOnlySafeCommands() {
+        #expect(DeliveryInsights.commands(in: Self.pmAnswer) == ["gh pr reopen 117"])
+    }
+
+    @Test func readsWhichFindingsAStepWorksOn() {
+        let r = DeliveryRecord(id: UUID())
+        let text = CycleInstructions.text(.fix, ids: ["P4", "P9"], record: {
+            var x = r
+            _ = try? x.openFinding(id: "P4", text: "racha", anchor: "a.ts:1", severity: "P2", by: "QA")
+            _ = try? x.openFinding(id: "P9", text: "migración", anchor: "006.sql", severity: nil, by: "QA")
+            return x
+        }())
+        #expect(DeliveryInsights.findingIDs(inStep: text) == ["P4", "P9"])
+    }
+}

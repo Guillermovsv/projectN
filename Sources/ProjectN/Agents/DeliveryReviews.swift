@@ -11,7 +11,8 @@ import Foundation
 // The rest is the checklist. The verifier gets the lists that match what changed, and any agent can ask for them
 // with `review_lists`.
 
-struct ReviewList: Equatable {
+struct ReviewList: Equatable, Identifiable {
+    var id: String { name + "|" + patterns.joined(separator: ",") }
     var name: String
     var patterns: [String]
     var text: String
