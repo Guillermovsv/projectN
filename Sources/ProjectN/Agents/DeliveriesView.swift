@@ -1,18 +1,22 @@
 import SwiftUI
 
-/// Agents view → Deliveries: one entry per request that involved several tasks. Who worked and when (times and
-/// usage from ProjectN's own task records, not from what agents write), the acceptance criteria, the findings
-/// agents passed to each other, the automatic cycle, and what the request left behind.
+/// Agents view → Deliveries: one entry per request agents worked on together. In the middle, who worked and when
+/// (times and usage from ProjectN's own task records), the criteria, the findings and the cycle, compact and
+/// expandable; on the right, **For you**: what needs your decision or approval, a box to answer the coordinator,
+/// what to clean up and what it cost.
 struct DeliveriesPage: View {
     @EnvironmentObject var agents: AgentHarness
     @EnvironmentObject var nav: NavigationModel
     @Environment(\.sidebarVisible) private var sidebarVisible
     @Environment(\.showSidebar) private var showSidebar
     @AppStorage("deliveryListWidth") private var listWidth: Double = 290
+    @AppStorage("deliveryFilterAll") private var showAll = false
 
     var body: some View {
         let all = agents.deliveries
-        let selected = nav.selectedDeliveryID.flatMap { id in all.first { $0.id == id } } ?? all.first
+        let relevant = all.filter(Self.isRelevant)
+        let items = showAll || relevant.isEmpty ? all : relevant
+        let selected = nav.selectedDeliveryID.flatMap { id in all.first { $0.id == id } } ?? items.first
         VStack(spacing: 0) {
             TopBar(leadingInset: !sidebarVisible) {
                 if !sidebarVisible {
@@ -24,6 +28,12 @@ struct DeliveriesPage: View {
                     Text("Requests that agents worked on together").font(.caption).foregroundStyle(.secondary)
                 }
                 Spacer()
+                Picker("", selection: $showAll) {
+                    Text("Recent & tracked").tag(false)
+                    Text("All (\(all.count))").tag(true)
+                }
+                .pickerStyle(.segmented).fixedSize()
+                .help("Recent & tracked: in progress, from the last 2 days, or with criteria / findings / a PR")
             }
             if all.isEmpty {
                 VStack(spacing: 10) {
@@ -35,7 +45,7 @@ struct DeliveriesPage: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 HStack(spacing: 0) {
-                    DeliveryList(items: all, selectedID: selected?.id) { nav.selectedDeliveryID = $0 }
+                    DeliveryList(items: items, selectedID: selected?.id) { nav.selectedDeliveryID = $0 }
                         .frame(width: listWidth)
                     ColumnResizeHandle(width: $listWidth, range: 220...460, direction: 1)
                     if let d = selected {
@@ -48,11 +58,17 @@ struct DeliveriesPage: View {
         }
         .background(Color.appSurface)
     }
+
+    static func isRelevant(_ d: Delivery) -> Bool {
+        d.isActive || d.record?.ship?.isLive == true || !(d.record?.isEmpty ?? true)
+            || Date().timeIntervalSince(d.start) < 2 * 86400
+    }
 }
 
 // MARK: - List
 
 private struct DeliveryList: View {
+    @EnvironmentObject var agents: AgentHarness
     let items: [Delivery]
     let selectedID: UUID?
     let onSelect: (UUID) -> Void
@@ -69,6 +85,7 @@ private struct DeliveryList: View {
 
     private func row(_ d: Delivery) -> some View {
         let selected = d.id == selectedID
+        let waiting = agents.pendingForUser(d).count + (d.record?.findings.filter { $0.status == .needsDecision }.count ?? 0)
         return HStack(alignment: .top, spacing: 8) {
             DeliveryStateDot(delivery: d).padding(.top, 4)
             VStack(alignment: .leading, spacing: 3) {
@@ -77,11 +94,8 @@ private struct DeliveryList: View {
                     Text(d.start.formatted(.relative(presentation: .named))).font(.caption).foregroundStyle(.secondary)
                     Text("· \(d.agents.count) agents").font(.caption).foregroundStyle(.secondary)
                     Spacer(minLength: 0)
-                    if let r = d.record, !r.criteria.isEmpty {
-                        Text("\(r.criteriaMet)/\(r.criteria.count)").font(.caption2.monospacedDigit().weight(.semibold))
-                            .padding(.horizontal, 6).padding(.vertical, 1)
-                            .background(Capsule().fill((r.criteriaMet == r.criteria.count ? Color.green : Color.orange).opacity(0.2)))
-                    }
+                    if waiting > 0 { CountBadge(count: waiting) }
+                    if let r = d.record, !r.criteria.isEmpty { CriteriaBadge(record: r) }
                 }
             }
         }
@@ -89,6 +103,17 @@ private struct DeliveryList: View {
         .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(selected ? Color.primary.opacity(0.1) : .clear))
         .contentShape(Rectangle())
         .onTapGesture { onSelect(d.id) }
+    }
+}
+
+private struct CriteriaBadge: View {
+    let record: DeliveryRecord
+    var body: some View {
+        let ok = record.criteriaMet == record.criteria.count
+        Text("\(record.criteriaMet)/\(record.criteria.count)").font(.caption2.monospacedDigit().weight(.semibold))
+            .padding(.horizontal, 6).padding(.vertical, 1)
+            .foregroundStyle(ok ? Color.green : Color.orange)
+            .background(Capsule().fill((ok ? Color.green : Color.orange).opacity(0.18)))
     }
 }
 
@@ -137,28 +162,30 @@ enum DeliveryText {
 private struct DeliveryDetail: View {
     @EnvironmentObject var agents: AgentHarness
     @EnvironmentObject var nav: NavigationModel
+    @AppStorage("deliveryForYouWidth") private var sideWidth: Double = 310
     let delivery: Delivery
-    @State private var confirmCleanup = false
-    @State private var cleanupLog: [String] = []
-    @State private var cleaning = false
+    @State private var expanded: Set<String> = []
+    @State private var allTasks = false
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 18) {
-                header
-                timeline
-                if let r = delivery.record, !r.criteria.isEmpty { criteria(r) }
-                if let r = delivery.record, !r.findings.isEmpty { findings(r) }
-                if let c = delivery.record?.cycle { cycle(c) }
-                if let w = delivery.record?.ship { ship(w) }
-                if let r = delivery.record, !r.reviewsApplied.isEmpty { reviews(r) }
-                if let r = delivery.record, !r.decisions.isEmpty { decisions(r) }
-                leftBehind
+        HStack(spacing: 0) {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    header
+                    timeline
+                    if let r = delivery.record, !r.criteria.isEmpty { criteria(r) }
+                    if let r = delivery.record, !r.findings.isEmpty { findings(r) }
+                    if let c = delivery.record?.cycle { cycle(c) }
+                    if let w = delivery.record?.ship { ship(w) }
+                    if let r = delivery.record, !r.reviewsApplied.isEmpty || !r.decisions.isEmpty { reviewsAndDecisions(r) }
+                }
+                .padding(18)
+                .frame(maxWidth: 900, alignment: .leading)
             }
-            .padding(18)
-            .frame(maxWidth: 900, alignment: .leading)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            ColumnResizeHandle(width: $sideWidth, range: 260...440, direction: -1)
+            ForYouPanel(delivery: delivery).frame(width: sideWidth)
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 
     // MARK: Header
@@ -166,15 +193,17 @@ private struct DeliveryDetail: View {
     private var header: some View {
         let d = delivery
         let total = (d.end ?? Date()).timeIntervalSince(d.start)
-        let u = d.usage
         return VStack(alignment: .leading, spacing: 8) {
-            Text(DeliveryText.title(d)).font(.title3.weight(.semibold)).textSelection(.enabled)
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text(DeliveryText.title(d)).font(.title3.weight(.semibold)).textSelection(.enabled).lineLimit(3)
+                if let r = d.record, !r.criteria.isEmpty { CriteriaBadge(record: r) }
+            }
             HStack(spacing: 8) {
-                pill(d.request?.origin.label ?? "ProjectN", "bubble.left")
+                pill(d.request?.origin.kind == .slack ? "Slack" : "ProjectN", "bubble.left")
                 pill("\(d.start.formatted(date: .abbreviated, time: .omitted)) · \(DeliveryText.clock(d.start))", "clock")
                 pill(DeliveryText.duration(total) + (d.end == nil ? " · in progress" : ""), "timer")
                 pill("\(d.tasks.count) tasks · \(d.agents.count) agents", "person.2")
-                if u.total > 0 { pill("\(DeliveryText.tokens(u.outputTokens)) out · \(DeliveryText.tokens(u.cacheReadTokens)) cache", "gauge") }
+                if let c = d.record?.cycle { pill("Cycle: \(c.state.rawValue) · round \(c.round)/\(c.maxRounds)", "arrow.triangle.2.circlepath") }
             }
         }
     }
@@ -191,23 +220,24 @@ private struct DeliveryDetail: View {
         let d = delivery
         let start = d.start
         let span = max(1, (d.end ?? Date()).timeIntervalSince(start))
-        return section("Who worked", note: "Times and usage recorded by ProjectN") {
+        let shown = allTasks || d.tasks.count <= 8 ? d.tasks : Array(d.tasks.suffix(8))
+        return section("Who worked", note: "Times recorded by ProjectN") {
             VStack(spacing: 0) {
-                ForEach(d.tasks) { t in
+                if shown.count < d.tasks.count {
+                    Button("Show the \(d.tasks.count - shown.count) earlier tasks") { allTasks = true }
+                        .buttonStyle(.link).font(.caption).frame(maxWidth: .infinity, alignment: .leading).padding(.bottom, 4)
+                }
+                ForEach(shown) { t in
                     let s = t.startedAt ?? t.createdAt
                     let e = t.finishedAt ?? Date()
                     HStack(spacing: 10) {
-                        if let p = agents.profile(t.agentID) { AgentAvatar(profile: p, size: 22) }
-                        VStack(alignment: .leading, spacing: 1) {
-                            HStack(spacing: 6) {
-                                Text(t.agentName).font(.callout.weight(.medium))
-                                if let step = t.cycleStep { tag("cycle · \(step.rawValue)", .blue) }
-                                if t.origin.automatic == true, t.origin.parentTaskID == nil { tag("follow-up", .secondary) }
-                                if t.status != .completed { tag(t.status.label, t.status.isFinished ? .red : .green) }
-                            }
-                            Text(AgentHarness.oneLine(t.instruction, max: 90)).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                        if let p = agents.profile(t.agentID) { AgentAvatar(profile: p, size: 20) }
+                        HStack(spacing: 6) {
+                            Text(t.agentName.trimmingCharacters(in: .whitespaces)).font(.callout.weight(.medium)).lineLimit(1)
+                            Text("· " + stepLabel(t)).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                            if t.status != .completed { tag(t.status.label, t.status.isFinished ? .red : .green) }
                         }
-                        .frame(minWidth: 180, maxWidth: .infinity, alignment: .leading)
+                        .frame(minWidth: 160, maxWidth: .infinity, alignment: .leading)
                         GeometryReader { g in
                             let x = g.size.width * s.timeIntervalSince(start) / span
                             let w = max(3, g.size.width * e.timeIntervalSince(s) / span)
@@ -216,30 +246,42 @@ private struct DeliveryDetail: View {
                                 Capsule().fill(barColor(t)).frame(width: min(w, g.size.width - x)).offset(x: x)
                             }
                         }
-                        .frame(width: 160, height: 8)
-                        VStack(alignment: .trailing, spacing: 1) {
-                            Text(DeliveryText.clock(s)).font(.caption.monospacedDigit())
-                            Text(DeliveryText.duration(e.timeIntervalSince(s))).font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
-                        }
-                        .frame(width: 74, alignment: .trailing)
-                        Text(t.usage.map { DeliveryText.tokens($0.outputTokens) } ?? "—")
-                            .font(.caption2.monospacedDigit()).foregroundStyle(.secondary).frame(width: 52, alignment: .trailing)
-                            .help("Output tokens")
+                        .frame(width: 140, height: 7)
+                        Text("\(DeliveryText.clock(s)) · \(DeliveryText.duration(e.timeIntervalSince(s)))")
+                            .font(.caption.monospacedDigit()).foregroundStyle(.secondary).frame(width: 128, alignment: .trailing)
                     }
-                    .padding(.vertical, 6)
+                    .padding(.vertical, 4)
                     .contentShape(Rectangle())
                     .onTapGesture { open(t) }
-                    .help("Open this task in its agent's page")
+                    .help(AgentHarness.oneLine(t.instruction, max: 300) + "\n\nClick to open this task in its agent's page.")
                     Divider()
                 }
             }
         }
     }
 
+    /// What the task was, in a few words.
+    private func stepLabel(_ t: AgentTask) -> String {
+        switch t.cycleStep {
+        case .fix: return "fixes (cycle)"
+        case .retest: return "retests (cycle)"
+        case .verify: return "verifies (cycle)"
+        case .ship: return "fixes the PR (until merge)"
+        case nil: break
+        }
+        if t.origin.parentTaskID == nil {
+            return t.origin.automatic == true ? "follow-up" : "gets the request"
+        }
+        return AgentHarness.oneLine(t.instruction.replacingOccurrences(of: "\n", with: " "), max: 60)
+    }
+
     private func barColor(_ t: AgentTask) -> Color {
-        if t.cycleStep == .fix { return .orange }
-        if t.cycleStep != nil { return .green }
-        return agents.profile(t.agentID)?.canDelegate == true ? .secondary : .appAccent
+        switch t.cycleStep {
+        case .fix, .ship: return .orange
+        case .retest: return .blue
+        case .verify: return .green
+        case nil: return agents.profile(t.agentID)?.canDelegate == true ? .secondary : .appAccent
+        }
     }
 
     private func open(_ t: AgentTask) {
@@ -248,81 +290,128 @@ private struct DeliveryDetail: View {
         nav.selectedTaskByAgent[t.agentID] = t.id
     }
 
-    // MARK: Criteria & findings
+    // MARK: Criteria & findings (one line each; click for the detail)
 
     private func criteria(_ r: DeliveryRecord) -> some View {
-        section("Criteria", note: "\(r.criteriaMet) of \(r.criteria.count) met") {
+        section("Criteria", note: "\(r.criteriaMet) of \(r.criteria.count) met · click one for its check and evidence") {
             VStack(spacing: 0) {
                 ForEach(r.criteria) { c in
-                    HStack(alignment: .top, spacing: 10) {
-                        Text(c.id).font(.caption.monospaced().weight(.semibold)).foregroundStyle(Color.appAccent).frame(width: 34, alignment: .leading)
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(c.text).font(.callout).textSelection(.enabled)
-                            Text("Check: \(c.check)").font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
-                            if let e = c.evidence { Text("Evidence: \(e)").font(.caption).foregroundStyle(.secondary).textSelection(.enabled) }
-                            ForEach(c.amendments ?? [], id: \.self) { Text($0).font(.caption).italic().foregroundStyle(.secondary) }
+                    let key = "c:" + c.id
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack(alignment: .firstTextBaseline, spacing: 10) {
+                            Text(c.id).font(.caption.monospaced().weight(.semibold)).foregroundStyle(Color.appAccent).frame(width: 30, alignment: .leading)
+                            Text(c.text).font(.callout).lineLimit(expanded.contains(key) ? nil : 1)
+                            Spacer(minLength: 8)
+                            if c.amendments?.isEmpty == false { tag("amended", .purple) }
+                            statusTag(label(c.status), c.status == .met ? .green : c.status == .unmet ? .red : .secondary)
                         }
-                        Spacer(minLength: 8)
-                        statusTag(c.status.rawValue, c.status == .met ? .green : c.status == .unmet ? .red : .secondary)
+                        if expanded.contains(key) {
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text("Check: \(c.check)")
+                                if let e = c.evidence { Text("Evidence: \(e)") }
+                                ForEach(c.amendments ?? [], id: \.self) { Text($0).italic() }
+                            }
+                            .font(.caption).foregroundStyle(.secondary).textSelection(.enabled).padding(.leading, 40)
+                        }
                     }
                     .padding(.vertical, 6)
+                    .contentShape(Rectangle())
+                    .onTapGesture { toggle(key) }
                     Divider()
                 }
             }
         }
+    }
+
+    private func label(_ s: DeliveryCriterion.Status) -> String {
+        switch s { case .met: return "met"; case .unmet: return "not met"; case .pending: return "pending" }
     }
 
     private func findings(_ r: DeliveryRecord) -> some View {
-        section("Findings", note: "\(r.openFindings.count) not closed of \(r.findings.count)") {
+        let order: [DeliveryFinding.Status] = [.needsDecision, .reopened, .open, .fixed, .closed]
+        let sorted = r.findings.sorted { (order.firstIndex(of: $0.status) ?? 9, $0.id) < (order.firstIndex(of: $1.status) ?? 9, $1.id) }
+        return section("Findings", note: "\(r.openFindings.count) not closed of \(r.findings.count)") {
             VStack(spacing: 0) {
-                ForEach(r.findings) { f in
-                    HStack(alignment: .top, spacing: 10) {
-                        VStack(alignment: .leading, spacing: 1) {
-                            Text(f.id).font(.caption.monospaced().weight(.semibold))
-                            if let s = f.severity { Text(s).font(.caption2.monospaced()).foregroundStyle(.secondary) }
+                HStack(spacing: 10) {
+                    Text("ID").frame(width: 34, alignment: .leading)
+                    Text("SEV.").frame(width: 30, alignment: .leading)
+                    Text("WHAT FAILS").frame(maxWidth: .infinity, alignment: .leading)
+                    Text("ANCHOR").frame(width: 180, alignment: .leading)
+                    Text("STATUS").frame(width: 104, alignment: .trailing)
+                }
+                .font(.caption2.weight(.semibold)).foregroundStyle(.secondary).padding(.bottom, 4)
+                Divider()
+                ForEach(sorted) { f in
+                    let key = "f:" + f.id
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack(alignment: .firstTextBaseline, spacing: 10) {
+                            Text(f.id).font(.caption.monospaced().weight(.semibold)).frame(width: 34, alignment: .leading)
+                            Text(f.severity ?? "—").font(.caption.monospaced()).foregroundStyle(sevColor(f.severity)).frame(width: 30, alignment: .leading)
+                            Text(f.text).font(.callout).lineLimit(expanded.contains(key) ? nil : 2)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                            Text(f.anchor).font(.caption.monospaced()).foregroundStyle(.secondary)
+                                .lineLimit(expanded.contains(key) ? nil : 1).truncationMode(.middle).frame(width: 180, alignment: .leading)
+                            statusTag(f.status == .needsDecision ? "needs decision" : f.status.rawValue, color(f.status)).frame(width: 104, alignment: .trailing)
                         }
-                        .frame(width: 34, alignment: .leading)
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(f.text).font(.callout).textSelection(.enabled)
-                            Text(f.anchor).font(.caption.monospaced()).foregroundStyle(.secondary).textSelection(.enabled)
-                            Text(history(f)).font(.caption).foregroundStyle(.secondary)
+                        if expanded.contains(key) {
+                            VStack(alignment: .leading, spacing: 2) {
+                                ForEach(Array(f.history.enumerated()), id: \.offset) { _, h in
+                                    Text("\(DeliveryText.clock(h.at))  \(h.status.rawValue) — \(h.by.trimmingCharacters(in: .whitespaces))\(h.note.map { ": \($0)" } ?? "")")
+                                }
+                                if let c = f.commit { Text("Commit \(c)") }
+                            }
+                            .font(.caption).foregroundStyle(.secondary).textSelection(.enabled).padding(.leading, 84)
                         }
-                        Spacer(minLength: 8)
-                        statusTag(f.status.rawValue, color(f.status))
                     }
                     .padding(.vertical, 6)
+                    .contentShape(Rectangle())
+                    .onTapGesture { toggle(key) }
                     Divider()
                 }
             }
         }
     }
 
-    private func history(_ f: DeliveryFinding) -> String {
-        f.history.map { "\($0.status.rawValue) by \($0.by) \(DeliveryText.clock($0.at))" }.joined(separator: " → ")
-            + (f.commit.map { " · \($0)" } ?? "")
+    private func sevColor(_ s: String?) -> Color {
+        switch s?.uppercased() { case "P0", "P1": return .red; case "P2": return .orange; default: return .secondary }
     }
 
     private func color(_ s: DeliveryFinding.Status) -> Color {
         switch s { case .open, .reopened: return .red; case .fixed: return .orange; case .closed: return .green; case .needsDecision: return .purple }
     }
 
+    private func toggle(_ key: String) {
+        if expanded.contains(key) { expanded.remove(key) } else { expanded.insert(key) }
+    }
+
     // MARK: Cycle
 
     private func cycle(_ c: DeliveryCycle) -> some View {
-        section("Automatic cycle", note: c.state == .running ? "Running" : c.state == .done ? "Finished" : "Stopped") {
-            VStack(alignment: .leading, spacing: 6) {
+        let running = delivery.tasks.last { $0.cycleStep != nil && $0.cycleStep != .ship && !$0.status.isFinished }?.cycleStep
+        return section("Automatic cycle", note: "Round \(c.round) of \(c.maxRounds) · \(c.steps) steps") {
+            VStack(alignment: .leading, spacing: 8) {
                 HStack(spacing: 6) {
-                    tag("fix: \(c.fixer)", .orange)
-                    Image(systemName: "arrow.right").font(.caption2).foregroundStyle(.secondary)
-                    tag("retest: \(c.tester ?? c.verifier)", .blue)
-                    Image(systemName: "arrow.right").font(.caption2).foregroundStyle(.secondary)
-                    tag("verify: \(c.verifier)", .green)
+                    chip("✅ \(c.verifier) opens", on: false)
+                    arrow
+                    chip("🛠 \(c.fixer) fixes", on: running == .fix)
+                    arrow
+                    chip("🧪 \((c.tester ?? c.verifier).trimmingCharacters(in: .whitespaces)) retests", on: running == .retest)
+                    arrow
+                    chip("✅ \(c.verifier) verifies", on: running == .verify)
                     Spacer()
-                    Text("Round \(c.round) of \(c.maxRounds) · \(c.steps) steps").font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                    statusTag(c.state.rawValue, c.state == .done ? .green : c.state == .running ? .blue : .orange)
                 }
-                if let why = c.stopReason { Text(why).font(.callout).foregroundStyle(.orange) }
+                if let why = c.stopReason { Text(why).font(.callout).foregroundStyle(.orange).textSelection(.enabled) }
             }
         }
+    }
+
+    private var arrow: some View { Image(systemName: "arrow.right").font(.caption2).foregroundStyle(.secondary) }
+
+    private func chip(_ text: String, on: Bool) -> some View {
+        Text(text).font(.caption).padding(.horizontal, 8).padding(.vertical, 3)
+            .background(RoundedRectangle(cornerRadius: 6).fill(Color.primary.opacity(on ? 0.12 : 0.05)))
+            .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(on ? Color.appAccent : .clear, lineWidth: 1.5))
     }
 
     // MARK: Until merge
@@ -357,54 +446,16 @@ private struct DeliveryDetail: View {
 
     // MARK: Reviews & decisions
 
-    private func reviews(_ r: DeliveryRecord) -> some View {
-        section("Review lists", note: "Given to the verifier for what changed") {
-            HStack(spacing: 6) {
-                ForEach(r.reviewsApplied, id: \.self) { tag($0, .purple) }
-                Spacer()
-            }
-        }
-    }
-
-    private func decisions(_ r: DeliveryRecord) -> some View {
-        section("Decisions", note: "Saved in the project notes; every agent gets them") {
-            VStack(alignment: .leading, spacing: 4) {
+    private func reviewsAndDecisions(_ r: DeliveryRecord) -> some View {
+        section("Review lists & decisions", note: "Decisions are saved in the project notes") {
+            VStack(alignment: .leading, spacing: 6) {
+                if !r.reviewsApplied.isEmpty {
+                    HStack(spacing: 6) {
+                        Text("Given to the verifier:").font(.caption).foregroundStyle(.secondary)
+                        ForEach(r.reviewsApplied, id: \.self) { tag($0, .purple) }
+                    }
+                }
                 ForEach(r.decisions, id: \.self) { Text($0).font(.callout).textSelection(.enabled) }
-            }
-        }
-    }
-
-    // MARK: Left behind
-
-    @ViewBuilder private var leftBehind: some View {
-        let paths = delivery.record?.worktrees ?? []
-        if !paths.isEmpty || !cleanupLog.isEmpty {
-            section("Left behind", note: "Worktrees agents created for this request") {
-                VStack(alignment: .leading, spacing: 6) {
-                    ForEach(paths, id: \.self) { p in
-                        HStack {
-                            Image(systemName: "folder").foregroundStyle(.secondary)
-                            Text(p).font(.caption.monospaced()).textSelection(.enabled).lineLimit(1).truncationMode(.middle)
-                        }
-                    }
-                    if !paths.isEmpty {
-                        Button(cleaning ? "Cleaning up…" : "Clean Up Worktrees…") { confirmCleanup = true }
-                            .disabled(cleaning || delivery.isActive)
-                            .help(delivery.isActive ? "Wait until the agents finish" : "Removes them with git worktree remove --force")
-                    }
-                    ForEach(cleanupLog, id: \.self) { Text($0).font(.caption).foregroundStyle(.secondary) }
-                }
-            }
-            .confirmationDialog("Remove \(paths.count) worktree(s)?", isPresented: $confirmCleanup) {
-                Button("Remove", role: .destructive) {
-                    cleaning = true
-                    Task {
-                        cleanupLog = await agents.cleanUpWorktrees(delivery.id)
-                        cleaning = false
-                    }
-                }
-            } message: {
-                Text("Uncommitted changes in them are lost. Branches and commits stay in the repository.")
             }
         }
     }
@@ -428,8 +479,203 @@ private struct DeliveryDetail: View {
     }
 
     private func statusTag(_ text: String, _ color: Color) -> some View {
-        Text(text).font(.caption.weight(.medium)).foregroundStyle(color)
+        Text(text).font(.caption.weight(.medium)).foregroundStyle(color).lineLimit(1)
             .padding(.horizontal, 8).padding(.vertical, 2)
             .background(Capsule().strokeBorder(color.opacity(0.5)))
+    }
+}
+
+// MARK: - For you
+
+/// The right column: what this request needs from you, a box to answer its coordinator, clean-up and usage.
+private struct ForYouPanel: View {
+    @EnvironmentObject var agents: AgentHarness
+    let delivery: Delivery
+    @State private var reply = ""
+    @State private var sent: String?
+    @State private var confirmCleanup = false
+    @State private var cleanupLog: [String] = []
+    @State private var cleaning = false
+
+    var body: some View {
+        let r = delivery.record
+        let pending = agents.pendingForUser(delivery)
+        let undecided = r?.findings.filter { $0.status == .needsDecision } ?? []
+        let unmet = r?.criteria.filter { $0.status == .unmet } ?? []
+        VStack(alignment: .leading, spacing: 0) {
+            Text("For you").font(.headline).padding(.horizontal, 14).padding(.vertical, 12)
+            Divider()
+            ScrollView {
+                VStack(alignment: .leading, spacing: 12) {
+                    if pending.isEmpty && undecided.isEmpty && unmet.isEmpty && r?.cycle?.state != .stopped && r?.ship?.state != .ready {
+                        card {
+                            Label(delivery.isActive ? "Agents are working. Nothing needs you right now." : "Nothing is waiting on you.",
+                                  systemImage: delivery.isActive ? "hourglass" : "checkmark.circle")
+                                .font(.callout).foregroundStyle(.secondary)
+                        }
+                    }
+                    ForEach(pending) { q in
+                        card {
+                            Text(q.kind == .approval ? "Approve?" : "Question").font(.callout.weight(.semibold))
+                            Text("\(q.agentName.trimmingCharacters(in: .whitespaces)): \(q.summary)").font(.caption).textSelection(.enabled).lineLimit(6)
+                            if q.kind == .approval {
+                                HStack {
+                                    Button("Approve") { agents.resolveRequest(q.id, approve: true, by: "You (ProjectN)") }.buttonStyle(.borderedProminent)
+                                    Button("Deny") { agents.resolveRequest(q.id, approve: false, by: "You (ProjectN)") }
+                                }.controlSize(.small)
+                            } else {
+                                Button("Answer below") { reply = "" }.controlSize(.small).disabled(true)
+                                    .help("Answer it in its agent's page or in Slack")
+                            }
+                        }
+                    }
+                    if let c = r?.cycle, c.state == .stopped {
+                        card {
+                            Text("The cycle stopped").font(.callout.weight(.semibold))
+                            Text(c.stopReason ?? "").font(.caption).textSelection(.enabled)
+                        }
+                    }
+                    if !undecided.isEmpty || !unmet.isEmpty {
+                        card {
+                            Text("To decide").font(.callout.weight(.semibold))
+                            ForEach(undecided) { f in
+                                Text("\(f.id): \(f.history.last?.note ?? f.text)").font(.caption).textSelection(.enabled)
+                            }
+                            ForEach(unmet) { c in
+                                Text("\(c.id) not met: \(c.text)").font(.caption).lineLimit(3).textSelection(.enabled)
+                            }
+                            suggestions(undecided: undecided, unmet: unmet)
+                        }
+                    }
+                    if let w = r?.ship, w.state == .ready {
+                        card {
+                            Text("PR #\(w.pr) is ready to merge").font(.callout.weight(.semibold))
+                            Text(w.status).font(.caption)
+                            if !w.url.isEmpty, let u = URL(string: w.url) { Link("Open the PR to merge it", destination: u).font(.caption) }
+                        }
+                    }
+                    answerBox
+                    cleanup
+                    usage
+                }
+                .padding(12)
+            }
+        }
+        .background(Color.appSidebar.opacity(0.35))
+    }
+
+    // MARK: Answer the coordinator
+
+    @ViewBuilder private var answerBox: some View {
+        if let c = agents.coordinatorTask(of: delivery) {
+            card {
+                Text("Tell \(c.agentName.trimmingCharacters(in: .whitespaces))").font(.callout.weight(.semibold))
+                TextEditor(text: $reply)
+                    .font(.callout).frame(minHeight: 60, maxHeight: 120)
+                    .scrollContentBackground(.hidden)
+                    .padding(4).background(RoundedRectangle(cornerRadius: 6).fill(Color.primary.opacity(0.06)))
+                HStack {
+                    if let s = sent { Text(s).font(.caption).foregroundStyle(.secondary) }
+                    Spacer()
+                    Button("Send") {
+                        sent = agents.replyToCoordinator(delivery, text: reply) ? "Sent." : "Couldn't send it."
+                        if sent == "Sent." { reply = "" }
+                    }
+                    .buttonStyle(.borderedProminent).controlSize(.small)
+                    .disabled(reply.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    .keyboardShortcut(.return, modifiers: .command)
+                }
+                Text(delivery.request?.origin.kind == .slack ? "Its answer also goes to the Slack thread." : "It continues the same conversation.")
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    /// One-click starting points for the most common answers (editable before sending).
+    @ViewBuilder private func suggestions(undecided: [DeliveryFinding], unmet: [DeliveryCriterion]) -> some View {
+        let ids = (undecided.map(\.id) + unmet.map(\.id)).joined(separator: ", ")
+        VStack(alignment: .leading, spacing: 4) {
+            suggestion("Adjust the criterion and rerun",
+                       "Ajusta el criterio (\(ids)) con criterion_amend según lo que recomendó el agente, y vuelve a correr start_cycle.")
+            suggestion("Keep it and fix the code",
+                       "No cambies el criterio: reabre \(ids) con finding_update (reopened) y vuelve a correr start_cycle.")
+        }
+    }
+
+    private func suggestion(_ title: String, _ text: String) -> some View {
+        Button { reply = text } label: {
+            Label(title, systemImage: "text.bubble").font(.caption)
+        }
+        .buttonStyle(.link)
+    }
+
+    // MARK: Clean-up & usage
+
+    @ViewBuilder private var cleanup: some View {
+        let paths = delivery.record?.worktrees ?? []
+        if !paths.isEmpty || !cleanupLog.isEmpty {
+            card {
+                Text("Clean up what it left").font(.callout.weight(.semibold))
+                ForEach(paths, id: \.self) { p in
+                    Text((p as NSString).lastPathComponent).font(.caption.monospaced()).help(p)
+                }
+                if !paths.isEmpty {
+                    Button(cleaning ? "Cleaning up…" : "Remove \(paths.count) worktree(s)…") { confirmCleanup = true }
+                        .controlSize(.small)
+                        .disabled(cleaning || delivery.isActive)
+                        .help(delivery.isActive ? "Wait until the agents finish" : "git worktree remove --force; branches and commits stay")
+                }
+                ForEach(cleanupLog, id: \.self) { Text($0).font(.caption2).foregroundStyle(.secondary) }
+            }
+            .confirmationDialog("Remove \(paths.count) worktree(s)?", isPresented: $confirmCleanup) {
+                Button("Remove", role: .destructive) {
+                    cleaning = true
+                    Task {
+                        cleanupLog = await agents.cleanUpWorktrees(delivery.id)
+                        cleaning = false
+                    }
+                }
+            } message: {
+                Text("Uncommitted changes in them are lost. Branches and commits stay in the repository.")
+            }
+        }
+    }
+
+    private var usage: some View {
+        var rows: [(String, Int, Int)] = []
+        for t in delivery.tasks {
+            let name = t.agentName.trimmingCharacters(in: .whitespaces)
+            let u = t.usage ?? TokenUsage()
+            if let i = rows.firstIndex(where: { $0.0 == name }) {
+                rows[i].1 += u.outputTokens; rows[i].2 += u.cacheReadTokens
+            } else {
+                rows.append((name, u.outputTokens, u.cacheReadTokens))
+            }
+        }
+        return card {
+            Text("Usage").font(.callout.weight(.semibold))
+            Grid(alignment: .leading, horizontalSpacing: 10, verticalSpacing: 3) {
+                GridRow {
+                    Text("Agent"); Text("Output").gridColumnAlignment(.trailing); Text("Cache").gridColumnAlignment(.trailing)
+                }
+                .font(.caption2).foregroundStyle(.secondary)
+                ForEach(rows, id: \.0) { r in
+                    GridRow {
+                        Text(r.0).lineLimit(1)
+                        Text(DeliveryText.tokens(r.1)).monospacedDigit()
+                        Text(DeliveryText.tokens(r.2)).monospacedDigit()
+                    }
+                    .font(.caption)
+                }
+            }
+        }
+    }
+
+    private func card<C: View>(@ViewBuilder _ content: () -> C) -> some View {
+        VStack(alignment: .leading, spacing: 6) { content() }
+            .padding(10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(Color.appSurface))
+            .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).strokeBorder(Color.primary.opacity(0.08)))
     }
 }

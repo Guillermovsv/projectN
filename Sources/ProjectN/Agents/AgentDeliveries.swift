@@ -301,3 +301,36 @@ extension AgentHarness {
         }
     }
 }
+
+// MARK: - From the Deliveries view
+
+extension AgentHarness {
+    /// The coordinator of a request: its latest task by an agent that delegates.
+    func coordinatorTask(of d: Delivery) -> AgentTask? {
+        d.tasks.last { profile($0.agentID)?.canDelegate == true }
+    }
+
+    /// Your message to the request's coordinator, written in ProjectN: into its live session, else as a new turn
+    /// of the same conversation (a Slack request answers in its thread).
+    @discardableResult
+    func replyToCoordinator(_ d: Delivery, text: String) -> Bool {
+        let msg = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !msg.isEmpty, let c = coordinatorTask(of: d) else { return false }
+        AuditLog.record("delivery.reply", ["delivery": d.id.uuidString, "agent": c.agentName, "text": ApprovalPolicy.clip(msg)])
+        if c.status.isActive { deliverMessage(msg, to: c.id); return true }
+        var origin = c.origin
+        origin.automatic = nil
+        origin.conversationID = d.id
+        if case .success = submit(AgentTaskRequest(agentID: c.agentID, projectID: c.projectID,
+                                                   instruction: msg + "\n\n(Written by the user in ProjectN → Deliveries.)", origin: origin)) {
+            return true
+        }
+        return false
+    }
+
+    /// Approvals and questions of this request waiting on you.
+    func pendingForUser(_ d: Delivery) -> [AgentRequest] {
+        let ids = Set(d.tasks.map(\.id))
+        return pendingUserRequests().filter { ids.contains($0.taskID) }
+    }
+}
