@@ -42,6 +42,10 @@ open /Applications/ProjectN.app
 | **Files** — browse the focused project, insert paths, open files. | ![Files panel](docs/screenshots/files.png) |
 | **Browser** — preview localhost or any site at Fit / Mobile / Tablet / Desktop widths. Press ◎ (⇧⌘P) to *point things out*: click an element, drag an area or ⌥-select text and it's highlighted with a number and lands in the focused agent's chat box (selector, text, HTML and a screenshot go with your message). | ![Browser panel](docs/screenshots/browser.png) |
 | **Voice dictation (NVoice)** — hold fn anywhere, talk, release to paste. | ![Voice settings](docs/screenshots/voice.png) |
+| **Deliveries** — who worked on a request and when, its criteria and findings, the automatic cycle, and *For you*: what needs your decision. | ![Deliveries](docs/screenshots/deliveries.png) |
+| **Until merge** — a PR handed to an agent until checks are green and it merges cleanly. | ![Until merge](docs/screenshots/deliveries-until-merge.png) |
+| **Work zone** — folders an agent may write in; everything else is refused. | ![Work zone](docs/screenshots/work-zone.png) |
+| **Reviews & Decisions** — per project: what the verifier checks when files change, and the decisions agents keep. | ![Reviews and decisions](docs/screenshots/reviews-decisions.png) |
 
 ## Concepts
 
