@@ -172,11 +172,12 @@ private struct DeliveryDetail: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
                     header
+                    // What's happening now first: the cycle and the PR, then who worked, then the detail.
+                    if let c = delivery.record?.cycle { cycle(c) }
+                    if let w = delivery.record?.ship { ship(w) }
                     timeline
                     if let r = delivery.record, !r.criteria.isEmpty { criteria(r) }
                     if let r = delivery.record, !r.findings.isEmpty { findings(r) }
-                    if let c = delivery.record?.cycle { cycle(c) }
-                    if let w = delivery.record?.ship { ship(w) }
                     if let r = delivery.record, !r.reviewsApplied.isEmpty || !r.decisions.isEmpty { reviewsAndDecisions(r) }
                 }
                 .padding(18)
