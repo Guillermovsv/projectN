@@ -376,10 +376,13 @@ struct Delivery: Identifiable, Hashable {
     /// Slack thread (every follow-up and delegated task of a Slack request shares it), else by their root task.
     static func key(_ t: AgentTask) -> UUID {
         if let c = t.origin.conversationID { return c }
-        if let ch = t.origin.slackChannel, let ts = t.origin.slackThreadTS ?? t.origin.slackMessageTS {
-            return UUID.stable("slack:\(ch):\(ts)")
-        }
-        return t.rootTaskID ?? t.id
+        return threadKey(t.origin) ?? t.rootTaskID ?? t.id
+    }
+
+    /// The delivery of a Slack thread.
+    static func threadKey(_ o: TaskOrigin) -> UUID? {
+        guard let ch = o.slackChannel, let ts = o.slackThreadTS ?? o.slackMessageTS else { return nil }
+        return UUID.stable("slack:\(ch):\(ts)")
     }
 
     /// Requests that involved more than one task (a coordinator delegating, or an automatic cycle), newest first.

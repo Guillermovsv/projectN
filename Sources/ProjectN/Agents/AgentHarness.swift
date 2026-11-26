@@ -329,7 +329,8 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
                           model: resolution.model, effort: resolution.effort, permission: profile.permission)
         t.notes = resolution.notes
         t.dependsOn = request.dependsOn
-        if t.origin.conversationID == nil { t.origin.conversationID = t.id }
+        // A request is a Slack thread (every answer in it continues the same delivery), else this task.
+        if t.origin.conversationID == nil { t.origin.conversationID = Delivery.threadKey(t.origin) ?? t.id }
         if request.freshSession { t.skipRecap = true }
         if let parentID = request.origin.parentTaskID, let parent = task(parentID) {
             t.depth = parent.depth + 1

@@ -273,7 +273,9 @@ struct DeliveryCycleTests {
     @Test func coordinatorSetsCriteriaAndTheCycleVerifiesThenReportsDone() async throws {
         let (env, pm, _, _) = try await setUp("9100.1")
         defer { env.store.terminateAll() }
-        #expect(env.harness.task(pm.id)?.origin.conversationID == pm.id)
+        // A Slack request is its thread: the conversation id is the thread's.
+        let conv = try #require(env.harness.task(pm.id)?.origin.conversationID)
+        #expect(conv == UUID.stable("slack:C1:9100.1"))
 
         let r = await mcp([("criteria_set", ["criteria": [["text": "El login funciona", "check": "npm test"]]]),
                            ("criterion_update", ["id": "C1", "status": "met", "evidence": "npm test: 10/10"]),
@@ -283,15 +285,15 @@ struct DeliveryCycleTests {
         #expect(r.results[2].contains("\"cycle\":\"started\"") && r.results[2].contains("verify"))
 
         // Verify step runs (fake session finishes at once), the verifier ran after the last change → done.
-        try await waitUntil { env.harness.deliveryRecords[pm.id]?.cycle?.state == .done }
+        try await waitUntil { env.harness.deliveryRecords[Delivery.key(pm)]?.cycle?.state == .done }
         let steps = env.harness.tasks.filter { $0.cycleStep != nil }
         #expect(steps.map(\.cycleStep) == [.verify] && steps.first?.agentName == "Verificador")
-        #expect(steps.first?.origin.conversationID == pm.id && steps.first?.origin.parentTaskID == pm.id)
+        #expect(steps.first?.origin.conversationID == conv && steps.first?.origin.parentTaskID == pm.id)
         // The coordinator (still working) gets one report in its session.
         try await waitUntil { (env.harness.task(pm.id)?.inbox ?? []).contains { $0.contains("Automatic cycle finished") }
             || (env.harness.task(pm.id)?.followUps ?? []).contains { $0.contains("Automatic cycle finished") } }
         // It's one delivery with the coordinator and the step.
-        let d = try #require(env.harness.delivery(pm.id))
+        let d = try #require(env.harness.delivery(conv))
         #expect(d.tasks.count == 2 && d.record?.criteriaMet == 1)
     }
 
@@ -302,8 +304,8 @@ struct DeliveryCycleTests {
                            ("start_cycle", ["fixer": "Developer", "verifier": "Verificador", "max_rounds": 2])], task: pm.id, env: env)
         #expect(r.results.first?.contains("\"id\":\"P1\"") == true)
         // The fake developer never marks P1 fixed: two fix rounds, then the cycle stops and says why.
-        try await waitUntil { env.harness.deliveryRecords[pm.id]?.cycle?.state == .stopped }
-        let c = try #require(env.harness.deliveryRecords[pm.id]?.cycle)
+        try await waitUntil { env.harness.deliveryRecords[Delivery.key(pm)]?.cycle?.state == .stopped }
+        let c = try #require(env.harness.deliveryRecords[Delivery.key(pm)]?.cycle)
         #expect(c.round == 2 && (c.stopReason ?? "").contains("2 fix rounds"))
         let fixes = env.harness.tasks.filter { $0.cycleStep == .fix }
         #expect(fixes.count == 2 && fixes.allSatisfy { $0.agentName == "Developer" && $0.instruction.contains("P1") })
@@ -495,15 +497,15 @@ struct ShipAndDecisionTests {
         let fix = try #require(env.harness.tasks.first { $0.cycleStep == .ship })
         #expect(fix.agentName == "Developer" && fix.instruction.contains("Failing checks: saas")
                 && fix.instruction.contains("git push origin HEAD:seguridad/webhook-workos"))
-        #expect(env.harness.deliveryRecords[pm.id]?.ship?.branch == "seguridad/webhook-workos")
+        #expect(env.harness.deliveryRecords[Delivery.key(pm)]?.ship?.branch == "seguridad/webhook-workos")
 
         // After the fix everything is green: ready, reported once to the coordinator; merging stays with the user.
-        try await waitUntil { env.harness.deliveryRecords[pm.id]?.ship?.state == .ready }
+        try await waitUntil { env.harness.deliveryRecords[Delivery.key(pm)]?.ship?.state == .ready }
         try await waitUntil { ((env.harness.task(pm.id)?.inbox ?? []) + (env.harness.task(pm.id)?.followUps ?? [])).contains { $0.contains("Until merge: PR #117 — ready") } }
         #expect(env.harness.tasks.filter { $0.cycleStep == .ship }.count == 1)
         // Stop from the Deliveries view.
-        env.harness.stopShip(pm.id, reason: "test")
-        #expect(env.harness.deliveryRecords[pm.id]?.ship?.state == .stopped)
+        env.harness.stopShip(Delivery.key(pm), reason: "test")
+        #expect(env.harness.deliveryRecords[Delivery.key(pm)]?.ship?.state == .stopped)
     }
 
     @Test func yourAnswerToAQuestionIsSavedAsADecision() async throws {
@@ -534,6 +536,6 @@ struct ShipAndDecisionTests {
         try await waitUntil { env.harness.tasks.contains { $0.cycleStep == .verify } }
         let v = try #require(env.harness.tasks.first { $0.cycleStep == .verify })
         #expect(v.instruction.contains("### seguridad") && v.instruction.contains("Concurrencia"))
-        #expect(env.harness.deliveryRecords[pm.id]?.reviewsApplied == ["seguridad"])
+        #expect(env.harness.deliveryRecords[Delivery.key(pm)]?.reviewsApplied == ["seguridad"])
     }
 }
