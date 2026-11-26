@@ -100,6 +100,48 @@ enum ReviewLists {
         return files.sorted()
     }
 
+    /// Project-relative file paths mentioned in a text (`saas/src/rutas/avisos.ts:86`, `app/web/js/motor/`).
+    static func paths(in text: String) -> [String] {
+        guard let re = try? NSRegularExpression(pattern: #"(?<![\w/.-])((?:[\w.-]+/)+[\w.-]*)"#) else { return [] }
+        let ns = text as NSString
+        return re.matches(in: text, range: NSRange(location: 0, length: ns.length)).compactMap { m in
+            var p = ns.substring(with: m.range(at: 1))
+            if p.hasPrefix("./") { p.removeFirst(2) }
+            guard !p.hasPrefix("/"), !p.contains("://"), !p.hasPrefix("."), p.contains("/") else { return nil }
+            return p
+        }
+    }
+
+    /// Worktree folders of a repository (`git worktree list --porcelain`), the main checkout excluded.
+    nonisolated static func worktrees(of repo: String) -> [String] {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+        p.arguments = ["-C", repo, "worktree", "list", "--porcelain"]
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = FileHandle.nullDevice
+        guard (try? p.run()) != nil else { return [] }
+        let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        p.waitUntilExit()
+        let main = (repo as NSString).standardizingPath
+        return out.split(separator: "\n").compactMap { l in l.hasPrefix("worktree ") ? String(l.dropFirst("worktree ".count)) : nil }
+            .filter { PathGuard.canonical($0) != PathGuard.canonical(main) }
+    }
+
+    /// Whether a checkout's history contains a commit (short hashes work).
+    nonisolated static func contains(_ dir: String, commit: String) -> Bool {
+        let c = commit.trimmingCharacters(in: .whitespaces)
+        guard c.count >= 7, c.allSatisfy(\.isHexDigit) else { return false }
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+        p.arguments = ["-C", dir, "merge-base", "--is-ancestor", c, "HEAD"]
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        guard (try? p.run()) != nil else { return false }
+        p.waitUntilExit()
+        return p.terminationStatus == 0
+    }
+
     static func instructionBlock(_ lists: [ReviewList]) -> String {
         guard !lists.isEmpty else { return "" }
         return "\n\nReview lists for what changed — apply every point; open a finding (finding_open) for each one that fails:\n"
@@ -108,11 +150,25 @@ enum ReviewLists {
 }
 
 extension AgentHarness {
-    /// The changed files of a request: in its worktrees, else in the project folder.
+    /// The changed files of a request: what changed in its worktrees — the ones agents created, plus the project's
+    /// worktrees that hold a commit of one of its fixes (created before ProjectN could see it) — else in the project
+    /// folder, plus the files its findings and criteria point at.
     func changedFiles(delivery id: UUID, projectID: UUID) -> [String] {
-        let wts = deliveryRecord(id).worktrees.filter { FileManager.default.fileExists(atPath: $0) }
-        let dirs = wts.isEmpty ? [store?.project(projectID)?.path].compactMap { $0 } : wts
-        return Array(Set(dirs.flatMap(ReviewLists.changedFiles(in:)))).sorted()
+        guard let project = store?.project(projectID)?.path else { return [] }
+        var r = deliveryRecord(id)
+        let commits = Set(r.findings.compactMap(\.commit))
+        var wts = r.worktrees.filter { FileManager.default.fileExists(atPath: $0) }
+        if !commits.isEmpty {
+            let found = ReviewLists.worktrees(of: project).filter { wt in !wts.contains(wt) && commits.contains { ReviewLists.contains(wt, commit: $0) } }
+            if !found.isEmpty {
+                wts += found
+                r = mutateDelivery(id) { rec in for p in found where !rec.worktrees.contains(p) { rec.worktrees.append(p) } }
+            }
+        }
+        let dirs = wts.isEmpty ? [project] : wts
+        var files = Set(dirs.flatMap(ReviewLists.changedFiles(in:)))
+        for text in r.findings.map(\.anchor) + r.criteria.map(\.check) { files.formUnion(ReviewLists.paths(in: text)) }
+        return files.sorted()
     }
 
     func reviewLists(delivery id: UUID, projectID: UUID, paths: [String]? = nil) -> [ReviewList] {

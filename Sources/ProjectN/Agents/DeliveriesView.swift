@@ -260,6 +260,7 @@ private struct DeliveryDetail: View {
                             Text(c.text).font(.callout).textSelection(.enabled)
                             Text("Check: \(c.check)").font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
                             if let e = c.evidence { Text("Evidence: \(e)").font(.caption).foregroundStyle(.secondary).textSelection(.enabled) }
+                            ForEach(c.amendments ?? [], id: \.self) { Text($0).font(.caption).italic().foregroundStyle(.secondary) }
                         }
                         Spacer(minLength: 8)
                         statusTag(c.status.rawValue, c.status == .met ? .green : c.status == .unmet ? .red : .secondary)
@@ -302,7 +303,7 @@ private struct DeliveryDetail: View {
     }
 
     private func color(_ s: DeliveryFinding.Status) -> Color {
-        switch s { case .open, .reopened: return .red; case .fixed: return .orange; case .closed: return .green }
+        switch s { case .open, .reopened: return .red; case .fixed: return .orange; case .closed: return .green; case .needsDecision: return .purple }
     }
 
     // MARK: Cycle

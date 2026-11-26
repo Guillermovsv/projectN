@@ -23,7 +23,7 @@ extension AgentHarness {
     // MARK: Tools
 
     static let deliveryToolNames: Set<String> = ["criteria_set", "criterion_update", "finding_open", "finding_update", "delivery_status",
-                                                 "start_cycle", "review_lists", "ship_pr", "stop_ship"]
+                                                 "start_cycle", "review_lists", "ship_pr", "stop_ship", "criterion_amend"]
 
     func callDeliveryTool(_ name: String, _ a: [String: Any], task t: AgentTask, profile: AgentProfile,
                           reply: @escaping (String, Bool) -> Void) {
@@ -62,9 +62,19 @@ extension AgentHarness {
                 AuditLog.record("delivery.finding", ["delivery": id.uuidString, "agent": who, "finding": fid, "status": "open"])
                 reply(Self.json(["id": fid, "status": "open"]), false)
 
+            case "criterion_amend":
+                guard depthAllowsDelegation(t, profile) else {
+                    reply("Only the coordinator can change a criterion. Use finding_update(id, needs_decision, note) to ask for it.", true); return
+                }
+                guard let cid = str("id") else { reply("Give the criterion `id`.", true); return }
+                let r = try mutateDelivery(id) { try $0.amendCriterion(cid, text: str("text"), check: str("check"), reason: str("reason") ?? "", by: who) }
+                AuditLog.record("delivery.criterion_amended", ["delivery": id.uuidString, "agent": who, "criterion": cid, "reason": str("reason") ?? ""])
+                reply(Self.json(["amended": cid, "criteria_met": "\(r.criteriaMet)/\(r.criteria.count)",
+                                 "next": "It's pending again: start_cycle (or ask the verifier) to check it."]), false)
+
             case "finding_update":
                 guard let fid = str("id"), let s = str("status").flatMap(DeliveryFinding.Status.init(rawValue:)) else {
-                    reply("Give `id` and `status` (fixed | closed | reopened).", true); return
+                    reply("Give `id` and `status` (fixed | needs_decision | closed | reopened).", true); return
                 }
                 let r = try mutateDelivery(id) { try $0.updateFinding(fid, status: s, commit: str("commit"), note: str("note"), by: who) }
                 AuditLog.record("delivery.finding", ["delivery": id.uuidString, "agent": who, "finding": fid, "status": s.rawValue])

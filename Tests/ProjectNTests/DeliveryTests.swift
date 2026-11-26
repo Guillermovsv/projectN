@@ -318,12 +318,16 @@ struct DeliveryCycleTests {
         defer { env.store.terminateAll() }
         let bad = await mcp([("start_cycle", ["fixer": "Developer", "verifier": "Developer"])], task: pm.id, env: env)
         #expect(bad.results.first?.contains("can't test or verify its own work") == true)
+        // Only coordinators reword criteria.
+        let amend = await mcp([("criteria_set", ["criteria": [["text": "A", "check": "b"]]]),
+                               ("criterion_amend", ["id": "C1", "text": "A bien escrito", "reason": "era ambiguo"])], task: pm.id, env: env)
+        #expect(amend.results.count == 2 && amend.results[1].contains("\"amended\":\"C1\""))
 
         let dev = try #require(env.harness.profiles.first { $0.name == "Developer" })
         let t = try env.harness.submit(.init(agentID: dev.id, projectID: env.project.id, instruction: "SLOW edit", origin: .local)).get()
         try await waitUntil { env.harness.task(t.id)?.status == .running }
         let tools = await mcp([("start_cycle", ["fixer": "Developer", "verifier": "Verificador"])], task: t.id, env: env)
-        #expect(!tools.tools.contains("start_cycle") && tools.tools.contains("criteria_set"))
+        #expect(!tools.tools.contains("start_cycle") && !tools.tools.contains("criterion_amend") && tools.tools.contains("criteria_set"))
         #expect(tools.results.first?.contains("can't delegate") == true)
 
         // The hook records worktrees the agent creates, for the clean-up in Deliveries.
@@ -537,5 +541,81 @@ struct ShipAndDecisionTests {
         let v = try #require(env.harness.tasks.first { $0.cycleStep == .verify })
         #expect(v.instruction.contains("### seguridad") && v.instruction.contains("Concurrencia"))
         #expect(env.harness.deliveryRecords[Delivery.key(pm)]?.reviewsApplied == ["seguridad"])
+    }
+}
+
+/// What the PR #117 run showed: a criterion that needs rewording, a finding the fixer can't solve in code, and a
+/// worktree ProjectN didn't see being created.
+struct DecisionAndAmendRuleTests {
+    private func record() throws -> DeliveryRecord {
+        var r = DeliveryRecord(id: UUID())
+        r.cycle = DeliveryCycle(fixer: "Developer", tester: "QA", verifier: "Verificador", projectID: UUID(), coordinatorTaskID: UUID())
+        try r.setCriteria([(nil, "Login OK", "npm test"), (nil, "La migración 006 crea el índice único", "psql pg_indexes")], by: "Verificador")
+        try r.updateCriterion("C2", status: .unmet, evidence: "no existe en 006", by: "Verificador")
+        try r.openFinding(id: nil, text: "C2 no se cumple", anchor: "criterion C2 · saas/migraciones/006.sql", severity: "P3", by: "Verificador")
+        return r
+    }
+
+    @Test func theFixerAsksForADecisionAndTheCycleStopsAtOnce() throws {
+        var r = try record()
+        #expect(DeliveryRecord.nextStep(r) == .fix(["P1"]))
+        #expect(throws: DeliveryError.self) { try r.updateFinding("P1", status: .needsDecision, commit: nil, note: " ", by: "Developer") }
+        try r.updateFinding("P1", status: .needsDecision, commit: nil, note: "El índice pasó a la 007: ajustar C2", by: "Developer")
+        if case .stop(let why) = DeliveryRecord.nextStep(r) { #expect(why.contains("Needs a decision") && why.contains("007")) } else { Issue.record("expected stop") }
+        // Someone else decides it.
+        #expect(throws: DeliveryError.self) { try r.updateFinding("P1", status: .closed, commit: nil, note: "ok", by: "Developer") }
+        try r.updateFinding("P1", status: .reopened, commit: nil, note: "Sí hace falta el índice en 006", by: "Project Manager")
+        #expect(DeliveryRecord.nextStep(r) == .fix(["P1"]))
+        #expect(r.endReport().contains("criterion_amend"))
+    }
+
+    @Test func amendingACriterionKeepsTheOldWordingAndSettlesItsFindings() throws {
+        var r = try record()
+        try r.updateFinding("P1", status: .needsDecision, commit: nil, note: "ajustar C2", by: "Developer")
+        #expect(throws: DeliveryError.self) { try r.amendCriterion("C2", text: "x", check: nil, reason: "", by: "Project Manager") }
+        #expect(throws: DeliveryError.self) { try r.amendCriterion("C9", text: "x", check: nil, reason: "y", by: "Project Manager") }
+        try r.amendCriterion("c2", text: "La migración 007 crea la tabla con llave primaria por id", check: "psql \\d avisos_workos_recibidos",
+                             reason: "La unicidad pasó a la 007 (P9)", by: "Project Manager")
+        let c = r.criteria[1]
+        #expect(c.status == .pending && c.evidence == nil && c.text.contains("007") && c.check.contains("avisos_workos"))
+        #expect(c.amendments?.first?.contains("006") == true && c.amendments?.first?.contains("P9") == true)
+        #expect(r.findings[0].status == .closed)
+        // Criteria stay locked for setCriteria, but the verifier checks C2 again.
+        r.cycle?.verifiedSinceChange = true
+        try r.amendCriterion("C1", text: nil, check: "npm test && npx playwright test login", reason: "faltaba e2e", by: "Project Manager")
+        #expect(DeliveryRecord.nextStep(r) == .verify)
+    }
+
+    @Test func pathsAreReadFromAnchorsAndChecks() {
+        #expect(ReviewLists.paths(in: "saas/src/rutas/avisos-identidad.ts:76 · page: #x") == ["saas/src/rutas/avisos-identidad.ts"])
+        #expect(ReviewLists.paths(in: "criterion C3 · avisos-identidad.ts:90").isEmpty)
+        #expect(ReviewLists.paths(in: "cd .worktrees/rev/saas && npm test; ver app/web/js/motor/ y https://x.com/a/b").contains("app/web/js/motor/"))
+        #expect(!ReviewLists.paths(in: "https://x.com/a/b").contains { $0.contains("x.com") })
+    }
+
+    @Test func worktreesHoldingAFixCommitAreFound() throws {
+        let fm = FileManager.default
+        let repo = fm.temporaryDirectory.appendingPathComponent("wt-repo-\(UUID())").path
+        func git(_ dir: String, _ args: String...) throws -> String {
+            let p = Process(); p.executableURL = URL(fileURLWithPath: "/usr/bin/git"); p.arguments = ["-C", dir] + args
+            let pipe = Pipe(); p.standardOutput = pipe; p.standardError = FileHandle.nullDevice
+            try p.run(); let d = pipe.fileHandleForReading.readDataToEndOfFile(); p.waitUntilExit()
+            return String(data: d, encoding: .utf8)!.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        try fm.createDirectory(atPath: repo, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(atPath: repo) }
+        _ = try git(repo, "init", "-q", "-b", "main")
+        _ = try git(repo, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "base")
+        _ = try git(repo, "worktree", "add", "-q", ".worktrees/fix", "-b", "fix")
+        let wt = repo + "/.worktrees/fix"
+        try "x".write(toFile: wt + "/a.ts", atomically: true, encoding: .utf8)
+        _ = try git(wt, "add", "a.ts")
+        _ = try git(wt, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "fix")
+        let sha = try git(wt, "rev-parse", "--short", "HEAD")
+        let found = ReviewLists.worktrees(of: repo)
+        #expect(found.count == 1 && found[0].hasSuffix("/.worktrees/fix"))
+        #expect(ReviewLists.contains(found[0], commit: sha))
+        #expect(!ReviewLists.contains(repo, commit: sha))
+        #expect(!ReviewLists.contains(found[0], commit: "zz"))
     }
 }

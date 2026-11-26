@@ -176,8 +176,9 @@ Agents keep the state of a request in ProjectN instead of in files, through thes
 | `criteria_set` | The request's acceptance criteria: 1–8 observable results, each with how it's checked. Can be refined until one is checked. |
 | `criterion_update` | `met` / `unmet` with the evidence (command, test output, file, screenshot). Not by the agent fixing the work. |
 | `finding_open` | A problem for whoever fixes the work, anchored to `file:line`, a page element and viewport, a document or a criterion. Report ids (B20) are kept; otherwise P1, P2… |
-| `finding_update` | `fixed` (with the commit) by whoever fixed it; `closed` / `reopened` (with a note) by someone else. |
+| `finding_update` | `fixed` (with the commit) by whoever fixed it; `needs_decision` (with a note) when it can't be solved in the work — the criterion is wrong or it's your call — which stops the cycle at once and asks; `closed` / `reopened` (with a note) by someone else. |
 | `delivery_status` | The whole state: criteria, findings, cycle, worktrees. |
+| `criterion_amend` | Coordinators only: rewords a criterion when the right solution turned out different (e.g. the fix moved to another migration), with a reason. It goes back to pending, the old wording is kept and shown, and findings anchored only to it are closed. |
 
 Coordinators also get **`start_cycle(fixer, verifier, tester?, max_rounds?)`**. From then on ProjectN drives the request by itself, one step at a time: open or reopened findings go to the **fixer**; fixed ones to the **tester** (default: the verifier) to close or reopen; then the **verifier** checks every criterion and opens findings for what isn't met. It repeats until every criterion is met, or stops when the fix rounds run out (default 3) or agents stop updating anything. Steps run as delegated tasks of the coordinator (their progress shows in the same Slack thread), but their results aren't handed back one by one: the coordinator gets **one message when the cycle ends**, with criteria met, rounds and what's left, and tells you. The fixer can't verify or retest its own work, and can't mark criteria.
 
@@ -194,7 +195,7 @@ What to check whenever certain files change, written once per project and given 
 ~/.projectn/reviews/_all/<name>.md                     every project
 ```
 
-The first line may say which files trigger it — `when: saas/src/**, saas/migraciones/**` (`cuando:` works too; `**` = any folders, `*` = anything but `/`); without it the list always applies. The rest is the checklist. The cycle's verify step gets the lists that match what changed in the request's worktrees, with the instruction to open a finding for every point that fails; any agent can ask for them with `review_lists`. Deliveries shows which lists were applied.
+The first line may say which files trigger it — `when: saas/src/**, saas/migraciones/**` (`cuando:` works too; `**` = any folders, `*` = anything but `/`); without it the list always applies. The rest is the checklist. The cycle's verify step gets the lists that match what changed in the request's worktrees (also worktrees created before ProjectN saw them, found by the fix commits) and the files its findings and criteria point at, with the instruction to open a finding for every point that fails; any agent can ask for them with `review_lists`. Deliveries shows which lists were applied.
 
 ### Decisions
 

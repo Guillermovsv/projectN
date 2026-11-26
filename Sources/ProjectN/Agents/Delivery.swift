@@ -19,12 +19,17 @@ struct DeliveryCriterion: Codable, Hashable, Identifiable {
     var evidence: String?
     var by: String?
     var at: Date?
+    /// Earlier wordings, when the criterion was adjusted ("C5: was … — why").
+    var amendments: [String]?
 }
 
 /// A problem one agent found and another fixes: anchored to a file line, a page element, a document or a criterion.
 struct DeliveryFinding: Codable, Hashable, Identifiable {
     enum Status: String, Codable, CaseIterable {
         case open, fixed, closed, reopened
+        /// The fixer can't solve it in the work itself (the criterion is wrong, it needs the user's call): the cycle
+        /// stops and asks instead of spending rounds on it.
+        case needsDecision = "needs_decision"
         /// Waiting for whoever fixes things.
         var needsFix: Bool { self == .open || self == .reopened }
     }
@@ -155,6 +160,38 @@ extension DeliveryRecord {
         updatedAt = now
     }
 
+    /// Rewords a criterion when the right solution turned out different from what it says (coordinators only).
+    /// It goes back to pending, so the verifier checks it again; the old wording is kept.
+    mutating func amendCriterion(_ id: String, text: String?, check: String?, reason: String, by: String, now: Date = Date()) throws {
+        guard let i = criteria.firstIndex(where: { $0.id.caseInsensitiveCompare(id) == .orderedSame }) else {
+            throw DeliveryError.unknown("No criterion \(id). Criteria: \(criteria.map(\.id).joined(separator: ", ")).")
+        }
+        let why = reason.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !why.isEmpty else { throw DeliveryError.invalid("Give the `reason`: why the criterion changes.") }
+        let t = text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let k = check?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !t.isEmpty || !k.isEmpty else { throw DeliveryError.invalid("Give the new `text` and/or `check`.") }
+        var c = criteria[i]
+        c.amendments = (c.amendments ?? []) + ["Was: \(c.text) (check: \(c.check)) — changed by \(by): \(why)"]
+        if !t.isEmpty { c.text = t }
+        if !k.isEmpty { c.check = k }
+        c.status = .pending
+        c.evidence = nil
+        c.by = by
+        c.at = now
+        criteria[i] = c
+        // Findings that were only about the old wording are settled by the change.
+        for j in findings.indices where findings[j].status == .needsDecision || findings[j].status.needsFix {
+            let a = findings[j].anchor.folded
+            if a.contains("criterion \(c.id.folded)") || a.contains("criterio \(c.id.folded)") {
+                findings[j].status = .closed
+                findings[j].history.append(.init(status: .closed, by: by, at: now, note: "Criterion \(c.id) amended: \(why)"))
+            }
+        }
+        cycle?.verifiedSinceChange = false
+        updatedAt = now
+    }
+
     /// Opens a finding; returns its id. Ids from a report (B20, N05) are kept; otherwise P1, P2…
     @discardableResult
     mutating func openFinding(id: String?, text: String, anchor: String, severity: String?, by: String, now: Date = Date()) throws -> String {
@@ -187,6 +224,10 @@ extension DeliveryRecord {
         switch status {
         case .open:
             throw DeliveryError.invalid("Use fixed, closed or reopened.")
+        case .needsDecision:
+            guard f.status.needsFix else { throw DeliveryError.invalid("\(f.id) is \(f.status.rawValue): only an open finding can need a decision.") }
+            guard !(n ?? "").isEmpty else { throw DeliveryError.invalid("Give a `note`: what has to be decided and your recommendation.") }
+            f.fixedBy = by
         case .fixed:
             guard f.status.needsFix else { throw DeliveryError.invalid("\(f.id) is \(f.status.rawValue), not open: nothing to fix.") }
             let c = commit?.trimmingCharacters(in: .whitespaces) ?? ""
@@ -196,11 +237,13 @@ extension DeliveryRecord {
         case .closed, .reopened:
             // Its author may also withdraw a finding nobody has worked on yet (closed straight from open).
             let withdraw = status == .closed && f.status == .open && f.openedBy.folded == by.folded
-            guard f.status == .fixed || withdraw else {
+            guard f.status == .fixed || f.status == .needsDecision || withdraw else {
                 throw DeliveryError.invalid("Only a finding marked fixed can be \(status.rawValue) (\(f.id) is \(f.status.rawValue)).")
             }
             if let fixer = f.fixedBy, fixer.folded == by.folded {
-                throw DeliveryError.notAllowed("\(by) fixed \(f.id), so someone else has to check it.")
+                throw DeliveryError.notAllowed(f.status == .needsDecision
+                    ? "\(by) asked for a decision on \(f.id), so someone else decides it."
+                    : "\(by) fixed \(f.id), so someone else has to check it.")
             }
             guard !(n ?? "").isEmpty else { throw DeliveryError.invalid("Give a `note` with the evidence (what you ran or saw).") }
         }
@@ -220,6 +263,10 @@ extension DeliveryRecord {
 
     static func nextStep(_ r: DeliveryRecord) -> Next {
         guard let c = r.cycle, c.state == .running else { return .wait }
+        let undecided = r.findings.filter { $0.status == .needsDecision }
+        if !undecided.isEmpty {
+            return .stop("Needs a decision: " + undecided.map { "\($0.id) — \($0.history.last?.note ?? $0.text)" }.joined(separator: "; "))
+        }
         let toFix = r.findings.filter { $0.status.needsFix }.map(\.id)
         let fixed = r.findings.filter { $0.status == .fixed }.map(\.id)
         if !toFix.isEmpty {
@@ -275,6 +322,9 @@ extension DeliveryRecord {
         lines.append(left.isEmpty ? "All findings are closed (\(findings.count))."
                                   : "Not closed: " + left.map { "\($0.id) (\($0.status.rawValue)) \(PromptComposer.oneLine($0.text, 90))" }.joined(separator: "; "))
         if !worktrees.isEmpty { lines.append("Worktrees left: \(worktrees.joined(separator: ", ")) (the user can clean them up in Deliveries).") }
+        if findings.contains(where: { $0.status == .needsDecision }) || criteria.contains(where: { $0.status == .unmet }) {
+            lines.append("If a criterion's wording is what's wrong (the solution is right but different), adjust it with criterion_amend (reason required) — ask the user first if it changes what they asked for — then start_cycle again. Close or reopen findings that needed a decision with finding_update.")
+        }
         lines.append("Tell the user the outcome in a few lines (criteria, rounds, what's left, the branch) and what they need to do. Pushing / opening the PR is theirs.")
         return lines.joined(separator: "\n")
     }
@@ -294,6 +344,8 @@ enum CycleInstructions {
             \(list)
 
             For each one: fix it, run the relevant tests, commit (no push), then call finding_update(id, status: fixed, commit: <hash>).
+            If one can't be solved in the work itself (the criterion asks for something that is no longer right, or it needs the
+            user's call), don't retry: call finding_update(id, status: needs_decision, note: <what must be decided and what you recommend>).
             Don't mark anything closed and don't change the criteria. delivery_status shows the whole state.
             Answer in the user's language: one line per finding with what you changed.
             """
