@@ -2,8 +2,14 @@ import AppKit
 import SwiftUI
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    /// SwiftUI installs its own NSApp.delegate, so reach ours through this.
+    private(set) static weak var shared: AppDelegate?
+    override init() { super.init(); AppDelegate.shared = self }
+
     var store: Store?
     var agents: AgentHarness?
+    /// Set once the user already confirmed (e.g. the updater asked before staging its install script).
+    var quitConfirmed = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Needed when launched as a bare executable (swift run); harmless inside the .app bundle.
@@ -14,12 +20,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        // Everything (layout, conversations, terminal output) is saved and restored on next launch,
-        // so quitting doesn't need a confirmation.
+        // Everything (layout, conversations, terminal output) is saved and restored on next launch, so an
+        // idle quit needs no confirmation. Agents mid-turn would be cut off, so ask first (e.g. a stray ⌘Q).
+        if !quitConfirmed, !confirmQuitWhileWorking() { return .terminateCancel }
         if let store { MainActor.assumeIsolated { store.terminateAll() } }
         if let agents { MainActor.assumeIsolated { agents.saveNow() } }
         NVoiceController.shared.shutdown()
         return .terminateNow
+    }
+
+    /// True when it's fine to quit: nothing is working, or the user confirmed.
+    func confirmQuitWhileWorking() -> Bool {
+        guard let store else { return true }
+        let working = MainActor.assumeIsolated { store.workingPaneTitles }
+        guard !working.isEmpty else { return true }
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = working.count == 1
+            ? "An agent is still working. Quit ProjectN?"
+            : "\(working.count) agents are still working. Quit ProjectN?"
+        let shown = working.prefix(6).map { "• \($0)" }
+        let more = working.count > shown.count ? ["…and \(working.count - shown.count) more"] : []
+        alert.informativeText = (shown + more).joined(separator: "\n")
+            + "\n\nQuitting stops them mid-task. Conversations are restored on next launch, but the current turn is lost."
+        alert.addButton(withTitle: "Cancel")
+        let quit = alert.addButton(withTitle: "Quit Anyway")
+        quit.hasDestructiveAction = true
+        NSApp.activate(ignoringOtherApps: true)
+        return alert.runModal() == .alertSecondButtonReturn
     }
 }
 

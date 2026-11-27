@@ -942,6 +942,16 @@ final class Store: ObservableObject {
         return Tool.allCases.filter { $0.hasUsageMeter && present.contains($0) }
     }
 
+    /// Titles of the panes whose agent is mid-turn right now (Claude/Codex/Cursor working, or an AI CLI
+    /// running in a shell pane). Used to confirm before quitting.
+    var workingPaneTitles: [String] {
+        state.workspaces.flatMap(\.spaces).flatMap(\.panes).compactMap { p in
+            guard let rt = runtimes[p.id], rt.isRunning else { return nil }
+            let working = p.tool == .terminal ? rt.foregroundAICLI != nil : rt.activity == .working
+            return working ? paneTitle(p) : nil
+        }
+    }
+
     func paneTitle(_ p: Pane) -> String {
         p.title ?? "\(p.tool.label) · \(project(p.projectID)?.name ?? "?")"
     }

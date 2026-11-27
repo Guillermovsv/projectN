@@ -419,6 +419,11 @@ final class UpdateModel: ObservableObject {
         guard case .ready(let sha) = phase, FileManager.default.fileExists(atPath: Self.stagedApp.path) else { return }
         let current = Bundle.main.bundleURL
         let dest = current.pathExtension == "app" ? current : URL(fileURLWithPath: "/Applications/ProjectN.app")
+        // Ask before staging the install script: once it runs it waits for us to quit, so cancelling later is unsafe.
+        if let app = AppDelegate.shared {
+            guard app.confirmQuitWhileWorking() else { return }
+            app.quitConfirmed = true
+        }
         let script = Self.dir.appendingPathComponent("install.sh")
         let body = """
         #!/bin/bash
