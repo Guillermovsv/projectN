@@ -20,10 +20,25 @@ enum AgentStarterPack {
         [AgentProfile.projectManager(), developer(), qa(), verifier()]
     }
 
-    /// The pack's agents that `existing` doesn't have yet (by name, ignoring case, accents and spaces).
+    /// Other names that count as the same agent: you may already have a "PM", a "Dev" or a "Verifier".
+    static let aliases: [String: [String]] = [
+        projectManagerName: ["pm", "project manager", "projectmanager", "gerente de proyecto", "jefe de proyecto"],
+        developerName: ["dev", "developer", "desarrollador", "desarrolladora", "programador", "programadora"],
+        qaName: ["qa", "tester", "q.a."],
+        verifierName: ["verificador", "verificadora", "verifier"],
+    ]
+
+    /// The agent you already have for this pack agent: same name or one of its aliases, ignoring case, accents,
+    /// spaces, dashes and underscores.
+    static func existing(_ packName: String, in profiles: [AgentProfile]) -> AgentProfile? {
+        let key: (String) -> String = { $0.folded.filter { !" -_".contains($0) } }
+        let names = Set(([packName] + (aliases[packName] ?? [])).map(key))
+        return profiles.first { names.contains(key($0.name)) }
+    }
+
+    /// The pack's agents that `existing` doesn't have yet.
     static func missing(in existing: [AgentProfile]) -> [AgentProfile] {
-        let names = Set(existing.map { $0.name.trimmingCharacters(in: .whitespaces).folded })
-        return profiles().filter { !names.contains($0.name.folded) }
+        profiles().filter { self.existing($0.name, in: existing) == nil }
     }
 
     /// One line per agent, for the offer.
@@ -84,7 +99,7 @@ enum AgentStarterPack {
       - Verificador: comprueba cada criterio con evidencia; nunca es quien hizo el trabajo.
       - Si hay agentes más adecuados para la tarea (SEO, contenido, diseño…), úsalos. Si el usuario pide un agente concreto (“pídele / dile al developer…”), respétalo.
     - Cada delegate_task lleva instrucción y contexto completos: el objetivo con las palabras del usuario, dónde está todo (archivos, URLs, IDs), lo ya decidido y los criterios. El otro agente no ve tu conversación.
-    - Cierra el ciclo: cuando el Developer termine un cambio, inicia start_cycle (fixer: Developer, tester: QA, verifier: Verificador) para que ProjectN repita corregir → re-probar → verificar hasta que todo se cumpla. Termina tu turno después de iniciarlo; recibirás un mensaje con el resultado.
+    - Cierra el ciclo: cuando el Developer termine un cambio, inicia start_cycle (fixer: Developer, tester: QA, verifier: Verificador) para que ProjectN repita corregir → re-probar → verificar hasta que todo se cumpla. Usa los agentes que list_agents muestre para cada papel: sin QA, el verificador también re-prueba; sin nadie que verifique (que no sea quien hizo el trabajo), revisa tú el resultado contra los criterios. Termina tu turno después de iniciarlo; recibirás un mensaje con el resultado.
     - Si el trabajo terminó en un pull request, usa ship_pr con el Developer para dejarlo listo para merge. El merge lo decide el usuario.
     - Guarda con save_project_note los datos duraderos que descubras (dónde vive cada cosa, URLs, convenciones, decisiones). Nunca secretos.
     - No inventes información sobre archivos, tareas o resultados. No le devuelvas al usuario lo que otro agente puede resolver.

@@ -118,6 +118,7 @@ struct AgentsSidebar: View {
     @EnvironmentObject var panel: RightPanelModel
     var onHide: () -> Void
     @State private var creating = false
+    @State private var choosingPack = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -132,7 +133,7 @@ struct AgentsSidebar: View {
                     Button { creating = true } label: { Label("Create with AI…", systemImage: "sparkles") }
                     Button { newAgent() } label: { Label("Blank Agent", systemImage: "plus") }
                     Divider()
-                    StarterPackMenuItem { id in nav.showDeliveries = false; nav.selectedAgentID = id }
+                    StarterPackMenuItem { choosingPack = true }
                 } label: { Image(systemName: "plus") }
                 .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
                 .help("New agent")
@@ -153,7 +154,7 @@ struct AgentsSidebar: View {
                     .padding(.horizontal, 8)
                     .frame(height: 24)
                     if agents.offersStarterPack && !agents.profiles.isEmpty {
-                        StarterPackCard(compact: true) { id in nav.showDeliveries = false; nav.selectedAgentID = id }
+                        StarterPackCard { choosingPack = true }
                             .padding(.bottom, 6)
                     } else if agents.profiles.isEmpty {
                         Text("No agents yet.").font(.callout).foregroundStyle(.secondary).padding(8)
@@ -169,6 +170,9 @@ struct AgentsSidebar: View {
         .onAppear { if nav.selectedAgentID.flatMap(agents.profile) == nil { nav.selectedAgentID = agents.profiles.first?.id } }
         .sheet(isPresented: $creating) {
             AgentCreatorSheet(harness: agents, store: store) { id in nav.selectedAgentID = id }
+        }
+        .sheet(isPresented: $choosingPack) {
+            StarterPackSheet { id in nav.showDeliveries = false; nav.selectedAgentID = id }
         }
     }
 
@@ -266,72 +270,122 @@ struct AgentsSidebar: View {
 
 // MARK: - Default agent pack
 
-/// The offer to add the default agents (AgentStarterPack). Compact: a card in the sidebar; else the full list.
-struct StarterPackCard: View {
+/// The default agents (AgentStarterPack) with a checkbox each: you choose which to add. Agents you already have
+/// (same name or an alias, e.g. "PM", "Dev") show as added and are never created again.
+struct StarterPackPicker: View {
     @EnvironmentObject var agents: AgentHarness
-    var compact: Bool
     var onAdded: (UUID) -> Void
+    var onCancel: (() -> Void)?
+    /// Pack names ticked; nil until the user changes something = every missing agent.
+    @State private var picked: Set<String>?
 
     var body: some View {
         let missing = Set(agents.missingStarterAgents.map(\.name))
-        VStack(alignment: .leading, spacing: compact ? 6 : 12) {
+        let chosen = (picked ?? missing).intersection(missing)
+        VStack(alignment: .leading, spacing: 12) {
             HStack(spacing: 8) {
                 Image(systemName: "person.3.fill").foregroundStyle(Color.accentColor)
-                Text("Default agent pack").font(compact ? .callout.weight(.semibold) : .headline)
+                Text("Default agent pack").font(.headline)
             }
-            if compact {
-                Text(AgentStarterPack.summaries.filter { missing.contains($0.name) }.map(\.name).joined(separator: ", ")
-                     + " — ready for any project.")
-                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-            } else {
-                Text("Four agents that work together on any project: you ask the Project Manager, it hands the work out, and you get the result checked.")
-                    .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                ForEach(AgentStarterPack.summaries.filter { missing.contains($0.name) }, id: \.name) { a in
-                    HStack(alignment: .top, spacing: 10) {
-                        Image(systemName: a.symbol).frame(width: 22).foregroundStyle(.secondary)
-                        VStack(alignment: .leading, spacing: 1) {
-                            Text(a.name).font(.callout.weight(.medium))
-                            Text(a.line).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                        }
-                    }
-                }
-                Text("They work in all your projects with Claude Code. Deleting, publishing and anything outside a project still ask you. You can edit or remove each one later.")
-                    .font(.caption).foregroundStyle(.tertiary).fixedSize(horizontal: false, vertical: true)
+            Text(missing.isEmpty
+                 ? "You already have every agent of the pack."
+                 : "Agents that work together on any project: you ask the Project Manager, it hands the work out, and you get the result checked. Choose the ones you want.")
+                .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            ForEach(AgentStarterPack.summaries, id: \.name) { a in
+                row(a, have: AgentStarterPack.existing(a.name, in: agents.profiles), on: chosen.contains(a.name))
             }
+            Text("They work in all your projects with Claude Code. Deleting, publishing and anything outside a project still ask you. You can edit or remove each one later.")
+                .font(.caption).foregroundStyle(.tertiary).fixedSize(horizontal: false, vertical: true)
             HStack(spacing: 8) {
-                Button(compact ? "Add" : "Add the \(missing.count) agents") { add() }
-                    .buttonStyle(.borderedProminent).controlSize(compact ? .small : .regular)
-                if agents.policy.starterPackOffered {
-                    Button("Not now") { agents.dismissStarterPack() }
-                        .buttonStyle(.borderless).controlSize(compact ? .small : .regular)
+                Button(chosen.count == 1 ? "Add 1 agent" : "Add \(chosen.count) agents") {
+                    if let first = agents.addStarterPack(only: chosen).first { onAdded(first.id) }
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(chosen.isEmpty)
+                .keyboardShortcut(.defaultAction)
+                if let onCancel {
+                    Button("Cancel", action: onCancel).keyboardShortcut(.cancelAction)
+                } else if agents.policy.starterPackOffered {
+                    Button("Not now") { agents.dismissStarterPack() }.buttonStyle(.borderless)
                 }
             }
         }
-        .padding(compact ? 10 : 18)
+        .padding(18)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(Color.primary.opacity(0.05)))
         .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(Color.primary.opacity(0.08)))
     }
 
-    private func add() {
-        if let first = agents.addStarterPack().first { onAdded(first.id) }
+    private func row(_ a: (name: String, symbol: String, line: String), have: AgentProfile?, on: Bool) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            if have != nil {
+                Image(systemName: "checkmark.circle.fill").foregroundStyle(.green).frame(width: 18)
+            } else {
+                Toggle("", isOn: Binding(get: { on }, set: { v in
+                    var s = picked ?? Set(agents.missingStarterAgents.map(\.name))
+                    if v { s.insert(a.name) } else { s.remove(a.name) }
+                    picked = s
+                }))
+                .toggleStyle(.checkbox).labelsHidden().frame(width: 18)
+            }
+            Image(systemName: a.symbol).frame(width: 22).foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(a.name).font(.callout.weight(.medium))
+                Text(have.map { $0.name.folded == a.name.folded ? "Already added." : "Already added as “\($0.name)”." } ?? a.line)
+                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .opacity(have != nil ? 0.6 : 1)
+        .contentShape(Rectangle())
     }
 }
 
-/// "+" menu item: adds whatever of the pack is missing.
-struct StarterPackMenuItem: View {
-    @EnvironmentObject var agents: AgentHarness
+/// The picker in a sheet (from the "+" menus and the sidebar card).
+struct StarterPackSheet: View {
+    @Environment(\.dismiss) private var dismiss
     var onAdded: (UUID) -> Void
 
     var body: some View {
+        StarterPackPicker(onAdded: { id in onAdded(id); dismiss() }, onCancel: { dismiss() })
+            .padding(16)
+            .frame(width: 520)
+    }
+}
+
+/// Sidebar card while the offer stands and you already have some agent of your own.
+struct StarterPackCard: View {
+    @EnvironmentObject var agents: AgentHarness
+    var onChoose: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                Image(systemName: "person.3.fill").foregroundStyle(Color.accentColor)
+                Text("Default agent pack").font(.callout.weight(.semibold))
+            }
+            Text(agents.missingStarterAgents.map(\.name).joined(separator: ", ") + " — ready for any project.")
+                .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 8) {
+                Button("Choose…", action: onChoose).buttonStyle(.borderedProminent).controlSize(.small)
+                Button("Not now") { agents.dismissStarterPack() }.buttonStyle(.borderless).controlSize(.small)
+            }
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(Color.primary.opacity(0.05)))
+        .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(Color.primary.opacity(0.08)))
+    }
+}
+
+/// "+" menu item: opens the picker; off when you already have the whole pack.
+struct StarterPackMenuItem: View {
+    @EnvironmentObject var agents: AgentHarness
+    var open: () -> Void
+
+    var body: some View {
         let missing = agents.missingStarterAgents
-        Button {
-            if let first = agents.addStarterPack().first { onAdded(first.id) }
-        } label: {
-            Label(missing.isEmpty ? "Default Agent Pack (added)"
-                  : missing.count == AgentStarterPack.summaries.count ? "Default Agent Pack (PM, Dev, QA, Verificador)"
-                  : "Default Agent Pack: add " + missing.map(\.name).joined(separator: ", "),
-                  systemImage: "person.3")
+        Button(action: open) {
+            Label(missing.isEmpty ? "Default Agent Pack (all added)" : "Default Agent Pack…", systemImage: "person.3")
         }
         .disabled(missing.isEmpty)
     }
@@ -361,7 +415,7 @@ struct AgentsDetailView: View {
                         Image(systemName: "person.3").font(.system(size: 40)).foregroundStyle(.tertiary)
                         Text("No agents yet").font(.title3)
                         Text("Agents run tasks in your projects — from here or from Slack.").foregroundStyle(.secondary)
-                        StarterPackCard(compact: false) { id in nav.selectedAgentID = id }
+                        StarterPackPicker(onAdded: { id in nav.selectedAgentID = id })
                             .frame(maxWidth: 520)
                         Button("Or create your own in Agent Settings") { nav.openSettings(.agents, panel: panel) }
                             .buttonStyle(.link)

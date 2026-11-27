@@ -57,7 +57,7 @@ struct AgentsSettingsView: View {
                         Button { creatingWithAI = true } label: { Label("Create with AI…", systemImage: "sparkles") }
                         Button { selection = newProfile() } label: { Label("Blank Agent", systemImage: "plus") }
                         Divider()
-                        StarterPackMenuItem { id in selection = id }
+                        StarterPackMenuItem { choosingPack = true }
                     } label: { Image(systemName: "plus") }
                     .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
                     .help("New agent")
@@ -81,6 +81,9 @@ struct AgentsSettingsView: View {
         .sheet(isPresented: $creatingWithAI) {
             AgentCreatorSheet(harness: agents, store: store) { id in selection = id }
         }
+        .sheet(isPresented: $choosingPack) {
+            StarterPackSheet { id in selection = id }
+        }
         .alert("Delete \(selection.flatMap { agents.profile($0)?.name } ?? "agent")?", isPresented: $confirmDelete) {
             Button("Delete", role: .destructive) {
                 if let id = selection { agents.deleteProfile(id); selection = agents.profiles.first?.id }
@@ -93,6 +96,7 @@ struct AgentsSettingsView: View {
 
     @State private var confirmDelete = false
     @State private var creatingWithAI = false
+    @State private var choosingPack = false
 
     private func newProfile() -> UUID {
         var p = AgentProfile(name: "New Agent", role: "Developer", model: "claude-sonnet-5-5", effort: "medium",

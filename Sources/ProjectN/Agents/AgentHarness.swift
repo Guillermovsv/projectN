@@ -253,14 +253,16 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
     /// Show the offer: a fresh install that hasn't added or dismissed the pack.
     var offersStarterPack: Bool { policy.starterPackOffered && !missingStarterAgents.isEmpty }
 
-    /// Adds the pack's missing agents (an agent you already have with the same name is kept as it is).
+    /// Adds the pack's agents you chose (`only`: their pack names; nil = all). Never one you already have under
+    /// that name or an alias (AgentStarterPack.existing): yours is kept as it is.
     @discardableResult
-    func addStarterPack() -> [AgentProfile] {
-        let added = missingStarterAgents
+    func addStarterPack(only names: Set<String>? = nil) -> [AgentProfile] {
+        let added = missingStarterAgents.filter { names?.contains($0.name) ?? true }
         profiles += added
+        guard !added.isEmpty else { return [] }
         policy.starterPackOffered = false
         AgentStore.saveProfiles(profiles, policy: policy)
-        if !added.isEmpty { onProfilesChanged?() }
+        onProfilesChanged?()
         AuditLog.record("agents.starter_pack_added", ["agents": added.map(\.name).joined(separator: ", ")])
         return added
     }

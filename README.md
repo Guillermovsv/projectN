@@ -209,7 +209,7 @@ When you answer an agent's question (`ask`), the question and your answer are sa
 
 Each profile has: name, role, provider (Anthropic / OpenAI / other compatible), runtime (Claude Code / Codex CLI), model, reasoning effort, instructions, allowed tools, access level, project access, context sources, session policy, concurrency limit, timeout and an on/off switch. Profiles can be created, edited, duplicated and deleted.
 
-**Default agent pack** — a fresh install starts with no agents. The Agents view offers the pack (add it or "Not now"); it's also in the **+** menus (Agents sidebar, Settings → Agents), which add only the agents you don't have by name. Each comes with template instructions that work for any user and project (`AgentStarterPack.swift`), editable afterwards:
+**Default agent pack** — a fresh install starts with no agents. The Agents view offers the pack with a checkbox per agent, so you add only the ones you want (or "Not now"); it's also in the **+** menus (Agents sidebar, Settings → Agents → *Default Agent Pack…*). An agent you already have under the same name or a common alias (*PM*, *Dev*, *Desarrollador*, *Tester*, *Verifier*…) shows as already added and is never created again; the menu item is off once you have them all. Each comes with template instructions that work for any user and project (`AgentStarterPack.swift`), editable afterwards:
 
 | Agent | Model | Access | Role in a request |
 |---|---|---|---|

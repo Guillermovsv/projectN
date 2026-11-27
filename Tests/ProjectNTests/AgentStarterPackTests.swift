@@ -74,6 +74,15 @@ struct AgentStarterPackTests {
         #expect(AgentStarterPack.missing(in: AgentStarterPack.profiles()).isEmpty)
     }
 
+    @Test func agentsYouAlreadyHaveUnderAnotherCommonNameCount() {
+        func named(_ n: String) -> AgentProfile { AgentProfile(name: n, role: "x", model: "claude-opus-5-5", instructions: "") }
+        #expect(AgentStarterPack.missing(in: [named("PM"), named("Dev"), named("verifier")]).map(\.name) == ["QA"])
+        #expect(AgentStarterPack.missing(in: [named("project-manager"), named("Desarrollador"), named("Q.A."), named("VERIFICADORA")]).isEmpty)
+        #expect(AgentStarterPack.existing("Developer", in: [named("SEO"), named(" dev ")])?.name == " dev ")
+        // Different agents don't count: a "Developer 2" or a "Dev Ops" isn't the Developer.
+        #expect(AgentStarterPack.missing(in: [named("Developer 2"), named("DevOps"), named("QA Lead")]).count == 4)
+    }
+
     @Test func installsFromBeforeThePackDontGetTheOffer() throws {
         let old = try JSONDecoder().decode(AgentPolicy.self, from: Data(#"{"autonomyMigrated": true}"#.utf8))
         #expect(!old.starterPackOffered)

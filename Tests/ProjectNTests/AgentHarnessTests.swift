@@ -183,6 +183,23 @@ struct AgentHarnessTests {
         #expect(other.profiles.isEmpty && !other.offersStarterPack && other.missingStarterAgents.count == 4)
     }
 
+    @Test func youChooseWhichPackAgentsToAddAndExistingOnesAreNeverDuplicated() async throws {
+        AppHome.bootstrap()
+        try? FileManager.default.removeItem(at: AgentStore.profilesFile)
+        let harness = AgentHarness(catalog: ModelCatalog())
+        // Only the ones ticked.
+        #expect(harness.addStarterPack(only: ["Project Manager", "Verificador"]).map(\.name) == ["Project Manager", "Verificador"])
+        #expect(harness.missingStarterAgents.map(\.name) == ["Developer", "QA"])
+        // Your own "Dev" is the Developer: asking for it again creates nothing.
+        var mine = AgentProfile(name: "Dev", role: "Developer", model: "claude-opus-5-5", instructions: "mine")
+        mine.permission = .readOnly
+        harness.saveProfile(mine)
+        #expect(harness.addStarterPack(only: ["Developer", "Project Manager"]).isEmpty)
+        #expect(harness.profiles.filter { AgentStarterPack.existing("Developer", in: [$0]) != nil }.map(\.instructions) == ["mine"])
+        #expect(harness.addStarterPack().map(\.name) == ["QA"])
+        #expect(harness.addStarterPack().isEmpty && harness.profiles.count == 4)
+    }
+
     // MARK: Acceptance
 
     @Test func slackFilesReachTheAgentInsideTheProject() async throws {
