@@ -18,7 +18,7 @@ extension Store {
             let quiet = entry.runtime.map { Date().timeIntervalSince($0.lastOutputAt) } ?? 0
             return OfficeAgent(id: p.id, workspaceID: entry.workspace.id, name: paneTitle(p),
                                project: project(p.projectID)?.name ?? "?", status: status,
-                               resting: status == .idle && quiet >= OfficeAgent.sleepAfter)
+                               resting: status == .idle && quiet >= OfficeAgent.sleepAfter, projectID: p.projectID)
         }
     }
 }

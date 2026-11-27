@@ -27,6 +27,12 @@ struct OfficeAgent: Equatable, Identifiable {
     var status: OfficeStatus
     /// Idle for a long time: it goes to bed instead of playing.
     var resting = false
+    var projectID: UUID? = nil
+
+    /// What groups agents of the same project.
+    var projectKey: String { projectID?.uuidString ?? project }
+
+    var isBusy: Bool { status == .working || status == .needsInput }
 
     /// How long without activity before an idle agent stops playing and goes to sleep.
     static let sleepAfter: TimeInterval = 10 * 60
@@ -73,6 +79,12 @@ struct OfficeBridge {
     private(set) var numbers: [UUID: Int] = [:]
     private var nextNumber = 1
     private var sent: [UUID: OfficeAgent] = [:]
+    /// Project → the meeting room it holds, and agent → the room it was sent to.
+    private(set) var rooms: [String: String] = [:]
+    private var sentRooms: [UUID: String] = [:]
+
+    /// The office's meeting rooms: the names of the layout Areas that are used as such.
+    static let meetingRooms = ["Meeting 1", "Meeting 2"]
 
     func paneID(for number: Int) -> UUID? {
         numbers.first { $0.value == number }?.key
@@ -81,6 +93,7 @@ struct OfficeBridge {
     /// Messages for a (re)loaded interface, to send after the assets: the agents, the layout, then their state.
     mutating func snapshot(_ agents: [OfficeAgent], saved: OfficeSaved, defaultLayout: Any) -> [Message] {
         sent = [:]
+        sentRooms = [:]
         var meta: [String: Message] = [:]
         var directories: [String: String] = [:]
         var ids: [Int] = []
@@ -102,6 +115,7 @@ struct OfficeBridge {
             out.append(leisureMessage(agent))
             sent[agent.id] = agent
         }
+        out += roomMessages(agents)
         return out
     }
 
@@ -112,6 +126,7 @@ struct OfficeBridge {
         for id in sent.keys.filter({ !current.contains($0) }).sorted(by: { number($0) < number($1) }) {
             out.append(["type": "agentClosed", "id": number(id)])
             sent[id] = nil
+            sentRooms[id] = nil
         }
         for agent in agents {
             let n = number(agent.id)
@@ -129,6 +144,33 @@ struct OfficeBridge {
             if old.status != agent.status { out += statusMessages(agent, from: old.status) }
             if old.leisure != agent.leisure { out.append(leisureMessage(agent)) }
             sent[agent.id] = agent
+        }
+        out += roomMessages(agents)
+        return out
+    }
+
+    /// A project gets a meeting room when two or more of its agents are working at once, and keeps it while any of
+    /// them still is. Only the busy ones sit there; with every room taken, the next project stays at its desks.
+    private mutating func roomMessages(_ agents: [OfficeAgent]) -> [Message] {
+        let busy = Dictionary(grouping: agents.filter(\.isBusy), by: \.projectKey)
+        rooms = rooms.filter { busy[$0.key] != nil }
+        // The biggest teams first; same size, the one listed first.
+        var order: [String] = []
+        for agent in agents where agent.isBusy && !order.contains(agent.projectKey) { order.append(agent.projectKey) }
+        let waiting = order.enumerated()
+            .filter { rooms[$0.element] == nil && (busy[$0.element]?.count ?? 0) >= 2 }
+            .sorted { (busy[$0.element]!.count, $1.offset) > (busy[$1.element]!.count, $0.offset) }
+        for (_, project) in waiting {
+            guard let free = Self.meetingRooms.first(where: { !rooms.values.contains($0) }) else { break }
+            rooms[project] = free
+        }
+        var out: [Message] = []
+        for agent in agents {
+            let room = agent.isBusy ? rooms[agent.projectKey] : nil
+            guard sentRooms[agent.id] != room else { continue }
+            sentRooms[agent.id] = room
+            // ProjectN's own message (see scripts/office/pixel-agents.patch).
+            out.append(["type": "agentRoom", "id": number(agent.id), "room": room ?? NSNull()])
         }
         return out
     }

@@ -31,4 +31,55 @@ const messages = [
   { type: 'carpetTilesLoaded', sets: decodeAllCarpets(dir) },
   { type: 'furnitureAssetsLoaded', catalog, sprites: decodeAllFurniture(dir, catalog) },
 ];
+addMeetingRooms(layout);
 fs.writeFileSync(out, JSON.stringify({ messages, defaultLayout: layout }));
+
+// Two meeting rooms to the right of the lounge, each with a table and six chairs. Their floor is an Area named
+// "Meeting 1" / "Meeting 2": that name is how ProjectN seats a project's agents together (OfficeBridge.swift),
+// so any area painted with it in the Layout editor works as that room.
+function addMeetingRooms(l: any) {
+  const cols = 28, rows = l.rows;
+  const at = (c: number, r: number) => r * l.cols + c;
+  const VOID = 255, WALL = 0;
+  const wallColour = l.tileColors[at(19, 12)];
+  const floor = l.tiles[at(15, 15)], floorColour = l.tileColors[at(15, 15)];
+  if (l.tiles[at(19, 12)] !== WALL || floor === WALL || floor === VOID) throw new Error('default layout changed');
+  const tiles: number[] = [], tileColors: unknown[] = [], areaTiles: Array<string | null> = [];
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      const old = c < l.cols && r < l.rows;
+      tiles.push(old ? l.tiles[at(c, r)] : VOID);
+      tileColors.push(old ? l.tileColors[at(c, r)] : null);
+      areaTiles.push(null);
+    }
+  }
+  const set = (c: number, r: number, tile: number, colour: unknown, area: string | null = null) => {
+    tiles[r * cols + c] = tile;
+    tileColors[r * cols + c] = colour;
+    areaTiles[r * cols + c] = area;
+  };
+  // Like the lounge, the lower room has no bottom wall.
+  for (let r = 10; r <= 20; r++) {
+    for (let c = 19; c <= 27; c++) {
+      const wall = c === 19 || c === 27 || r === 10 || r === 16;
+      if (wall) set(c, r, WALL, wallColour);
+    }
+  }
+  for (const [name, top, depth] of [['Meeting 1', 11, 5], ['Meeting 2', 17, 4]] as const) {
+    for (let r = top; r < top + depth; r++) for (let c = 20; c <= 26; c++) set(c, r, floor, floorColour, name);
+    // Door from the lounge.
+    set(19, top + 1, floor, floorColour);
+    set(19, top + 2, floor, floorColour);
+    const n = name.slice(-1);
+    l.furniture.push({ uid: `pn-table-${n}`, type: 'TABLE_FRONT', col: 22, row: top });
+    for (let i = 0; i < 3; i++) {
+      l.furniture.push({ uid: `pn-chair-${n}-l${i}`, type: 'CUSHIONED_CHAIR_SIDE', col: 21, row: top + 1 + i });
+      l.furniture.push({ uid: `pn-chair-${n}-r${i}`, type: 'CUSHIONED_CHAIR_SIDE:left', col: 25, row: top + 1 + i });
+    }
+  }
+  Object.assign(l, {
+    cols, rows, tiles, tileColors, areaTiles,
+    areas: [{ label: 'Meeting 1', color: '#6aa9ff' }, { label: 'Meeting 2', color: '#ffb86a' }],
+  });
+  delete l.carpetTiles;
+}

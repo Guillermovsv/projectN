@@ -39,6 +39,32 @@ struct OfficeTests {
         #expect(swapped[1]["id"] as? Int == 2)
     }
 
+    @Test func busyAgentsOfOneProjectShareAMeetingRoom() {
+        var bridge = OfficeBridge()
+        func make(_ project: String, _ status: OfficeStatus = .working) -> OfficeAgent {
+            OfficeAgent(id: UUID(), workspaceID: UUID(), name: "n", project: project, status: status)
+        }
+        var app = [make("app"), make("app")]
+        let web = [make("web"), make("web", .needsInput), make("web")]
+        let docs = [make("docs"), make("docs")]
+        let solo = make("solo")
+        let out = bridge.snapshot(app + [solo] + web + docs, saved: OfficeSaved(), defaultLayout: [:])
+        // The two biggest teams (ties: first listed) get the two rooms.
+        #expect(bridge.rooms == ["web": "Meeting 1", "app": "Meeting 2"])
+        #expect(out.filter { $0["type"] as? String == "agentRoom" }.count == 5)
+
+        // One of the pair finishes: it leaves, the other keeps the room.
+        app[1].status = .idle
+        let left = bridge.update(app + [solo] + web + docs, saved: OfficeSaved())
+        #expect(left.filter { $0["type"] as? String == "agentRoom" }.count == 1)
+        #expect(bridge.rooms["app"] == "Meeting 2")
+
+        // The whole project stops: the room goes to the next team.
+        app[0].status = .idle
+        _ = bridge.update(app + [solo] + web + docs, saved: OfficeSaved())
+        #expect(bridge.rooms == ["web": "Meeting 1", "docs": "Meeting 2"])
+    }
+
     @Test func idleAgentsPlayThenSleep() {
         var bridge = OfficeBridge()
         let id = UUID()

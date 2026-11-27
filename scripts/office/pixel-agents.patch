@@ -20,13 +20,15 @@ index 3eb91a2..c747b10 100644
        <VersionIndicator
          currentVersion={extensionVersion}
 diff --git a/webview-ui/src/hooks/useExtensionMessages.ts b/webview-ui/src/hooks/useExtensionMessages.ts
-index 649025d..67b66c8 100644
+index 649025d..d13b616 100644
 --- a/webview-ui/src/hooks/useExtensionMessages.ts
 +++ b/webview-ui/src/hooks/useExtensionMessages.ts
-@@ -901,6 +901,8 @@ export function useExtensionMessages(
+@@ -901,6 +901,10 @@ export function useExtensionMessages(
            msg.leadAgentId as number | undefined,
            msg.teamUsesTmux as boolean | undefined,
          );
++      } else if (msg.type === 'agentRoom') {
++        os.setRoom(msg.id as number, (msg.room as string | null) ?? null);
 +      } else if (msg.type === 'agentLeisure') {
 +        os.setLeisure(msg.id as number, (msg.mode as 'play' | 'sleep' | null) ?? null);
        } else if (msg.type === 'agentContextUsage') {
@@ -279,7 +281,7 @@ index 0000000..e4d92b3
 +  return true;
 +}
 diff --git a/webview-ui/src/office/engine/officeState.ts b/webview-ui/src/office/engine/officeState.ts
-index 1afd778..decd0ea 100644
+index 1afd778..5f00700 100644
 --- a/webview-ui/src/office/engine/officeState.ts
 +++ b/webview-ui/src/office/engine/officeState.ts
 @@ -34,12 +34,14 @@ import type {
@@ -297,20 +299,80 @@ index 1afd778..decd0ea 100644
  import { advanceMatrixEffect, startMatrixEffect } from './matrixEffectState.js';
  import { createPet, updatePet } from './petEntity.js';
  import { anchorTile, closestFreeSeat } from './seatPlacement.js';
-@@ -201,6 +203,9 @@ export class OfficeState {
+@@ -201,6 +203,15 @@ export class OfficeState {
        }
      }
  
-+    // Spots belong to the old layout.
-+    for (const ch of this.characters.values()) leaveSpot(ch);
++    // Spots belong to the old layout. Meeting seats are taken again afterwards (updateRoom).
++    for (const ch of this.characters.values()) {
++      leaveSpot(ch);
++      if (ch.homeSeatId !== undefined) {
++        ch.seatId = ch.homeSeatId;
++        ch.homeSeatId = undefined;
++      }
++    }
 +
      // Reassign characters to new seats, preserving existing assignments when possible
      for (const seat of this.seats.values()) {
        seat.assigned = false;
-@@ -1193,6 +1198,61 @@ export class OfficeState {
+@@ -615,6 +626,9 @@ export class OfficeState {
+       if (seat) seat.assigned = false;
+       ch.seatId = null;
+     }
++    // ProjectN: the desk it left for a meeting room.
++    this.freeSeat(ch.homeSeatId ?? null);
++    ch.homeSeatId = undefined;
+     this.forgetSelection(id);
+     // Start despawn animation instead of immediate delete
+     startMatrixEffect(ch, 'despawn');
+@@ -1193,6 +1207,105 @@ export class OfficeState {
      ch.contextReported = true;
    }
  
++  /** ProjectN: the meeting room (an Area) an agent works in, or null for its own desk. */
++  setRoom(id: number, room: string | null): void {
++    const ch = this.characters.get(id);
++    if (ch) ch.room = room;
++  }
++
++  /** ProjectN: move to a free chair of its meeting room, or back to its own desk. */
++  private updateRoom(ch: Character): void {
++    const inRoom = ch.homeSeatId !== undefined;
++    const current = ch.seatId ? this.seatZone(ch.seatId) : null;
++    if (ch.room) {
++      if (current === ch.room) return;
++      const free = [...this.seats.values()].find((s) => !s.assigned && this.seatZone(s.uid) === ch.room);
++      if (!free) return;
++      if (!inRoom) ch.homeSeatId = ch.seatId;
++      else this.freeSeat(ch.seatId);
++      free.assigned = true;
++      ch.seatId = free.uid;
++    } else {
++      if (!inRoom) return;
++      this.freeSeat(ch.seatId);
++      ch.seatId = ch.homeSeatId ?? null;
++      ch.homeSeatId = undefined;
++    }
++    // At work it walks over; off duty it just changes desks.
++    const seat = ch.seatId ? this.seats.get(ch.seatId) : undefined;
++    if (!ch.isActive || !seat) return;
++    leaveSpot(ch);
++    const path = this.withOwnSeatUnblocked(ch, () =>
++      findPath(ch.tileCol, ch.tileRow, seat.seatCol, seat.seatRow, this.tileMap, this.blockedTiles),
++    );
++    ch.path = path;
++    ch.moveProgress = 0;
++    ch.frame = 0;
++    ch.frameTimer = 0;
++    ch.state = path.length > 0 ? CharacterState.WALK : CharacterState.TYPE;
++    if (path.length === 0) ch.dir = seat.facingDir;
++  }
++
++  private freeSeat(seatId: string | null): void {
++    const seat = seatId ? this.seats.get(seatId) : undefined;
++    if (seat) seat.assigned = false;
++  }
++
 +  /** ProjectN: send an agent to play or sleep, or (null) back to its usual self. */
 +  setLeisure(id: number, mode: Leisure | null): void {
 +    const ch = this.characters.get(id);
@@ -369,9 +431,11 @@ index 1afd778..decd0ea 100644
    update(dt: number): void {
      // Furniture animation cycling
      const prevFrame = Math.floor(this.furnitureAnimTimer / FURNITURE_ANIM_INTERVAL_SEC);
-@@ -1234,9 +1294,10 @@ export class OfficeState {
+@@ -1233,10 +1346,12 @@ export class OfficeState {
+           this.blockedTiles,
          );
        } else {
++        this.updateRoom(ch);
          // Temporarily unblock own seat so character can pathfind to it
 -        this.withOwnSeatUnblocked(ch, () =>
 -          updateCharacter(ch, dt, this.walkableTiles, this.seats, this.tileMap, this.blockedTiles),
@@ -383,6 +447,17 @@ index 1afd778..decd0ea 100644
        }
  
        // Tick bubble timer for waiting bubbles
+@@ -1283,7 +1398,9 @@ export class OfficeState {
+     const seats: Record<number, { palette: number; repeat: number; seatId: string | null }> = {};
+     for (const ch of this.characters.values()) {
+       if (ch.isSubagent) continue;
+-      seats[ch.id] = { palette: ch.palette, repeat: ch.repeat, seatId: ch.seatId };
++      // ProjectN: a meeting chair is borrowed; its own desk is what's remembered.
++      const seatId = ch.homeSeatId !== undefined ? ch.homeSeatId : ch.seatId;
++      seats[ch.id] = { palette: ch.palette, repeat: ch.repeat, seatId };
+     }
+     return seats;
+   }
 diff --git a/webview-ui/src/office/engine/renderer.ts b/webview-ui/src/office/engine/renderer.ts
 index ac77349..fa53c9e 100644
 --- a/webview-ui/src/office/engine/renderer.ts
@@ -485,7 +560,7 @@ index ac77349..fa53c9e 100644
      // Headless agents (adopted, no terminal to focus) render translucent while
      // the "Display headless as ghosts" setting is on.
 diff --git a/webview-ui/src/office/types.ts b/webview-ui/src/office/types.ts
-index 00f3f3d..eb31ab8 100644
+index 00f3f3d..b16d9c6 100644
 --- a/webview-ui/src/office/types.ts
 +++ b/webview-ui/src/office/types.ts
 @@ -30,6 +30,8 @@ export const CharacterState = {
@@ -520,10 +595,16 @@ index 00f3f3d..eb31ab8 100644
  export interface FurnitureInstance {
    sprite: SpriteData;
    /** Pixel x (top-left) */
-@@ -247,6 +265,10 @@ export interface Character extends Blinker {
+@@ -247,6 +265,16 @@ export interface Character extends Blinker {
     *  (testHooks.getCharacters) to tell the greeter from agents. */
    isGreeter?: boolean;
  
++  // -- ProjectN meeting rooms --
++  /** Area label of the meeting room it should work in, if any. */
++  room?: string | null;
++  /** Its own desk, kept reserved while it sits in a meeting room. */
++  homeSeatId?: string | null;
++
 +  // -- ProjectN time off --
 +  leisure?: Leisure | null;
 +  spot?: LeisureSpot | null;
