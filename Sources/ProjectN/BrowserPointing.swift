@@ -110,13 +110,18 @@ enum BrowserPointing {
     /// Pointing runs in its own JavaScript world: the page's scripts can't see or break it, and it can't clash with them.
     static let world = WKContentWorld.world(name: "projectn-pointing")
 
-    /// Installed on demand (idempotent). `P` is the API used by the Swift side.
+    /// Installed at document start, so its event listeners run before the page's (and again on demand, idempotent).
+    /// While picking, mouse events are swallowed there: popups and menus don't see "a click outside" or lose focus,
+    /// so they stay open to be pointed out. `P` is the API used by the Swift side.
     static let script = #"""
     if (!window.__pnPoint) window.__pnPoint = (() => {
       const ACCENT = '#ff5a1f';
       const post = (m) => { try { window.webkit.messageHandlers.pnPoint.postMessage(m); } catch (e) {} };
       const host = document.createElement('projectn-pointing');
-      host.style.cssText = 'position:fixed;inset:0;pointer-events:none;z-index:2147483647;display:block;';
+      // A manual popover, so it can join the top layer and draw above modal dialogs and popovers.
+      host.setAttribute('popover', 'manual');
+      host.style.cssText = 'position:fixed;inset:0;width:100%;height:100%;max-width:none;max-height:none;margin:0;padding:0;'
+        + 'border:0;background:transparent;overflow:visible;pointer-events:none;z-index:2147483647;display:block;';
       const shadow = host.attachShadow({ mode: 'closed' });
       shadow.innerHTML = `<style>
         :host { all: initial; }
@@ -147,7 +152,22 @@ enum BrowserPointing {
       const marks = new Map();   // id -> { kind, el, range, doc: {x,y,w,h}, node }
       let picking = false, hoverEl = null, stack = [], down = null, dragging = false, seq = 0;
 
-      const attach = () => { if (!host.isConnected) document.documentElement.appendChild(host); };
+      const all = (q) => { try { return [...document.querySelectorAll(q)]; } catch (e) { return []; } };
+      let above = [];   // what was in the top layer the last time the overlay was raised over it
+      const attach = () => {
+        // Everything outside a modal dialog is inert, so the overlay goes inside the topmost one.
+        const parent = all('dialog:modal').pop() || document.documentElement;
+        if (!parent) return;
+        if (host.parentNode !== parent) parent.appendChild(host);
+        const now = [...all('dialog:modal'), ...all(':popover-open'), document.fullscreenElement].filter(e => e && e !== host);
+        try {
+          const open = host.matches(':popover-open');
+          if (open && now.length === above.length && now.every((e, i) => e === above[i])) return;
+          if (open) host.hidePopover();
+          host.showPopover();
+          above = now;
+        } catch (e) {}
+      };
       const isOurs = (el) => el === host;
 
       // ---- describing elements ----
@@ -161,28 +181,32 @@ enum BrowserPointing {
       };
       const selectorFor = (el) => {
         const parts = [];
-        let e = el;
+        let e = el, prefix = '';
         while (e && e.nodeType === 1 && e !== document.documentElement && parts.length < 7) {
-          if (e.id && /^[A-Za-z][\w-]*$/.test(e.id) && document.querySelectorAll('#' + CSS.escape(e.id)).length === 1) {
-            parts.unshift('#' + CSS.escape(e.id)); break;
+          if (e.id && /^[A-Za-z][\w-]*$/.test(e.id) && e.getRootNode().querySelectorAll('#' + CSS.escape(e.id)).length === 1) {
+            parts.unshift('#' + CSS.escape(e.id));
+            if (e.getRootNode() instanceof ShadowRoot) prefix = selectorFor(e.getRootNode().host) + ' >>> ';
+            break;
           }
           let p = e.localName;
           const c = cleanClasses(e).slice(0, 2);
           if (c.length) p += '.' + c.map(x => CSS.escape(x)).join('.');
           const par = e.parentElement;
-          if (par) {
-            const same = [...par.children].filter(x => x.localName === e.localName);
+          const root = !par && e.parentNode instanceof ShadowRoot ? e.parentNode : null;
+          if (root) prefix = selectorFor(root.host) + ' >>> ';
+          if (par || root) {
+            const same = [...(par || root).children].filter(x => x.localName === e.localName);
             if (same.length > 1) p += ':nth-of-type(' + (same.indexOf(e) + 1) + ')';
           }
           parts.unshift(p);
           if (e === document.body) break;
           e = par;
         }
-        return parts.join(' > ');
+        return prefix + parts.join(' > ');
       };
       const squash = (s, n) => { s = (s || '').replace(/\s+/g, ' ').trim(); return s.length > n ? s.slice(0, n) + '…' : s; };
       const htmlOf = (el) => {
-        let h = el.outerHTML || '';
+        let h = (el.outerHTML || '').replace(/<projectn-pointing[^>]*><\/projectn-pointing>/g, '');
         h = h.replace(/\s+/g, ' ').replace(/ (style|data-[\w-]*-id)="[^"]{120,}"/g, ' $1="…"');
         return h.length > 900 ? h.slice(0, 900) + '…' : h;
       };
@@ -196,6 +220,14 @@ enum BrowserPointing {
         node.style.left = r.left + 'px'; node.style.top = r.top + 'px';
         node.style.width = Math.max(2, r.width) + 'px'; node.style.height = Math.max(2, r.height) + 'px';
       };
+      // An element mark whose popup was closed (or that left the page) isn't drawn until it shows again.
+      const shown = (m) => {
+        if (!m.el) return true;
+        if (!m.el.isConnected) return false;
+        if (m.el.checkVisibility && !m.el.checkVisibility({ visibilityProperty: true, opacityProperty: true })) return false;
+        const r = m.el.getBoundingClientRect();
+        return r.width > 0 || r.height > 0;
+      };
       const rectOf = (m) => {
         if (m.el && m.el.isConnected) return m.el.getBoundingClientRect();
         if (m.range) { try { const r = m.range.getBoundingClientRect(); if (r.width || r.height) return r; } catch (e) {} }
@@ -204,7 +236,11 @@ enum BrowserPointing {
       let raf = 0;
       const tick = () => {
         raf = 0;
-        for (const m of marks.values()) place(m.node, rectOf(m));
+        if (marks.size) attach();
+        for (const m of marks.values()) {
+          m.node.style.display = shown(m) ? '' : 'none';
+          place(m.node, rectOf(m));
+        }
         if (marks.size) raf = requestAnimationFrame(tick);
       };
       const loop = () => { if (!raf) raf = requestAnimationFrame(tick); };
@@ -224,11 +260,30 @@ enum BrowserPointing {
       };
 
       // ---- picking ----
-      const elementAt = (x, y) => {
-        const all = document.elementsFromPoint(x, y);
-        return all.find(e => !isOurs(e) && e !== document.documentElement) || null;
+      const parentOf = (el) => el.parentElement || (el.parentNode instanceof ShadowRoot ? el.parentNode.host : null);
+      const holds = (a, b) => { while (b && b !== a) b = parentOf(b); return !!b; };
+      const clear = (c) => c === 'transparent' || /^rgba\(.*, 0\)$/.test(c);
+      // Nothing to see: a transparent layer laid over the content (click catchers, stretched links, faded-out menus).
+      const isGhost = (el) => {
+        for (let e = el; e; e = parentOf(e)) if (getComputedStyle(e).opacity === '0') return true;
+        if (el === document.body || el.childElementCount || el.shadowRoot || (el.textContent || '').trim()) return false;
+        if (/^(img|svg|video|audio|canvas|input|textarea|select|button|iframe|frame|embed|object|hr|progress|meter)$/.test(el.localName) || el.ownerSVGElement) return false;
+        const s = getComputedStyle(el);
+        const painted = !clear(s.backgroundColor) || s.backgroundImage !== 'none' || s.boxShadow !== 'none'
+          || (s.backdropFilter || s.webkitBackdropFilter || 'none') !== 'none'
+          || ['Top', 'Right', 'Bottom', 'Left'].some(k => parseFloat(s['border' + k + 'Width']) > 0 && !clear(s['border' + k + 'Color']))
+          || ['::before', '::after'].some(p => !['none', 'normal'].includes(getComputedStyle(el, p).content));
+        return !painted;
+      };
+      // The topmost visible element at the point, looking inside open shadow roots (web-component popups).
+      const elementAt = (x, y, root = document) => {
+        const stacked = root.elementsFromPoint(x, y).filter(e => !isOurs(e) && e !== document.documentElement
+          && (root === document || e.getRootNode() === root));
+        const el = stacked.find(e => !isGhost(e)) || stacked[0] || null;
+        return (el && el.shadowRoot && elementAt(x, y, el.shadowRoot)) || el;
       };
       const showHover = () => {
+        if (picking) attach();
         if (!hoverEl || dragging) { hoverBox.style.display = 'none'; return; }
         const r = hoverEl.getBoundingClientRect();
         hoverBox.style.display = 'block';
@@ -255,10 +310,9 @@ enum BrowserPointing {
         if (el !== hoverEl && !stack.length) setHover(el);
         else if (el !== hoverEl && stack.length && !stack.includes(el)) setHover(el);
       };
-      const onDown = (e) => { if (e.button !== 0) return; e.preventDefault(); down = { x: e.clientX, y: e.clientY }; dragging = false; };
+      const onDown = (e) => { if (e.button !== 0) return; down = { x: e.clientX, y: e.clientY }; dragging = false; };
       const onUp = (e) => {
         if (!down) return;
-        e.preventDefault();
         const start = down; down = null;
         if (dragging) {
           dragging = false;
@@ -272,38 +326,57 @@ enum BrowserPointing {
       };
       const onKey = (e) => {
         if (!picking) return;
-        if (e.key === 'Alt') { shield.style.pointerEvents = e.type === 'keydown' ? 'none' : 'auto'; hoverBox.style.display = e.type === 'keydown' ? 'none' : hoverBox.style.display; return; }
-        if (e.type !== 'keydown') return;
-        if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); setPicking(false); post({ type: 'exit' }); }
-        else if (e.key === 'ArrowUp' && hoverEl && hoverEl.parentElement && hoverEl.parentElement !== document.documentElement) {
-          e.preventDefault(); e.stopPropagation(); stack.push(hoverEl); hoverEl = hoverEl.parentElement; showHover();
-        } else if (e.key === 'ArrowDown' && stack.length) {
-          e.preventDefault(); e.stopPropagation(); hoverEl = stack.pop(); showHover();
-        } else if (e.key === 'Enter' && hoverEl) {
-          e.preventDefault(); e.stopPropagation(); markElement(hoverEl);
+        if (e.key === 'Alt') {
+          if (e.type === 'keydown') { shield.style.display = 'none'; hoverBox.style.display = 'none'; }
+          return;
         }
+        if (e.type !== 'keydown') return;
+        // Handled keys stop here: Esc must not also close the popup being pointed out.
+        const take = () => { e.preventDefault(); e.stopImmediatePropagation(); };
+        const up = hoverEl && parentOf(hoverEl);
+        if (e.key === 'Escape') { take(); setPicking(false); post({ type: 'exit' }); }
+        else if (e.key === 'ArrowUp' && up && up !== document.documentElement) { take(); stack.push(hoverEl); hoverEl = up; showHover(); }
+        else if (e.key === 'ArrowDown' && stack.length) { take(); hoverEl = stack.pop(); showHover(); }
+        else if (e.key === 'Enter' && hoverEl) { take(); markElement(hoverEl); }
+      };
+      // Every mouse event of the page while picking: act on it here and let nothing else see it.
+      const onPointer = (e) => {
+        // Scripted clicks keep working; ⌥ lets the page through.
+        if (!picking || !e.isTrusted) return;
+        if (e.altKey) { shield.style.display = 'none'; return; }
+        // Events inside a frame never reach this document: cover it while the pointer is over one.
+        const frame = (el) => !!el && /^(iframe|frame|embed|object)$/.test(el.localName);
+        if (e.type === 'pointerover' && frame(e.composedPath()[0])) shield.style.display = 'block';
+        e.stopImmediatePropagation();
+        // Cancelling pointerdown would also cancel mousedown, whose default action is what moves the focus.
+        if (e.cancelable && !e.type.startsWith('pointer')) e.preventDefault();
+        if (e.type === 'pointermove') {
+          if (!down && shield.style.display === 'block' && !frame(elementAt(e.clientX, e.clientY))) shield.style.display = 'none';
+          onMove(e);
+        } else if (e.type === 'pointerdown') onDown(e);
+        else if (e.type === 'pointerup') onUp(e);
+        else if (e.type === 'pointercancel') { down = null; dragging = false; dragBox.style.display = 'none'; }
+        else if (e.type === 'contextmenu') { setPicking(false); post({ type: 'exit' }); }
       };
       // ⌥ lets the page through: select text with ⌥ held, it's pointed out when you release the mouse.
-      const onPageUp = () => { if (picking && shield.style.pointerEvents === 'none') setTimeout(() => { if (markSelection()) getSelection().removeAllRanges(); }, 0); };
+      const onPageUp = (e) => { if (picking && e.altKey) setTimeout(() => { if (markSelection()) getSelection().removeAllRanges(); }, 0); };
       const onScroll = () => { if (picking) showHover(); };
 
       const setPicking = (on) => {
         picking = !!on;
         attach();
-        shield.style.display = picking ? 'block' : 'none';
-        shield.style.pointerEvents = 'auto';
+        shield.style.display = 'none';
         if (!picking) { hoverEl = null; stack = []; down = null; dragging = false; dragBox.style.display = 'none'; }
         showHover();
         return picking;
       };
-      shield.addEventListener('mousemove', onMove, true);
-      shield.addEventListener('mousedown', onDown, true);
-      shield.addEventListener('mouseup', onUp, true);
-      shield.addEventListener('click', e => { e.preventDefault(); e.stopPropagation(); }, true);
-      shield.addEventListener('contextmenu', e => { e.preventDefault(); setPicking(false); post({ type: 'exit' }); }, true);
+      for (const type of ['pointerdown', 'pointerup', 'pointermove', 'pointercancel', 'pointerover', 'pointerout', 'pointerenter',
+                          'pointerleave', 'mousedown', 'mouseup', 'mousemove', 'mouseover', 'mouseout', 'mouseenter', 'mouseleave',
+                          'click', 'dblclick', 'auxclick', 'contextmenu', 'touchstart', 'touchend', 'dragstart', 'selectstart']) {
+        window.addEventListener(type, onPointer, { capture: true, passive: false });
+      }
       window.addEventListener('keydown', onKey, true);
       window.addEventListener('keyup', onKey, true);
-      window.addEventListener('blur', () => { if (picking) shield.style.pointerEvents = 'auto'; });
       document.addEventListener('mouseup', onPageUp, true);
       window.addEventListener('scroll', onScroll, true);
 
@@ -325,14 +398,20 @@ enum BrowserPointing {
         const inside = [];
         const walker = document.createTreeWalker(document.body || document.documentElement, NodeFilter.SHOW_ELEMENT);
         const within = (b) => b.width > 0 && b.height > 0 && b.left >= r.left - 2 && b.top >= r.top - 2 && b.right <= r.right + 2 && b.bottom <= r.bottom + 2;
+        // Leaves out what a popup or another layer covers.
+        const onTop = (el) => {
+          const b = el.getBoundingClientRect();
+          const hit = elementAt(b.left + b.width / 2, b.top + b.height / 2);
+          return !hit || holds(el, hit) || holds(hit, el);
+        };
         let n = walker.nextNode();
         while (n && inside.length < 15) {
-          if (!isOurs(n) && within(n.getBoundingClientRect()) && !inside.some(p => p.contains(n))) inside.push(n);
+          if (!isOurs(n) && within(n.getBoundingClientRect()) && !inside.some(p => p.contains(n)) && onTop(n)) inside.push(n);
           n = walker.nextNode();
         }
         // The smallest element that holds the whole area, as context.
         let around = elementAt(r.left + r.width / 2, r.top + r.height / 2);
-        while (around && around.parentElement && !(() => { const b = around.getBoundingClientRect(); return b.left <= r.left && b.top <= r.top && b.right >= r.right && b.bottom >= r.bottom; })()) around = around.parentElement;
+        while (around && parentOf(around) && !(() => { const b = around.getBoundingClientRect(); return b.left <= r.left && b.top <= r.top && b.right >= r.right && b.bottom >= r.bottom; })()) around = parentOf(around);
         const { id, m } = addBox('area', null, null, r);
         send(id, { kind: 'area', label: 'Area ' + sizeOf(r), selector: around ? selectorFor(around) : '',
                    text: squash(inside.map(e => e.innerText || '').join(' '), 400), html: '', box: boxText(m.doc),

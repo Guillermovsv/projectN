@@ -238,6 +238,8 @@ final class BrowserTab: NSObject, ObservableObject, WKNavigationDelegate, WKUIDe
         config.preferences.isElementFullscreenEnabled = true
         config.preferences.javaScriptCanOpenWindowsAutomatically = true
         config.userContentController.addUserScript(WKUserScript(source: consoleHookJS, injectionTime: .atDocumentStart, forMainFrameOnly: true))
+        config.userContentController.addUserScript(WKUserScript(source: BrowserPointing.script, injectionTime: .atDocumentStart,
+                                                                forMainFrameOnly: true, in: BrowserPointing.world))
         config.userContentController.add(ConsoleRouter.shared, name: "pnConsole")
         config.userContentController.add(ConsoleRouter.shared, contentWorld: BrowserPointing.world, name: "pnPoint")
         return config
