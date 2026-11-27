@@ -160,7 +160,32 @@ struct RootView: View {
     @AppStorage("sidebarWidth") private var sidebarWidth: Double = 260
     @AppStorage("sidebarVisible") private var sidebarVisible = true
 
+    /// Narrowest the centre column may get when the right panel is dragged wide.
+    private let detailMinWidth: Double = 320
+
     var body: some View {
+        GeometryReader { geo in
+            content(maxPanelWidth: maxPanelWidth(windowWidth: geo.size.width))
+        }
+        .background(Color.appWindow)
+        .background(TrafficLightsAligner())
+        .preferredColorScheme(AppTheme.current.dark ? .dark : .light)
+        .tint(Color.appAccent)
+        .ignoresSafeArea()
+        .onAppear { nav.restorePanel = panel }
+        .environment(\.sidebarVisible, sidebarVisible)
+        .environment(\.showSidebar, { withAnimation(.easeInOut(duration: 0.18)) { sidebarVisible = true } })
+    }
+
+    /// The right panel can grow leftwards until only `detailMinWidth` is left for the centre column.
+    private func maxPanelWidth(windowWidth: Double) -> Double {
+        let sidebar = sidebarVisible ? sidebarWidth + 1 : 0
+        let rail: Double = 44
+        return max(280, windowWidth - sidebar - rail - 1 - detailMinWidth)
+    }
+
+    @ViewBuilder
+    private func content(maxPanelWidth: Double) -> some View {
         HStack(spacing: 0) {
             if sidebarVisible {
                 ZStack {
@@ -175,25 +200,17 @@ struct RootView: View {
                 ColumnResizeHandle(width: $sidebarWidth, range: 210...420, direction: 1)
             }
             detail
-                .frame(minWidth: 420, maxWidth: .infinity, maxHeight: .infinity)
+                .frame(minWidth: detailMinWidth, maxWidth: .infinity, maxHeight: .infinity)
             if !nav.settingsOpen {
                 if panel.visible {
-                    ColumnResizeHandle(width: $panel.width, range: 280...900, direction: -1)
+                    ColumnResizeHandle(width: $panel.width, range: 280...maxPanelWidth, direction: -1)
                     RightPanelView()
-                        .frame(width: panel.width)
+                        .frame(width: min(panel.width, maxPanelWidth))
                         .transition(.move(edge: .trailing))
                 }
                 RightRail()
             }
         }
-        .background(Color.appWindow)
-        .background(TrafficLightsAligner())
-        .preferredColorScheme(AppTheme.current.dark ? .dark : .light)
-        .tint(Color.appAccent)
-        .ignoresSafeArea()
-        .onAppear { nav.restorePanel = panel }
-        .environment(\.sidebarVisible, sidebarVisible)
-        .environment(\.showSidebar, { withAnimation(.easeInOut(duration: 0.18)) { sidebarVisible = true } })
     }
 
     /// Workspaces and Agents both stay mounted; only the active one is shown. Swapping them used to tear down
