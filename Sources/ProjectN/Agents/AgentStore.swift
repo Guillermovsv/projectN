@@ -360,6 +360,14 @@ enum PromptComposer {
               the most reasonable option yourself, note the assumption in one line in your final answer, and keep going.
               Finish the whole task in this turn.
             """
+            if capabilities != .none {
+                s += """
+
+                - Each time you decide something yourself that you would otherwise have asked, call the ProjectN tool
+                  `record_decision` (mcp__projectn__record_decision) right then: the decision and why. The user reviews
+                  them in the delivery.
+                """
+            }
         } else if capabilities != .none {
             s += """
 

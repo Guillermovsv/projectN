@@ -274,7 +274,7 @@ struct AgentEditor: View {
                 ForEach(AgentRuntime.allCases.filter { $0.providers.contains(draft.provider) }) { Text($0.label).tag($0) }
             }
             .onChange(of: draft.runtime) { _, _ in
-                if selectedModel == nil, let first = listing.models.first { draft.model = first.id }
+                if selectedModel == nil, let first = ModelCatalog.featured(listing.models).first { draft.model = first.id }
             }
             modelRow
             Picker("Reasoning effort", selection: Binding(get: { draft.effort ?? "" }, set: { draft.effort = $0.isEmpty ? nil : $0 })) {
@@ -666,14 +666,35 @@ struct AgentEditor: View {
         return draft.runtime == .claudeCode ? LaunchCatalog.claudeEfforts : ["low", "medium", "high", "xhigh"]
     }
 
+    /// The newest model of each family; the rest under "More models".
+    private var modelMenu: some View {
+        let featured = ModelCatalog.featured(listing.models)
+        let more = listing.models.filter { !featured.contains($0) }
+        return LabeledContent("Model") {
+            Menu {
+                ForEach(featured) { modelItem($0) }
+                if !more.isEmpty {
+                    Divider()
+                    Menu("More models") { ForEach(more) { modelItem($0) } }
+                }
+            } label: {
+                Text(selectedModel.map(modelName) ?? (draft.model.isEmpty ? "Choose a model" : "\(draft.model) (not available)"))
+            }
+            .fixedSize()
+        }
+    }
+
+    private func modelName(_ m: ModelCatalog.Model) -> String { m.label == m.id ? m.id : "\(m.label)  ·  \(m.id)" }
+
+    private func modelItem(_ m: ModelCatalog.Model) -> some View {
+        Toggle(modelName(m), isOn: Binding(get: { draft.model == m.id }, set: { if $0 { draft.model = m.id } }))
+    }
+
     @ViewBuilder private var modelRow: some View {
         if draft.provider == .other {
             TextField("Model", text: $draft.model, prompt: Text("model id as the CLI expects it"))
         } else {
-            Picker("Model", selection: $draft.model) {
-                if selectedModel == nil, !draft.model.isEmpty { Text("\(draft.model) (not available)").tag(draft.model) }
-                ForEach(listing.models) { m in Text(m.label == m.id ? m.id : "\(m.label)  ·  \(m.id)").tag(m.id) }
-            }
+            modelMenu
         }
         HStack(spacing: 6) {
             switch listing.source {

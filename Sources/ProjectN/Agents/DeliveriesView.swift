@@ -173,6 +173,8 @@ private struct DeliveryDetail: View {
     let delivery: Delivery
     @State private var expanded: Set<String> = []
     @State private var allTasks = false
+    @State private var autoDecisions: [AutoDecision] = []
+    @State private var showActions = false
 
     var body: some View {
         HStack(spacing: 0) {
@@ -185,6 +187,7 @@ private struct DeliveryDetail: View {
                     timeline
                     if let r = delivery.record, !r.criteria.isEmpty { criteria(r) }
                     if let r = delivery.record, !r.findings.isEmpty { findings(r) }
+                    if !autoDecisions.isEmpty { autoModeDecisions }
                     if let r = delivery.record, !r.reviewsApplied.isEmpty || !r.decisions.isEmpty { reviewsAndDecisions(r) }
                 }
                 .padding(18)
@@ -194,6 +197,59 @@ private struct DeliveryDetail: View {
             .safeAreaInset(edge: .bottom) { filesBar }
             ColumnResizeHandle(width: $sideWidth, range: 260...440, direction: -1)
             ForYouPanel(delivery: delivery).frame(width: sideWidth)
+        }
+        // Reloaded when a task changes state, and every few seconds while agents are still working.
+        .task(id: delivery.tasks.map { "\($0.id)\($0.status.rawValue)" }.joined()) {
+            repeat {
+                let auto = Set(agents.profiles.filter(\.autoMode).map(\.id))
+                let found = await AutoDecision.load(tasks: delivery.tasks, autoModeAgents: auto)
+                if Task.isCancelled { return }
+                autoDecisions = found
+                try? await Task.sleep(for: .seconds(5))
+            } while !Task.isCancelled && delivery.isActive
+        }
+    }
+
+    // MARK: Auto mode decisions
+
+    private var autoModeDecisions: some View {
+        let decided = autoDecisions.filter { $0.kind != .action }
+        let actions = autoDecisions.filter { $0.kind == .action }
+        return section("Auto mode decisions", note: "\(decided.count) decided · \(actions.count) actions approved automatically") {
+            VStack(spacing: 0) {
+                ForEach(decided) { autoRow($0) }
+                if !actions.isEmpty {
+                    Button { showActions.toggle() } label: {
+                        Label("\(showActions ? "Hide" : "Show") \(actions.count) actions approved automatically",
+                              systemImage: showActions ? "chevron.down" : "chevron.right")
+                    }
+                    .buttonStyle(.link).font(.caption).frame(maxWidth: .infinity, alignment: .leading).padding(.vertical, 6)
+                    if showActions { ForEach(actions) { autoRow($0) } }
+                }
+            }
+        }
+    }
+
+    private func autoRow(_ d: AutoDecision) -> some View {
+        let key = "d:" + d.id
+        return VStack(alignment: .leading, spacing: 4) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                tag(d.runtime.shortLabel, d.runtime == .codexCLI ? .blue : .orange).frame(width: 52, alignment: .leading)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(d.text).font(d.kind == .action ? .caption.monospaced() : .callout)
+                        .lineLimit(expanded.contains(key) ? nil : 2)
+                    if let why = d.why {
+                        Text("Why: \(why)").font(.caption).foregroundStyle(.secondary).lineLimit(expanded.contains(key) ? nil : 1)
+                    }
+                    Text("\(d.agent.trimmingCharacters(in: .whitespaces)) · \(d.kind.label)").font(.caption2).foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                Text(DeliveryText.clock(d.at)).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+            }
+            .padding(.vertical, 6)
+            .contentShape(Rectangle())
+            .onTapGesture { toggle(key) }
+            Divider()
         }
     }
 

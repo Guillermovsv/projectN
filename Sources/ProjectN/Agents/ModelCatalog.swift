@@ -56,6 +56,41 @@ final class ModelCatalog: ObservableObject {
         return listing(for: runtime, settings: settings).models.first { $0.id == id }
     }
 
+    /// The newest model of each family (at most `limit`): what the picker shows before "More models".
+    /// Claude families come as Fable, Opus, Sonnet, Haiku; others (Codex) keep the listing's order.
+    nonisolated static func featured(_ models: [Model], limit: Int = 4) -> [Model] {
+        var best: [String: (model: Model, version: [Int])] = [:]
+        var order: [String] = []
+        for m in models {
+            let (family, version) = familyAndVersion(m.id)
+            if let b = best[family] {
+                if b.version.lexicographicallyPrecedes(version) { best[family] = (m, version) }
+            } else {
+                best[family] = (m, version)
+                order.append(family)
+            }
+        }
+        let claude = ["claude-fable", "claude-opus", "claude-sonnet", "claude-haiku"]
+        let sorted = order.enumerated().sorted {
+            (claude.firstIndex(of: $0.element) ?? claude.count, $0.offset) < (claude.firstIndex(of: $1.element) ?? claude.count, $1.offset)
+        }
+        return sorted.prefix(limit).compactMap { best[$0.element]?.model }
+    }
+
+    /// "claude-opus-4-8" → ("claude-opus", [4, 8]); "gpt-6.2-sol" → ("gpt-sol", [6, 2]). Date stamps are ignored.
+    nonisolated static func familyAndVersion(_ id: String) -> (String, [Int]) {
+        var family: [Substring] = [], version: [Int] = []
+        for part in id.split(separator: "-") {
+            let numbers = part.split(separator: ".").map { Int($0) }
+            if numbers.allSatisfy({ $0 != nil }) {
+                if part.count < 8 { version += numbers.compactMap { $0 } }
+            } else {
+                family.append(part)
+            }
+        }
+        return (family.joined(separator: "-"), version)
+    }
+
     /// Replaces the Claude listing (tests, or a list obtained elsewhere).
     func setClaudeListing(_ listing: Listing) { claude = listing }
 

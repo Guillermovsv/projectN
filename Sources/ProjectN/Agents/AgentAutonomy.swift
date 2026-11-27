@@ -190,6 +190,14 @@ extension AgentHarness {
             if !["Read", "Glob", "Grep", "LS", "TodoWrite"].contains(tool) {
                 AuditLog.record("tool.allowed", ["task": t.id.uuidString, "agent": t.agentName, "tool": tool, "call": summary])
             }
+            // Allowed only thanks to Auto mode: listed with the delivery's decisions.
+            if profile.autoMode {
+                var asking = ctx
+                asking.autoMode = false
+                if case .allow = ApprovalPolicy.decide(tool: tool, input: input, asking) {} else {
+                    AuditLog.record("tool.auto_approved", ["task": t.id.uuidString, "agent": t.agentName, "call": summary])
+                }
+            }
             rememberApproved(t.id, input: input, summary: summary)
             lastHookAllowed[t.id] = Date()
             if tool == "Bash", let command = input["command"] as? String {
@@ -397,6 +405,13 @@ extension AgentHarness {
             if case .orchestrator = route { who = t.origin.delegatedBy ?? "your coordinator" } else { who = "the user" }
             reply("Question sent to \(who). Now end your turn with one short line (don't repeat the question). "
                   + "The answer will arrive as the next message in this session and you'll continue from there.", false)
+
+        case "record_decision":
+            let decision = (a["decision"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !decision.isEmpty else { reply("Missing `decision`.", true); return }
+            let why = (a["why"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            AuditLog.record("decision.auto", ["task": t.id.uuidString, "agent": t.agentName, "decision": decision, "why": why])
+            reply("Recorded in this request's delivery. Continue.", false)
 
         case "save_project_note":
             let note = (a["note"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
@@ -734,6 +749,9 @@ enum AgentTools {
                      tool("save_project_note", "Save one durable fact about this project for every agent that works on it: where tasks / docs live (Notion page or database links and IDs), site URLs, MCP server names, conventions, decisions. Not a log of what you did or changed. No secrets.",
                           ["note": str("The fact, self-contained, with links / IDs."),
                            "project": str("Project name; default: your project (required for coordinators working outside projects).")], ["note"]),
+                     tool("record_decision", "Record one decision you took on your own instead of asking (an ambiguity you resolved, an option you chose, an assumption you built on). The user reads them in the request's delivery. Not a log of work done. No secrets.",
+                          ["decision": str("What you decided, self-contained, one or two sentences."),
+                           "why": str("Why, and what the alternative was.")], ["decision"]),
                      tool("delivery_status", "This request's acceptance criteria, findings (problems agents passed to each other) and automatic cycle, as ProjectN keeps them.", [:], []),
                      tool("criteria_set", "Set this request's acceptance criteria before doing the work: 1–8 observable results, each with how it is checked. Another agent checks them later. Can be refined until one is checked.",
                           ["criteria": ["type": "array", "description": "The criteria.",

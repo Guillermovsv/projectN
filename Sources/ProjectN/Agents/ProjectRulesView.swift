@@ -5,10 +5,13 @@ import SwiftUI
 /// change) and the decisions saved in its notes.
 struct ProjectRulesSheet: View {
     @EnvironmentObject var store: Store
+    @EnvironmentObject var agents: AgentHarness
     @Environment(\.dismiss) private var dismiss
     @State var projectID: UUID?
     @State private var tab = 0
     @State private var refresh = 0
+    @State private var autoDecisions: [AutoDecision] = []
+    @State private var showActions = false
 
     private var projects: [Project] { store.state.projects.filter { $0.id != Store.coordinationProjectID && $0.exists } }
     private var project: Project? { projectID.flatMap { store.project($0) } ?? projects.first }
@@ -40,6 +43,16 @@ struct ProjectRulesSheet: View {
         .frame(width: 860, height: 560)
         .background(Color(nsColor: .windowBackgroundColor))
         .id(refresh)
+        .task(id: project?.id) {
+            autoDecisions = []
+            guard let p = project else { return }
+            // The project's own tasks, plus the coordinator's in requests about it.
+            var tasks = agents.deliveries.filter { agents.projectID(of: $0) == p.id }.flatMap(\.tasks)
+            let seen = Set(tasks.map(\.id))
+            tasks += agents.tasks.filter { $0.projectID == p.id && !seen.contains($0.id) }
+            let found = await AutoDecision.load(tasks: tasks, autoModeAgents: Set(agents.profiles.filter(\.autoMode).map(\.id)))
+            if !Task.isCancelled { autoDecisions = found }
+        }
     }
 
     // MARK: Review lists
@@ -88,10 +101,10 @@ struct ProjectRulesSheet: View {
 
     // MARK: Decisions
 
-    private struct Decision: Identifiable { let id: Int; let date: String; let text: String; let by: String }
+    private struct Decision: Identifiable { let id: String; let at: String; let date: String; let text: String; let by: String }
 
     private func decisions(_ p: Project) -> some View {
-        let rows: [Decision] = AgentStore.projectNoteList(p.id).enumerated().compactMap { i, line in
+        let saved: [Decision] = AgentStore.projectNoteList(p.id).enumerated().compactMap { i, line in
             var l = line.hasPrefix("- ") ? String(line.dropFirst(2)) : line
             guard l.folded.contains("decision") else { return nil }
             var by = "", date = ""
@@ -99,18 +112,29 @@ struct ProjectRulesSheet: View {
                 by = String(m.1); date = String(m.2)
                 l = String(l[..<m.range.lowerBound])
             }
-            return Decision(id: i, date: date, text: l, by: by)
-        }.reversed()
+            return Decision(id: "n\(i)", at: date, date: date, text: l, by: by)
+        }
+        let auto: [Decision] = autoDecisions.filter { showActions || $0.kind != .action }.map { d in
+            let day = d.at.formatted(.iso8601.year().month().day().dateSeparator(.dash))
+            return Decision(id: d.id, at: day + d.at.formatted(.iso8601.time(includingFractionalSeconds: false)), date: day,
+                            text: d.text + (d.why.map { " — \($0)" } ?? ""),
+                            by: "\(d.agent.trimmingCharacters(in: .whitespaces)) · \(d.runtime.shortLabel) · \(d.kind.label)")
+        }
+        let rows = (saved + auto).sorted { $0.at > $1.at }
+        let actions = autoDecisions.filter { $0.kind == .action }.count
         return VStack(alignment: .leading, spacing: 8) {
-            Text("Saved when you answer an agent's question, or when an agent records a decision. Every agent working on \(p.name) can find them (project_notes).")
+            Text("Your answers and the decisions agents record (every agent working on \(p.name) can find those with project_notes), plus what Claude and Codex agents decided on their own in Auto mode.")
                 .font(.caption).foregroundStyle(.secondary)
+            if actions > 0 {
+                Toggle("Include \(actions) actions approved automatically", isOn: $showActions).font(.caption)
+            }
             if rows.isEmpty {
-                Text("No decisions saved for \(p.name) yet.").foregroundStyle(.secondary).frame(maxWidth: .infinity, maxHeight: .infinity)
+                Text("No decisions for \(p.name) yet.").foregroundStyle(.secondary).frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 Table(rows, columns: {
                     TableColumn("Date") { d in Text(d.date).font(.caption.monospacedDigit()) }.width(min: 80, ideal: 90)
                     TableColumn("Decision") { d in Text(d.text).font(.callout).lineLimit(4).help(d.text) }
-                    TableColumn("Origin") { d in Text(d.by).font(.caption).foregroundStyle(.secondary) }.width(min: 120, ideal: 170)
+                    TableColumn("Origin") { d in Text(d.by).font(.caption).foregroundStyle(.secondary).lineLimit(2).help(d.by) }.width(min: 150, ideal: 210)
                 })
             }
         }
