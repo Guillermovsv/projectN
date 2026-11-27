@@ -125,12 +125,27 @@ final class NavigationModel: ObservableObject {
     /// "Add Project from GitHub…" sheet (menu, ⇧⌘O, sidebar).
     @Published var showAddFromGitHub = false
 
-    /// Workspaces (projects → spaces → panes) or Agents (agents → their tasks). Remembered across launches.
+    /// Workspaces (projects → spaces → panes), Agents (agents → their tasks) or Office (running panes as pixel-art
+    /// characters). Remembered across launches.
     enum Mode: String, CaseIterable, Identifiable {
-        case workspaces, agents
+        case workspaces, agents, office
         var id: String { rawValue }
-        var label: String { self == .workspaces ? "Workspaces" : "Agents" }
-        var symbol: String { self == .workspaces ? "rectangle.3.group" : "person.2" }
+        var label: String {
+            switch self {
+            case .workspaces: return "Workspaces"
+            case .agents: return "Agents"
+            case .office: return "Office"
+            }
+        }
+        var symbol: String {
+            switch self {
+            case .workspaces: return "rectangle.3.group"
+            case .agents: return "person.2"
+            case .office: return "building.2"
+            }
+        }
+        /// ⌃⌘ + this digit.
+        var shortcut: Int { (Self.allCases.firstIndex(of: self) ?? 0) + 1 }
     }
     @Published var mode: Mode = Mode(rawValue: UserDefaults.standard.string(forKey: "viewMode") ?? "") ?? .workspaces {
         didSet { UserDefaults.standard.set(mode.rawValue, forKey: "viewMode") }
@@ -144,10 +159,12 @@ final class NavigationModel: ObservableObject {
     /// Agents view shows Deliveries (requests agents worked on together) instead of one agent.
     @Published var showDeliveries = false
     @Published var selectedDeliveryID: UUID?
+    /// Pane whose terminal floats over the Office.
+    @Published var officePaneID: UUID?
     /// Agent to show when Settings → Agents opens.
     @Published var focusAgentInSettings: UUID?
 
-    /// Both views stay mounted (RootView hides the inactive one), so this only cross-fades their opacity:
+    /// All views stay mounted (RootView hides the inactive ones), so this only cross-fades their opacity:
     /// no rebuilding the pane grid or re-parenting every terminal.
     static let switchDuration: TimeInterval = 0.15
 
@@ -221,6 +238,8 @@ struct RootView: View {
                         .modeLayer(active: !nav.settingsOpen && nav.mode == .workspaces)
                     AgentsSidebar(onHide: { withAnimation(.easeInOut(duration: 0.18)) { sidebarVisible = false } })
                         .modeLayer(active: !nav.settingsOpen && nav.mode == .agents)
+                    OfficeSidebar(onHide: { withAnimation(.easeInOut(duration: 0.18)) { sidebarVisible = false } })
+                        .modeLayer(active: !nav.settingsOpen && nav.mode == .office)
                     if nav.settingsOpen { SettingsSidebar() }
                 }
                 .frame(width: sidebarWidth)
@@ -241,7 +260,7 @@ struct RootView: View {
         }
     }
 
-    /// Workspaces and Agents both stay mounted; only the active one is shown. Swapping them used to tear down
+    /// Workspaces, Agents and Office stay mounted; only the active one is shown. Swapping them used to tear down
     /// the whole pane grid (and detach/re-attach every terminal) on each switch, which is what felt laggy.
     private var detail: some View {
         ZStack {
@@ -249,6 +268,8 @@ struct RootView: View {
                 .modeLayer(active: !nav.settingsOpen && nav.mode == .workspaces)
             AgentsDetailView()
                 .modeLayer(active: !nav.settingsOpen && nav.mode == .agents)
+            OfficeDetailView()
+                .modeLayer(active: !nav.settingsOpen && nav.mode == .office)
             if nav.settingsOpen { SettingsDetailView() }
         }
     }
@@ -322,6 +343,8 @@ struct AppCommands: Commands {
                 .keyboardShortcut("1", modifiers: [.command, .control])
             Button("Agents View") { nav.switchMode(.agents) }
                 .keyboardShortcut("2", modifiers: [.command, .control])
+            Button("Office View") { nav.switchMode(.office) }
+                .keyboardShortcut("3", modifiers: [.command, .control])
             Divider()
             Button(panel.visible ? "Hide Right Panel" : "Show Right Panel") { panel.toggle() }
                 .keyboardShortcut("0", modifiers: [.command, .option])

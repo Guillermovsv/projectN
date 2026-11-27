@@ -1,0 +1,533 @@
+diff --git a/webview-ui/src/App.tsx b/webview-ui/src/App.tsx
+index 3eb91a2..c747b10 100644
+--- a/webview-ui/src/App.tsx
++++ b/webview-ui/src/App.tsx
+@@ -38,7 +38,6 @@ import { MobileMenu, MobileMenuButton } from './mobile/MobileMenu.js';
+ import { MobileShell } from './mobile/MobileShell.js';
+ import { useMobileMenu } from './mobile/useMobileMenu.js';
+ import { useMobileShell } from './mobile/useMobileShell.js';
+-import { MusicPlayer } from './music/MusicPlayer.js';
+ import { OfficeCanvas } from './office/components/OfficeCanvas.js';
+ import { ToolOverlay } from './office/components/ToolOverlay.js';
+ import { EditorState } from './office/editor/editorState.js';
+@@ -752,7 +751,7 @@ function App() {
+       )}
+ 
+       {/* The office radio: bottom-right, centred on a phone (the version label sits above it). */}
+-      {!isDebugMode && <MusicPlayer mobile={isMobile} />}
++      
+ 
+       <VersionIndicator
+         currentVersion={extensionVersion}
+diff --git a/webview-ui/src/hooks/useExtensionMessages.ts b/webview-ui/src/hooks/useExtensionMessages.ts
+index 649025d..67b66c8 100644
+--- a/webview-ui/src/hooks/useExtensionMessages.ts
++++ b/webview-ui/src/hooks/useExtensionMessages.ts
+@@ -901,6 +901,8 @@ export function useExtensionMessages(
+           msg.leadAgentId as number | undefined,
+           msg.teamUsesTmux as boolean | undefined,
+         );
++      } else if (msg.type === 'agentLeisure') {
++        os.setLeisure(msg.id as number, (msg.mode as 'play' | 'sleep' | null) ?? null);
+       } else if (msg.type === 'agentContextUsage') {
+         const id = msg.id as number;
+         os.setAgentContext(id, msg.contextTokens as number, msg.maxContextTokens as number);
+diff --git a/webview-ui/src/office/components/ToolOverlay.tsx b/webview-ui/src/office/components/ToolOverlay.tsx
+index df2bc5c..63e0f45 100644
+--- a/webview-ui/src/office/components/ToolOverlay.tsx
++++ b/webview-ui/src/office/components/ToolOverlay.tsx
+@@ -264,6 +264,15 @@ export function ToolOverlay({
+           );
+         }
+ 
++        // ProjectN: say what it's doing on its time off.
++        if (ch.state === CharacterState.PLAY) activityText = 'Playing';
++        else if (ch.state === CharacterState.SLEEP) activityText = 'Sleeping';
++        // Off duty, only the name shows (so the games and beds stay visible) until pointed at.
++        const compact =
++          (ch.state === CharacterState.PLAY || ch.state === CharacterState.SLEEP) &&
++          !isSelected &&
++          !isHovered;
++
+         // Determine dot color
+         const tools = agentTools[id];
+         const hasPermission = subHasPermission || tools?.some((t) => t.permissionWait && !t.done);
+@@ -329,14 +338,16 @@ export function ToolOverlay({
+                   )}
+                   <span
+                     className="overflow-hidden text-ellipsis block leading-none"
++                    hidden={compact}
+                     style={{
++                      display: compact ? 'none' : undefined,
+                       fontSize: isSub ? '20px' : '22px',
+                       fontStyle: isSub ? 'italic' : undefined,
+                     }}
+                   >
+                     {activityText}
+                   </span>
+-                  {ch.directoryName && (
++                  {ch.directoryName && !compact && (
+                     <span className="text-2xs leading-none overflow-hidden text-ellipsis block">
+                       {ch.directoryName}
+                     </span>
+@@ -359,7 +370,7 @@ export function ToolOverlay({
+                   </Button>
+                 )}
+               </div>
+-              {showContextGauge && (
++              {showContextGauge && !compact && (
+                 <ContextBar
+                   used={contextRatio}
+                   width={CONTEXT_GAUGE_WIDTH_PX}
+diff --git a/webview-ui/src/office/engine/characters.ts b/webview-ui/src/office/engine/characters.ts
+index 5704a7b..2b54492 100644
+--- a/webview-ui/src/office/engine/characters.ts
++++ b/webview-ui/src/office/engine/characters.ts
+@@ -275,6 +275,12 @@ export function updateCharacter(
+ 
+       stepAlongPath(ch, dt);
+ 
++      // ProjectN: arrived at a game, bed or sofa; stop here and let leisure.ts take over.
++      if (!ch.isActive && ch.spot && ch.path.length === 0) {
++        ch.state = CharacterState.IDLE;
++        break;
++      }
++
+       // If became active while wandering, repath to seat
+       if (ch.isActive && ch.seatId) {
+         const seat = seats.get(ch.seatId);
+@@ -434,6 +440,11 @@ export function getCharacterSprite(ch: Character, sprites: CharacterSprites): Sp
+       return sprites.typing[ch.dir][ch.frame % 2];
+     case CharacterState.WALK:
+       return sprites.walk[ch.dir][ch.frame % 4];
++    case CharacterState.PLAY:
++      return sprites.typing[ch.dir][ch.frame % 2];
++    case CharacterState.SLEEP:
++      // In bed it lies facing up out of the covers; elsewhere it sits.
++      return ch.spot?.bed ? sprites.walk[ch.dir][1] : sprites.seated[ch.dir];
+     case CharacterState.IDLE:
+       return sprites.walk[ch.dir][1];
+     default:
+diff --git a/webview-ui/src/office/engine/leisure.ts b/webview-ui/src/office/engine/leisure.ts
+new file mode 100644
+index 0000000..e4d92b3
+--- /dev/null
++++ b/webview-ui/src/office/engine/leisure.ts
+@@ -0,0 +1,164 @@
++/**
++ * ProjectN: what an agent does off duty. The host says `play` or `sleep` (`agentLeisure`):
++ * the character walks to a free game or bed and stays there until it has work again.
++ * With nothing free, players wander as usual and sleepers nap in their own chair.
++ */
++
++import { TYPE_FRAME_DURATION_SEC } from '../../constants.js';
++import { findPath, isWalkable } from '../layout/tileMap.js';
++import type {
++  Character,
++  Leisure,
++  LeisureSpot,
++  PlacedFurniture,
++  Seat,
++  TileType as TileTypeVal,
++} from '../types.js';
++import { CharacterState, Direction, TILE_SIZE } from '../types.js';
++
++/** Where a sleeper's feet would be below the bed's top edge, so its head rests on the pillow. */
++const BED_ANCHOR_Y_PX = 25;
++const PLAY_FRAME_SEC = TYPE_FRAME_DURATION_SEC / 2;
++
++/** The games, beds and sofas of a layout. */
++export function leisureSpots(
++  furniture: PlacedFurniture[],
++  seats: Map<string, Seat>,
++  tileMap: TileTypeVal[][],
++  blocked: Set<string>,
++): LeisureSpot[] {
++  const spots: LeisureSpot[] = [];
++  for (const item of furniture) {
++    if (item.type.startsWith('ARCADE') || item.type.startsWith('GAME_TV')) {
++      // Players stand below the machine (two in front of the TV), facing it.
++      const width = item.type.startsWith('GAME_TV') ? 2 : 1;
++      for (let dc = 0; dc < width; dc++) {
++        const col = item.col + dc;
++        const row = item.row + 2;
++        if (!isWalkable(col, row, tileMap, blocked)) continue;
++        spots.push({ id: `${item.uid}:${dc}`, kind: 'play', col, row, dir: Direction.UP });
++      }
++    } else if (item.type.startsWith('BED')) {
++      // Reached from the foot of the bed or either side of it.
++      const foot = [
++        { col: item.col, row: item.row + 2 },
++        { col: item.col - 1, row: item.row + 1 },
++        { col: item.col + 1, row: item.row + 1 },
++      ].find((t) => isWalkable(t.col, t.row, tileMap, blocked));
++      if (!foot) continue;
++      spots.push({
++        id: item.uid,
++        kind: 'bed',
++        ...foot,
++        dir: Direction.DOWN,
++        bed: { x: item.col * TILE_SIZE + TILE_SIZE / 2, y: item.row * TILE_SIZE + BED_ANCHOR_Y_PX },
++      });
++    } else if (item.type.startsWith('SOFA')) {
++      for (const seat of seats.values()) {
++        if (seat.uid !== item.uid && !seat.uid.startsWith(`${item.uid}:`)) continue;
++        spots.push({
++          id: seat.uid,
++          kind: 'sofa',
++          col: seat.seatCol,
++          row: seat.seatRow,
++          dir: seat.facingDir,
++          seatId: seat.uid,
++        });
++      }
++    }
++  }
++  return spots;
++}
++
++/** A free spot for `mode`, beds before sofas, the closest first. */
++export function pickSpot(
++  ch: Character,
++  mode: Leisure,
++  spots: LeisureSpot[],
++  taken: Set<string>,
++  seats: Map<string, Seat>,
++): LeisureSpot | null {
++  const rank = (s: LeisureSpot) =>
++    (s.kind === 'sofa' ? 1000 : 0) + Math.abs(s.col - ch.tileCol) + Math.abs(s.row - ch.tileRow);
++  const free = spots.filter(
++    (s) =>
++      (mode === 'play') === (s.kind === 'play') &&
++      !taken.has(s.id) &&
++      // A sofa someone works from isn't free, unless it's their own.
++      (!s.seatId || s.seatId === ch.seatId || !seats.get(s.seatId)?.assigned),
++  );
++  return free.sort((a, b) => rank(a) - rank(b))[0] ?? null;
++}
++
++/** Leave the spot: from a bed, get up beside it. */
++export function leaveSpot(ch: Character): void {
++  if (ch.state === CharacterState.PLAY || ch.state === CharacterState.SLEEP) {
++    ch.state = CharacterState.IDLE;
++    ch.x = ch.tileCol * TILE_SIZE + TILE_SIZE / 2;
++    ch.y = ch.tileRow * TILE_SIZE + TILE_SIZE / 2;
++    ch.frame = 0;
++    ch.frameTimer = 0;
++    ch.wanderTimer = 0;
++  }
++  ch.spot = null;
++}
++
++/**
++ * One frame of time off at `ch.spot`. Returns false while the ordinary state machine
++ * should run instead (walking is shared with it).
++ */
++export function updateLeisure(
++  ch: Character,
++  dt: number,
++  tileMap: TileTypeVal[][],
++  blocked: Set<string>,
++): boolean {
++  const spot = ch.spot;
++  if (!spot || ch.state === CharacterState.WALK) return false;
++  if (ch.state === CharacterState.PLAY || ch.state === CharacterState.SLEEP) {
++    ch.frameTimer += dt;
++    if (ch.frameTimer >= PLAY_FRAME_SEC) {
++      ch.frameTimer -= PLAY_FRAME_SEC;
++      ch.frame = (ch.frame + 1) % 2;
++    }
++    return true;
++  }
++  if (ch.tileCol !== spot.col || ch.tileRow !== spot.row) {
++    // A sofa's own tile is furniture: open it just for this path.
++    const key = `${spot.col},${spot.row}`;
++    const wasBlocked = blocked.delete(key);
++    const path = findPath(ch.tileCol, ch.tileRow, spot.col, spot.row, tileMap, blocked);
++    if (wasBlocked) blocked.add(key);
++    if (path.length === 0) {
++      ch.spot = null;
++      return false;
++    }
++    ch.path = path;
++    ch.moveProgress = 0;
++    ch.state = CharacterState.WALK;
++    ch.frame = 0;
++    ch.frameTimer = 0;
++    return true;
++  }
++  ch.state = spot.kind === 'play' ? CharacterState.PLAY : CharacterState.SLEEP;
++  ch.dir = spot.dir;
++  if (spot.bed) {
++    ch.x = spot.bed.x;
++    ch.y = spot.bed.y;
++  }
++  ch.frame = 0;
++  ch.frameTimer = 0;
++  ch.bubbleType = null;
++  return true;
++}
++
++/** Nap where it sits: no bed or sofa was free. */
++export function napInChair(ch: Character, seats: Map<string, Seat>): boolean {
++  const seat = ch.seatId ? seats.get(ch.seatId) : undefined;
++  if (!seat || ch.tileCol !== seat.seatCol || ch.tileRow !== seat.seatRow) return false;
++  if (ch.state === CharacterState.WALK) return false;
++  ch.state = CharacterState.SLEEP;
++  ch.dir = seat.facingDir;
++  ch.bubbleType = null;
++  return true;
++}
+diff --git a/webview-ui/src/office/engine/officeState.ts b/webview-ui/src/office/engine/officeState.ts
+index 1afd778..decd0ea 100644
+--- a/webview-ui/src/office/engine/officeState.ts
++++ b/webview-ui/src/office/engine/officeState.ts
+@@ -34,12 +34,14 @@ import type {
+   Pet,
+   PlacedFurniture,
+   PlacedPet,
++  Leisure,
+   Seat,
+   TileType as TileTypeVal,
+ } from '../types.js';
+ import { CharacterState, Direction, PetState, TILE_SIZE } from '../types.js';
+ import { tickBlink } from './blink.js';
+ import { createCharacter, restInChair, updateCharacter, updateHelper } from './characters.js';
++import { leaveSpot, leisureSpots, napInChair, pickSpot, updateLeisure } from './leisure.js';
+ import { advanceMatrixEffect, startMatrixEffect } from './matrixEffectState.js';
+ import { createPet, updatePet } from './petEntity.js';
+ import { anchorTile, closestFreeSeat } from './seatPlacement.js';
+@@ -201,6 +203,9 @@ export class OfficeState {
+       }
+     }
+ 
++    // Spots belong to the old layout.
++    for (const ch of this.characters.values()) leaveSpot(ch);
++
+     // Reassign characters to new seats, preserving existing assignments when possible
+     for (const seat of this.seats.values()) {
+       seat.assigned = false;
+@@ -1193,6 +1198,61 @@ export class OfficeState {
+     ch.contextReported = true;
+   }
+ 
++  /** ProjectN: send an agent to play or sleep, or (null) back to its usual self. */
++  setLeisure(id: number, mode: Leisure | null): void {
++    const ch = this.characters.get(id);
++    if (!ch || (ch.leisure ?? null) === mode) return;
++    leaveSpot(ch);
++    ch.leisure = mode;
++    if (mode) {
++      // Get up now rather than after the usual rest in the chair.
++      ch.seatTimer = 0;
++      if (ch.state === CharacterState.TYPE && !ch.isActive) ch.state = CharacterState.IDLE;
++    }
++  }
++
++  /** ProjectN: one frame of time off. True when the character needs nothing else this frame. */
++  private updateTimeOff(ch: Character, dt: number): boolean {
++    if (ch.isActive || !ch.leisure) {
++      if (ch.spot || ch.state === CharacterState.PLAY || ch.state === CharacterState.SLEEP) {
++        leaveSpot(ch);
++      }
++      return false;
++    }
++    if (!ch.spot) {
++      const taken = new Set<string>();
++      for (const other of this.characters.values()) if (other.spot) taken.add(other.spot.id);
++      const spots = leisureSpots(
++        this.layout.furniture,
++        this.seats,
++        this.tileMap,
++        this.blockedTiles,
++      );
++      ch.spot = pickSpot(ch, ch.leisure, spots, taken, this.seats);
++    }
++    if (ch.spot) return updateLeisure(ch, dt, this.tileMap, this.blockedTiles);
++    if (ch.leisure !== 'sleep') return false;
++    if (ch.state === CharacterState.SLEEP || napInChair(ch, this.seats)) return true;
++    // Head to its chair to nap.
++    const seat = ch.seatId ? this.seats.get(ch.seatId) : undefined;
++    if (seat && ch.state !== CharacterState.WALK) {
++      const path = findPath(
++        ch.tileCol,
++        ch.tileRow,
++        seat.seatCol,
++        seat.seatRow,
++        this.tileMap,
++        this.blockedTiles,
++      );
++      if (path.length > 0) {
++        ch.path = path;
++        ch.moveProgress = 0;
++        ch.state = CharacterState.WALK;
++      }
++    }
++    return false;
++  }
++
+   update(dt: number): void {
+     // Furniture animation cycling
+     const prevFrame = Math.floor(this.furnitureAnimTimer / FURNITURE_ANIM_INTERVAL_SEC);
+@@ -1234,9 +1294,10 @@ export class OfficeState {
+         );
+       } else {
+         // Temporarily unblock own seat so character can pathfind to it
+-        this.withOwnSeatUnblocked(ch, () =>
+-          updateCharacter(ch, dt, this.walkableTiles, this.seats, this.tileMap, this.blockedTiles),
+-        );
++        this.withOwnSeatUnblocked(ch, () => {
++          if (this.updateTimeOff(ch, dt)) return;
++          updateCharacter(ch, dt, this.walkableTiles, this.seats, this.tileMap, this.blockedTiles);
++        });
+       }
+ 
+       // Tick bubble timer for waiting bubbles
+diff --git a/webview-ui/src/office/engine/renderer.ts b/webview-ui/src/office/engine/renderer.ts
+index ac77349..fa53c9e 100644
+--- a/webview-ui/src/office/engine/renderer.ts
++++ b/webview-ui/src/office/engine/renderer.ts
+@@ -350,6 +350,52 @@ interface ZDrawable {
+   draw: (ctx: CanvasRenderingContext2D) => void;
+ }
+ 
++const headCache = new WeakMap<string[][], string[][]>();
++
++/** ProjectN: the top of a sprite, down to the shoulders. */
++function headOf(sprite: string[][]): string[][] {
++  let head = headCache.get(sprite);
++  if (!head) {
++    const top = sprite.findIndex((row) => row.some((px) => px !== ''));
++    head = sprite.slice(0, Math.max(top, 0) + 15);
++    headCache.set(sprite, head);
++  }
++  return head;
++}
++
++const SNORE_Z = ['11111', '00010', '00100', '01000', '11111'];
++
++/** ProjectN: three little Zs drifting up from a sleeper. */
++function drawSnore(
++  c: CanvasRenderingContext2D,
++  x: number,
++  y: number,
++  zoom: number,
++  seed: number,
++): void {
++  const now = performance.now() / 2400 + seed * 0.37;
++  c.save();
++  for (let i = 0; i < 3; i++) {
++    const t = (now + i / 3) % 1;
++    const px = Math.max(1, Math.round(zoom * (0.5 + t * 0.5)));
++    const left = Math.round(x + t * 7 * zoom);
++    const top = Math.round(y - t * 14 * zoom);
++    c.globalAlpha = Math.min(1, (1 - t) * 1.6);
++    for (const [colour, off] of [
++      ['#1e1e2e', px / 2],
++      ['#e8f0ff', 0],
++    ] as const) {
++      c.fillStyle = colour;
++      SNORE_Z.forEach((row, r) => {
++        for (let k = 0; k < row.length; k++) {
++          if (row[k] === '1') c.fillRect(left + k * px + off, top + r * px + off, px, px);
++        }
++      });
++    }
++  }
++  c.restore();
++}
++
+ /** @internal */
+ export function renderScene(
+   ctx: CanvasRenderingContext2D,
+@@ -392,19 +438,38 @@ export function renderScene(
+ 
+   // Characters
+   for (const ch of characters) {
+-    const sprites = getCharacterSprites(ch.palette, ch.repeat, ch.blinkShut > 0);
+-    const spriteData = getCharacterSprite(ch, sprites);
++    const asleep = ch.state === CharacterState.SLEEP;
++    const sprites = getCharacterSprites(ch.palette, ch.repeat, asleep || ch.blinkShut > 0);
++    const inBed = asleep && !!ch.spot?.bed;
++    const wholeSprite = getCharacterSprite(ch, sprites);
++    // The covers hide everything below the shoulders.
++    const spriteData = inBed ? headOf(wholeSprite) : wholeSprite;
+     const cached = getCachedSprite(spriteData, zoom);
+     // Sitting offset: shift character down when seated so they visually sit in the chair
+-    const sittingOffset = ch.state === CharacterState.TYPE ? CHARACTER_SITTING_OFFSET_PX : 0;
++    const sittingOffset =
++      ch.state === CharacterState.TYPE || (asleep && !inBed) ? CHARACTER_SITTING_OFFSET_PX : 0;
+     // Anchor at bottom-center of character — round to integer device pixels
+     const drawX = Math.round(offsetX + ch.x * zoom - cached.width / 2);
+-    const drawY = Math.round(offsetY + (ch.y + sittingOffset) * zoom - cached.height);
++    // A cropped head keeps the top of the whole sprite.
++    const drawY = Math.round(
++      offsetY + (ch.y + sittingOffset - wholeSprite.length) * zoom,
++    );
+ 
+     // Sort characters by bottom of their tile (not center) so they render
+     // in front of same-row furniture (e.g. chairs) but behind furniture
+     // at lower rows (e.g. desks, bookshelves that occlude from below).
+-    const charZY = ch.y + TILE_SIZE / 2 + CHARACTER_Z_SORT_OFFSET;
++    // In bed: in front of the whole bed, which reaches two tiles down.
++    const charZY = inBed
++      ? (ch.spot!.row + 2) * TILE_SIZE
++      : ch.y + TILE_SIZE / 2 + CHARACTER_Z_SORT_OFFSET;
++    if (asleep) {
++      const zx = offsetX + (ch.x + 5) * zoom;
++      const zy = offsetY + (ch.y + sittingOffset - wholeSprite.length + 8) * zoom;
++      drawables.push({
++        zY: Number.MAX_SAFE_INTEGER,
++        draw: (c) => drawSnore(c, zx, zy, zoom, ch.id),
++      });
++    }
+ 
+     // Headless agents (adopted, no terminal to focus) render translucent while
+     // the "Display headless as ghosts" setting is on.
+diff --git a/webview-ui/src/office/types.ts b/webview-ui/src/office/types.ts
+index 00f3f3d..eb31ab8 100644
+--- a/webview-ui/src/office/types.ts
++++ b/webview-ui/src/office/types.ts
+@@ -30,6 +30,8 @@ export const CharacterState = {
+   IDLE: 'idle',
+   WALK: 'walk',
+   TYPE: 'type',
++  PLAY: 'play',
++  SLEEP: 'sleep',
+ } as const;
+ export type CharacterState = (typeof CharacterState)[keyof typeof CharacterState];
+ 
+@@ -56,6 +58,22 @@ export interface Seat {
+   assigned: boolean;
+ }
+ 
++/** ProjectN: what an off-duty agent is doing. */
++export type Leisure = 'play' | 'sleep';
++
++/** ProjectN: a place to play or sleep. `col,row` is where the character walks to. */
++export interface LeisureSpot {
++  id: string;
++  kind: 'play' | 'bed' | 'sofa';
++  col: number;
++  row: number;
++  dir: Direction;
++  /** Where a character lies, in pixels. */
++  bed?: { x: number; y: number };
++  /** The chair seat a sofa spot is. */
++  seatId?: string;
++}
++
+ export interface FurnitureInstance {
+   sprite: SpriteData;
+   /** Pixel x (top-left) */
+@@ -247,6 +265,10 @@ export interface Character extends Blinker {
+    *  (testHooks.getCharacters) to tell the greeter from agents. */
+   isGreeter?: boolean;
+ 
++  // -- ProjectN time off --
++  leisure?: Leisure | null;
++  spot?: LeisureSpot | null;
++
+   // -- Agent Teams --
+   /** Team name this agent belongs to */
+   teamName?: string;

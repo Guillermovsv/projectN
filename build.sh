@@ -27,6 +27,9 @@ cp "$(dirname "$BIN")/pn-agent" "$APP/Contents/MacOS/pn-agent"
 # SwiftTerm ships a resource bundle; copy any bundles next to the binary.
 for b in "$(dirname "$BIN")"/*.bundle; do [ -e "$b" ] && cp -R "$b" "$APP/Contents/Resources/"; done
 
+# The Office view's interface (rebuilt only by scripts/build-office.sh).
+cp -R Office/web "$APP/Contents/Resources/Office"
+
 if [ ! -f build/AppIcon.icns ]; then
   rm -rf build/AppIcon.iconset
   swift scripts/make_icon.swift build/AppIcon.iconset

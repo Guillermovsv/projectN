@@ -456,7 +456,7 @@ struct SidebarFooter: View {
     }
 }
 
-/// Workspaces | Agents switch at the top of the sidebar (⌃⌘1 / ⌃⌘2).
+/// Workspaces | Agents | Office switch at the top of the sidebar (⌃⌘1 / ⌃⌘2 / ⌃⌘3).
 struct ViewModeSwitch: View {
     @EnvironmentObject var nav: NavigationModel
     @EnvironmentObject var agents: AgentHarness
@@ -477,7 +477,7 @@ struct ViewModeSwitch: View {
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(nav.mode == m ? .primary : .secondary)
-                .help("\(m.label) view (⌃⌘\(m == .workspaces ? 1 : 2))")
+                .help("\(m.label) view (⌃⌘\(m.shortcut))")
             }
         }
         .padding(2)

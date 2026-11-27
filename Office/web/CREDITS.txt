@@ -1,0 +1,2 @@
+Office view: Pixel Agents (https://github.com/pixel-agents-hq/pixel-agents), MIT, commit 4dd14d612fd37d89ffbbc977959f572395c4eec8.
+Character art based on MetroCity by JIK-A-4 (https://jik-a-4.itch.io/metrocity-free-topdown-character-pack).

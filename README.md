@@ -54,6 +54,7 @@ open /Applications/ProjectN.app
 | **Project** | A folder you've declared (sidebar → Projects, ⌘O, drop folders on it, or clone from GitHub with ⇧⌘O). |
 | **Workspace** | A named group of projects. Shown as a parent in the sidebar. |
 | **Space** | A screen inside a workspace holding **1–8 panes**, tiled automatically: a single pane fills the space, 2–3 sit side by side, 4 → 2×2, 5–6 → 3×2, 7–8 → 4×2. |
+| **Office** | A third view (⌃⌘3) where every Claude, Codex or Cursor pane is a pixel-art character that types or asks for you; idle ones play at the arcade or console, and after 10 quiet minutes (or when asleep) go to bed. Click one to open its terminal in a floating window. Built on [Pixel Agents](https://github.com/pixel-agents-hq/pixel-agents) (rebuild its interface with `scripts/build-office.sh`); characters based on [MetroCity](https://jik-a-4.itch.io/metrocity-free-topdown-character-pack) by JIK-A-4. |
 | **Pane** | Claude, Codex or a Terminal running in one of the workspace's projects. Each new pane gets a random name (Ada, Grace, Linus…) so you can tell agents apart; the ⤢ button in its header expands it to fill the space (click again to go back to the split view). |
 
 The sidebar always shows the Workspaces → Spaces tree (plus Projects). Each workspace has a **⋮** menu: *Add Space*, *Projects…*, *Rename…*, *Remove from App* (removes the workspace from ProjectN only — your folders and files are never deleted). Click a space to open it, click **Overview** (⌘0) to step out. Panes keep running in the background while you're elsewhere.
