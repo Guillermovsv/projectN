@@ -198,6 +198,15 @@ final class TerminalSession: NSObject, ObservableObject, LocalProcessTerminalVie
         return fg > 0 && fg != process.shellPid
     }
 
+    /// Whether the agent is mid-turn (working, or stopped on a prompt) judged from the live screen read right now,
+    /// not the cached frame the activity timer last saw. For the quit confirmation, where a stale "idle" loses work.
+    var isMidTurnNow: Bool {
+        guard isRunning, !terminated else { return false }
+        if activity == .working || needsInput { return true }
+        let screen = TerminalScreenReader(view: view).tail(Self.scanRows)
+        return AutoResponder.isWorking(screen: screen) || AutoResponder.pendingPrompt(screen: screen) != nil
+    }
+
     /// AI CLIs we recognize when they're started by hand inside a plain terminal pane.
     static let aiCLINames: Set<String> = ["claude", "codex", "cursor-agent", "gemini"]
 

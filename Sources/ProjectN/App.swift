@@ -17,7 +17,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.activate(ignoringOtherApps: true)
     }
 
-    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+    /// Closing the window quits, but ask first when agents are working: on Cancel ProjectN keeps running
+    /// without a window (agents carry on; the Dock icon opens it again).
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        guard !quitConfirmed else { return true }
+        guard confirmQuitWhileWorking() else { return false }
+        quitConfirmed = true
+        return true
+    }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         // Everything (layout, conversations, terminal output) is saved and restored on next launch, so an
@@ -32,7 +39,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// True when it's fine to quit: nothing is working, or the user confirmed.
     func confirmQuitWhileWorking() -> Bool {
         guard let store else { return true }
-        let working = MainActor.assumeIsolated { store.workingPaneTitles }
+        let working = MainActor.assumeIsolated { () -> [String] in
+            var titles = store.workingPaneTitles
+            // Agent tasks the harness is running, even if their pane's screen doesn't read as busy.
+            for t in agents?.tasks ?? [] where [.starting, .running, .needsApproval].contains(t.status) {
+                let pane = t.paneID.flatMap { id in store.state.workspaces.flatMap(\.spaces).flatMap(\.panes).first { $0.id == id } }
+                let title = pane.map(store.paneTitle) ?? t.agentName
+                if !titles.contains(title) { titles.append(title) }
+            }
+            return titles
+        }
         guard !working.isEmpty else { return true }
         let alert = NSAlert()
         alert.alertStyle = .warning
