@@ -144,11 +144,12 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
             if changed { AgentStore.saveProfiles(saved, policy: policy) }
             profiles = saved
         } else {
+            // Fresh install: no agents yet. The Agents view offers the default pack (PM, Developer, QA, Verificador).
             policy.perProjectSessionsMigrated = true
             policy.autonomyMigrated = true
-            let seeded = [AgentProfile.projectManager()]
-            profiles = seeded
-            AgentStore.saveProfiles(seeded, policy: policy)
+            policy.starterPackOffered = true
+            profiles = []
+            AgentStore.saveProfiles([], policy: policy)
         }
         self.policy = policy
         // Anything that was running when the app quit can't be followed any more: report it as interrupted.
@@ -242,6 +243,34 @@ final class AgentHarness: ObservableObject, AgentCoordinating {
         AgentStore.saveProfiles(profiles, policy: policy)
         onProfilesChanged?()
         AuditLog.record("agent.deleted", ["agent": p.name])
+    }
+
+    // MARK: Default agent pack
+
+    /// The pack's agents you don't have yet.
+    var missingStarterAgents: [AgentProfile] { AgentStarterPack.missing(in: profiles) }
+
+    /// Show the offer: a fresh install that hasn't added or dismissed the pack.
+    var offersStarterPack: Bool { policy.starterPackOffered && !missingStarterAgents.isEmpty }
+
+    /// Adds the pack's missing agents (an agent you already have with the same name is kept as it is).
+    @discardableResult
+    func addStarterPack() -> [AgentProfile] {
+        let added = missingStarterAgents
+        profiles += added
+        policy.starterPackOffered = false
+        AgentStore.saveProfiles(profiles, policy: policy)
+        if !added.isEmpty { onProfilesChanged?() }
+        AuditLog.record("agents.starter_pack_added", ["agents": added.map(\.name).joined(separator: ", ")])
+        return added
+    }
+
+    /// "Not now": hides the offer. The pack stays in the "+" menus.
+    func dismissStarterPack() {
+        guard policy.starterPackOffered else { return }
+        policy.starterPackOffered = false
+        AgentStore.saveProfiles(profiles, policy: policy)
+        AuditLog.record("agents.starter_pack_dismissed")
     }
 
     func replaceProfileQuietly(_ p: AgentProfile) {

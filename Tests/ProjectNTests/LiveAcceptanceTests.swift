@@ -32,6 +32,7 @@ struct LiveAcceptanceTests {
         store.openProject(project)
 
         let harness = AgentHarness()
+        if harness.profiles.isEmpty { harness.saveProfile(.projectManager()) }   // fresh install: no agents
         harness.attach(store, refreshModels: true)
         let deadline = Date().addingTimeInterval(20)
         while ModelCatalog.shared.claude.source != .live, Date() < deadline { try await Task.sleep(for: .milliseconds(200)) }
@@ -96,6 +97,7 @@ struct LiveAcceptanceTests {
         store.openProject(project)
 
         let harness = AgentHarness()
+        if harness.profiles.isEmpty { harness.saveProfile(.projectManager()) }   // fresh install: no agents
         harness.attach(store, refreshModels: true)
         var pm = try #require(harness.profiles.first)
         pm.model = "claude-sonnet-5-5"; pm.effort = "low"
@@ -180,6 +182,7 @@ struct LiveAcceptanceTests {
         let project = store.addProject(url: repo)
         store.openProject(project)
         let harness = AgentHarness()
+        if harness.profiles.isEmpty { harness.saveProfile(.projectManager()) }   // fresh install: no agents
         harness.attach(store, refreshModels: true)
         var pm = try #require(harness.profiles.first)
         pm.model = "claude-sonnet-5-5"; pm.effort = "low"; pm.sessionPolicy = .perProject

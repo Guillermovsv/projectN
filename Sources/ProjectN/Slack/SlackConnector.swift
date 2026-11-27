@@ -346,7 +346,7 @@ final class SlackConnector: ObservableObject {
         } ?? SlackRouter.matchAgent(text, agents: harness.profiles, defaultID: settings.defaultAgentID)
         guard let agent = agentOpt else {
             let names = harness.availableAgents().map(\.name).joined(separator: ", ")
-            post(channel, threadTS, "No encontré un agente para este mensaje. Empieza con su nombre (\(names.isEmpty ? "no hay agentes activos" : names)) o elige un Default Agent en ProjectN.", bot: botKey)
+            post(channel, threadTS, "No encontré un agente para este mensaje. Empieza con su nombre (\(names.isEmpty ? "no hay agentes activos: agrega el paquete de agentes en ProjectN → Agentes" : names)) o elige un Default Agent en ProjectN.", bot: botKey)
             return
         }
         guard agent.enabled else {

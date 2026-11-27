@@ -56,6 +56,8 @@ struct AgentsSettingsView: View {
                     Menu {
                         Button { creatingWithAI = true } label: { Label("Create with AI…", systemImage: "sparkles") }
                         Button { selection = newProfile() } label: { Label("Blank Agent", systemImage: "plus") }
+                        Divider()
+                        StarterPackMenuItem { id in selection = id }
                     } label: { Image(systemName: "plus") }
                     .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
                     .help("New agent")

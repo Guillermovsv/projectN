@@ -110,6 +110,8 @@ struct AgentHarnessTests {
                      .init(id: "claude-haiku-5-5", label: "Haiku 5.5", efforts: [])],
             source: .live))
         let harness = AgentHarness(catalog: catalog)
+        // A fresh install has no agents (it offers the default pack); these suites talk to the pack's PM.
+        if harness.profiles.isEmpty { harness.saveProfile(.projectManager()) }
         harness.attach(store, refreshModels: false)
         // Most tests here count sessions per task; per-project sessions are tested in AutonomyTests.
         // These suites test the PM inside a project; working outside the projects has its own test (AutonomyTests).
@@ -152,6 +154,33 @@ struct AgentHarnessTests {
 
     private func value(after flag: String, in args: [String]) -> String? {
         args.firstIndex(of: flag).flatMap { args.indices.contains($0 + 1) ? args[$0 + 1] : nil }
+    }
+
+    // MARK: Default agent pack
+
+    @Test func freshInstallStartsWithoutAgentsAndOffersTheDefaultPack() async throws {
+        AppHome.bootstrap()
+        try? FileManager.default.removeItem(at: AgentStore.profilesFile)
+        let harness = AgentHarness(catalog: ModelCatalog())
+        #expect(harness.profiles.isEmpty)
+        #expect(harness.offersStarterPack)
+
+        let added = harness.addStarterPack()
+        #expect(added.map(\.name) == ["Project Manager", "Developer", "QA", "Verificador"])
+        #expect(harness.profiles.map(\.name) == added.map(\.name))
+        #expect(!harness.offersStarterPack && !harness.policy.starterPackOffered)
+        // Adding it again creates nothing; deleting one makes only that one missing.
+        #expect(harness.addStarterPack().isEmpty)
+        let qa = try #require(harness.profiles.first { $0.name == "QA" })
+        harness.deleteProfile(qa.id)
+        #expect(harness.missingStarterAgents.map(\.name) == ["QA"])
+        #expect(!harness.offersStarterPack)   // the offer doesn't come back once handled; the "+" menu still has it
+        #expect(harness.addStarterPack().map(\.name) == ["QA"])
+
+        try? FileManager.default.removeItem(at: AgentStore.profilesFile)
+        let other = AgentHarness(catalog: ModelCatalog())
+        other.dismissStarterPack()
+        #expect(other.profiles.isEmpty && !other.offersStarterPack && other.missingStarterAgents.count == 4)
     }
 
     // MARK: Acceptance

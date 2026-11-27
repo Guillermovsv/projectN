@@ -131,6 +131,8 @@ struct AgentsSidebar: View {
                 Menu {
                     Button { creating = true } label: { Label("Create with AI…", systemImage: "sparkles") }
                     Button { newAgent() } label: { Label("Blank Agent", systemImage: "plus") }
+                    Divider()
+                    StarterPackMenuItem { id in nav.showDeliveries = false; nav.selectedAgentID = id }
                 } label: { Image(systemName: "plus") }
                 .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
                 .help("New agent")
@@ -150,7 +152,10 @@ struct AgentsSidebar: View {
                     }
                     .padding(.horizontal, 8)
                     .frame(height: 24)
-                    if agents.profiles.isEmpty {
+                    if agents.offersStarterPack && !agents.profiles.isEmpty {
+                        StarterPackCard(compact: true) { id in nav.showDeliveries = false; nav.selectedAgentID = id }
+                            .padding(.bottom, 6)
+                    } else if agents.profiles.isEmpty {
                         Text("No agents yet.").font(.callout).foregroundStyle(.secondary).padding(8)
                     }
                     ForEach(agents.profiles) { p in agentRow(p) }
@@ -259,6 +264,79 @@ struct AgentsSidebar: View {
     }
 }
 
+// MARK: - Default agent pack
+
+/// The offer to add the default agents (AgentStarterPack). Compact: a card in the sidebar; else the full list.
+struct StarterPackCard: View {
+    @EnvironmentObject var agents: AgentHarness
+    var compact: Bool
+    var onAdded: (UUID) -> Void
+
+    var body: some View {
+        let missing = Set(agents.missingStarterAgents.map(\.name))
+        VStack(alignment: .leading, spacing: compact ? 6 : 12) {
+            HStack(spacing: 8) {
+                Image(systemName: "person.3.fill").foregroundStyle(Color.accentColor)
+                Text("Default agent pack").font(compact ? .callout.weight(.semibold) : .headline)
+            }
+            if compact {
+                Text(AgentStarterPack.summaries.filter { missing.contains($0.name) }.map(\.name).joined(separator: ", ")
+                     + " — ready for any project.")
+                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            } else {
+                Text("Four agents that work together on any project: you ask the Project Manager, it hands the work out, and you get the result checked.")
+                    .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                ForEach(AgentStarterPack.summaries.filter { missing.contains($0.name) }, id: \.name) { a in
+                    HStack(alignment: .top, spacing: 10) {
+                        Image(systemName: a.symbol).frame(width: 22).foregroundStyle(.secondary)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(a.name).font(.callout.weight(.medium))
+                            Text(a.line).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                }
+                Text("They work in all your projects with Claude Code. Deleting, publishing and anything outside a project still ask you. You can edit or remove each one later.")
+                    .font(.caption).foregroundStyle(.tertiary).fixedSize(horizontal: false, vertical: true)
+            }
+            HStack(spacing: 8) {
+                Button(compact ? "Add" : "Add the \(missing.count) agents") { add() }
+                    .buttonStyle(.borderedProminent).controlSize(compact ? .small : .regular)
+                if agents.policy.starterPackOffered {
+                    Button("Not now") { agents.dismissStarterPack() }
+                        .buttonStyle(.borderless).controlSize(compact ? .small : .regular)
+                }
+            }
+        }
+        .padding(compact ? 10 : 18)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(Color.primary.opacity(0.05)))
+        .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(Color.primary.opacity(0.08)))
+    }
+
+    private func add() {
+        if let first = agents.addStarterPack().first { onAdded(first.id) }
+    }
+}
+
+/// "+" menu item: adds whatever of the pack is missing.
+struct StarterPackMenuItem: View {
+    @EnvironmentObject var agents: AgentHarness
+    var onAdded: (UUID) -> Void
+
+    var body: some View {
+        let missing = agents.missingStarterAgents
+        Button {
+            if let first = agents.addStarterPack().first { onAdded(first.id) }
+        } label: {
+            Label(missing.isEmpty ? "Default Agent Pack (added)"
+                  : missing.count == AgentStarterPack.summaries.count ? "Default Agent Pack (PM, Dev, QA, Verificador)"
+                  : "Default Agent Pack: add " + missing.map(\.name).joined(separator: ", "),
+                  systemImage: "person.3")
+        }
+        .disabled(missing.isEmpty)
+    }
+}
+
 // MARK: - Detail
 
 /// Agents view, center: the selected agent, its conversations (one per task) as a vertical list, the task's terminal or result, and a message box.
@@ -277,10 +355,25 @@ struct AgentsDetailView: View {
                 DeliveriesPage()
             } else if let id = nav.selectedAgentID, let p = agents.profile(id) {
                 AgentPage(profile: p)
+            } else if agents.profiles.isEmpty {
+                ScrollView {
+                    VStack(spacing: 16) {
+                        Image(systemName: "person.3").font(.system(size: 40)).foregroundStyle(.tertiary)
+                        Text("No agents yet").font(.title3)
+                        Text("Agents run tasks in your projects — from here or from Slack.").foregroundStyle(.secondary)
+                        StarterPackCard(compact: false) { id in nav.selectedAgentID = id }
+                            .frame(maxWidth: 520)
+                        Button("Or create your own in Agent Settings") { nav.openSettings(.agents, panel: panel) }
+                            .buttonStyle(.link)
+                    }
+                    .padding(32)
+                    .frame(maxWidth: .infinity)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 VStack(spacing: 12) {
                     Image(systemName: "person.2").font(.system(size: 40)).foregroundStyle(.tertiary)
-                    Text(agents.profiles.isEmpty ? "No agents yet" : "Select an agent").font(.title3)
+                    Text("Select an agent").font(.title3)
                     Text("Agents run tasks in your projects — from here or from Slack.").foregroundStyle(.secondary)
                     Button("Agent Settings") { nav.openSettings(.agents, panel: panel) }
                 }

@@ -207,7 +207,18 @@ When you answer an agent's question (`ask`), the question and your answer are sa
 
 ### Agents (Settings → Agents)
 
-Each profile has: name, role, provider (Anthropic / OpenAI / other compatible), runtime (Claude Code / Codex CLI), model, reasoning effort, instructions, allowed tools, access level, project access, context sources, session policy, concurrency limit, timeout and an on/off switch. Profiles can be created, edited, duplicated and deleted. A **Project Manager** profile (Claude Code, Opus 5.5, effort high, read-only, can delegate, all projects, README as context) is created on first launch.
+Each profile has: name, role, provider (Anthropic / OpenAI / other compatible), runtime (Claude Code / Codex CLI), model, reasoning effort, instructions, allowed tools, access level, project access, context sources, session policy, concurrency limit, timeout and an on/off switch. Profiles can be created, edited, duplicated and deleted.
+
+**Default agent pack** — a fresh install starts with no agents. The Agents view offers the pack (add it or "Not now"); it's also in the **+** menus (Agents sidebar, Settings → Agents), which add only the agents you don't have by name. Each comes with template instructions that work for any user and project (`AgentStarterPack.swift`), editable afterwards:
+
+| Agent | Model | Access | Role in a request |
+|---|---|---|---|
+| **Project Manager** | Opus 5.5, high | Read only, can delegate, works outside the projects | Understands the request, sets acceptance criteria, delegates, starts the fix → retest → verify cycle |
+| **Developer** | Sonnet 5.5, high | Read & write | Implements and fixes, tests, commits (no push); the cycle's *fixer* |
+| **QA** | Sonnet 5.5, medium | Read & write, work zone `.qa` | Runs builds/tests and the app, opens findings, retests fixes; the cycle's *tester* |
+| **Verificador** | Sonnet 5.5, high | Read & write, work zone `.qa` | Checks every criterion with evidence and writes the delivery summary; the cycle's *verifier* |
+
+All four work in every project with one session per project. QA and the Verificador can run commands but only write in `.qa/` (evidence), so they never change the code they check. Installs from before the pack keep their agents and don't get the offer.
 
 **Create with AI** (the **+** menu in the Agents view or in Settings → Agents): describe the agent in a few words, answer 2–4 quick questions (with options to pick), and Claude designs the whole profile — name, role, detailed instructions, access, tools, model and effort, context files, MCP servers, projects, emoji and schedules. Review and edit it, then create it. Uses your Claude Code login (`claude -p`, no tools).
 

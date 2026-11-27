@@ -227,7 +227,8 @@ struct AgentProfile: Codable, Identifiable, Hashable {
         let r = (role + " " + name).folded
         let byRole: [(String, String)] = [("project manager", ":card_index_dividers:"), ("manager", ":card_index_dividers:"),
                                           ("develop", ":computer:"), ("seo", ":mag:"), ("design", ":art:"), ("copy", ":pencil2:"),
-                                          ("writ", ":pencil2:"), ("qa", ":white_check_mark:"), ("review", ":white_check_mark:"),
+                                          ("writ", ":pencil2:"), ("qa", ":white_check_mark:"), ("verif", ":ballot_box_with_check:"),
+                                          ("review", ":white_check_mark:"),
                                           ("analy", ":bar_chart:"), ("market", ":mega:"), ("support", ":speech_balloon:")]
         return byRole.first { r.contains($0.0) }?.1 ?? ":robot_face:"
     }
@@ -272,18 +273,8 @@ struct AgentProfile: Codable, Identifiable, Hashable {
     Presenta resultados claros y solicita aprobación cuando corresponda.
     """
 
-    static let projectManagerInstructions = """
-    Eres el Project Manager de una agencia de marketing digital.
-
-    Tu responsabilidad es recibir solicitudes, identificar el proyecto, organizar el trabajo, repartirlo entre los agentes y comunicar resultados.
-
-    Cómo trabajar:
-    - Actúa. Ya tienes acceso a los proyectos y a tus herramientas; no pidas permiso para lo que tu configuración permite. ProjectN pide aprobación al usuario automáticamente cuando hace falta.
-    - Usa el contexto: la conversación anterior, el README, la memoria del proyecto y los archivos. Si algo es ambiguo, elige la interpretación más razonable, dila en una línea y avanza. Pregunta solo si equivocarte sería costoso.
-    - Delega: cuando el trabajo corresponde a otro agente (desarrollo, SEO, contenido…) o el usuario dice “pídele / dile / que lo haga el developer…”, usa delegate_task con una instrucción completa. No le devuelvas al usuario lo que otro agente puede resolver.
-    - No inventes información sobre archivos o tareas.
-    - Responde breve y claro: qué se hizo, qué está en curso (y con quién) y qué necesita al usuario, si algo.
-    """
+    /// The Project Manager of the default agent pack (generic: any user, any kind of project).
+    static let projectManagerInstructions = AgentStarterPack.projectManagerInstructions
 
     // Tolerant decoding so new fields don't break saved profiles.
     init(from decoder: Decoder) throws {
@@ -324,7 +315,7 @@ struct AgentProfile: Codable, Identifiable, Hashable {
         workZone = (try? c.decode([String].self, forKey: .workZone)) ?? []
     }
 
-    /// The first profile created on a fresh install (section 6 of the spec).
+    /// The coordinator of the default agent pack (AgentStarterPack).
     static func projectManager() -> AgentProfile {
         var p = AgentProfile(
             name: "Project Manager", role: "Project Manager",
@@ -575,6 +566,9 @@ struct AgentPolicy: Codable, Equatable {
     var allowProjectCreation = true
     /// Where new project folders are created. Empty = the folder most of your projects live in (else ~/Documents).
     var newProjectsFolder = ""
+    /// A fresh install starts without agents and offers the default pack (AgentStarterPack) until you add it or
+    /// dismiss the offer. Installs from before the pack never had the offer (they already have their agents).
+    var starterPackOffered = false
 
     init() {}
     init(from decoder: Decoder) throws {
@@ -592,6 +586,7 @@ struct AgentPolicy: Codable, Equatable {
         maxIdleSessionsPerAgent = max(1, (try? c.decode(Int.self, forKey: .maxIdleSessionsPerAgent)) ?? d.maxIdleSessionsPerAgent)
         allowProjectCreation = (try? c.decode(Bool.self, forKey: .allowProjectCreation)) ?? d.allowProjectCreation
         newProjectsFolder = (try? c.decode(String.self, forKey: .newProjectsFolder)) ?? d.newProjectsFolder
+        starterPackOffered = (try? c.decode(Bool.self, forKey: .starterPackOffered)) ?? false
     }
 }
 
