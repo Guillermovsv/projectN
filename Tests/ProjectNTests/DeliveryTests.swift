@@ -192,6 +192,12 @@ struct WorkZonePolicyTests {
         if case .user = ApprovalPolicy.decide(tool: "Bash", input: ["command": "pkill -f \"postgres\""], own) {} else { Issue.record("expected user") }
         // Too short a pattern would match anything.
         if case .user = ApprovalPolicy.decide(tool: "Bash", input: ["command": "pkill -f no"], own) {} else { Issue.record("expected user") }
+        // The program's name alone (or a loose word) would kill the user's own processes too.
+        let node = ctx(own: ["node server.js --port 3000"])
+        #expect(ApprovalPolicy.decide(tool: "Bash", input: ["command": "pkill -f server.js"], node) == .allow)
+        for loose in ["pkill -f node", "pkill node", "pkill -f server", "pkill -f \"node serv\""] {
+            if case .user = ApprovalPolicy.decide(tool: "Bash", input: ["command": loose], node) {} else { Issue.record("expected user: \(loose)") }
+        }
         if case .user = ApprovalPolicy.decide(tool: "Bash", input: ["command": "pkill -f \"servidor-prueba.mjs 18517\""], ctx()) {} else { Issue.record("expected user") }
     }
 }

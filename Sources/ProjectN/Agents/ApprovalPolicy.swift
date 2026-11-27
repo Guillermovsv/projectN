@@ -337,8 +337,10 @@ enum ApprovalPolicy {
             return .orchestrator("Downloads from the network: \(clipped)")
         }
         // Stopping a process this task started itself (a test server it ran in the background).
-        if cmd == "pkill", let pattern = args.last(where: { !$0.hasPrefix("-") }), pattern.count >= 4,
-           ctx.ownBackground.contains(where: { $0.contains(pattern) }) {
+        // pkill matches every process on the machine, so the pattern must name that command
+        // specifically: `pkill -f node` for `node server.js` would also kill the user's own node.
+        if cmd == "pkill", let pattern = args.last(where: { !$0.hasPrefix("-") }),
+           ctx.ownBackground.contains(where: { pkillTargetsOnly(pattern, $0) }) {
             return .allow
         }
         if ["chmod", "chown", "chflags", "xattr", "launchctl", "crontab", "defaults", "security", "killall", "kill", "pkill", "shutdown", "reboot", "diskutil"].contains(cmd) {
@@ -418,6 +420,18 @@ enum ApprovalPolicy {
 
     static func zoneDenial(_ path: String, _ ctx: Context) -> ApprovalTier {
         .deny("\(path) is outside this agent's work zone. It may only write in: \(ctx.workZone.joined(separator: ", ")) (inside the project). Write the file there instead.")
+    }
+
+    /// Whether `pkill -f pattern` only reaches `command` (one this task started): the pattern is in it
+    /// and contains one of its arguments whole, one specific enough not to be some other program's
+    /// (a script, a path, a port: `server.js`, `./run`, `18517`), never just the program's name.
+    static func pkillTargetsOnly(_ pattern: String, _ command: String) -> Bool {
+        guard pattern.count >= 4, command.contains(pattern) else { return false }
+        let tokens = command.split(whereSeparator: { $0.isWhitespace }).map { $0.trimmingCharacters(in: CharacterSet(charactersIn: "'\"")) }
+        let patternTokens = Set(pattern.split(whereSeparator: { $0.isWhitespace }).map(String.init))
+        return tokens.dropFirst().contains { t in
+            t.count >= 4 && patternTokens.contains(t) && t.contains(where: { $0 == "." || $0 == "/" || $0.isNumber })
+        }
     }
 
     static func isDevice(_ p: String) -> Bool { p.hasPrefix("/dev/") }
